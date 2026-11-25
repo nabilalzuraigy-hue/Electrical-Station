@@ -1,55 +1,25 @@
 import * as XLSX from 'xlsx';
-import {
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  orderBy,
-  query,
-  serverTimestamp,
-  setDoc,
-  Timestamp,
-  updateDoc,
-  writeBatch,
-} from 'firebase/firestore';
-import type { User } from 'firebase/auth';
-import {
-  computeSubscriberPortalHash,
-  db,
-  handleFirestoreError,
-  OperationType,
-} from './firebase';
+import { idbGet, idbSet } from './indexedDbCache';
 import type {
-  CollectorInvite,
+  AccessCodeRecord,
   CollectorPermissions,
   CollectorProfile,
-  LicenseRecord,
-  LicenseStatus,
   MeterReading,
   PaymentReceipt,
   StationConfig,
   Subscriber,
-  UserRoleBinding,
+  SubscriberLookupResult,
+  SyncProgress,
 } from '../types/station';
 
-export const SUPER_ADMIN_EMAIL = 'nabilalzuraigy@gmail.com';
-
-const STORAGE_PREFIX = 'yemen_power_isolated_v2_';
+const IDB_KEY_PREFIX = 'station_state_v3_';
 
 export interface StationLocalState {
   station: StationConfig;
   collectors: CollectorProfile[];
-  invites: CollectorInvite[];
   subscribers: Subscriber[];
   readings: MeterReading[];
   receipts: PaymentReceipt[];
-}
-
-export function isSuperAdminUser(user: User | null): boolean {
-  return (
-    Boolean(user?.emailVerified) &&
-    user?.email?.toLowerCase() === SUPER_ADMIN_EMAIL
-  );
 }
 
 export function sanitizeFirestoreId(raw: string): string {
@@ -61,635 +31,227 @@ export function normalizeActivationCode(raw: string): string {
   return raw.trim().toUpperCase().replace(/[^A-Z0-9-]/g, '');
 }
 
-export function generateRandomCode(prefix: string): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const block = (len: number) =>
-    Array.from({ length: len }, () =>
-      chars.charAt(Math.floor(Math.random() * chars.length)),
-    ).join('');
-  return `${prefix}-${block(4)}-${block(4)}`;
-}
-
-export function createEmptyStationState(station: StationConfig): StationLocalState {
-  return {
-    station,
-    collectors: [],
-    invites: [],
-    subscribers: [],
-    readings: [],
-    receipts: [],
-  };
-}
-
-export function loadStationLocalState(
+export async function loadStationLocalState(
   stationId: string,
-): StationLocalState | null {
-  try {
-    const raw = localStorage.getItem(`${STORAGE_PREFIX}${stationId}`);
-    if (!raw) return null;
-    return JSON.parse(raw) as StationLocalState;
-  } catch {
-    return null;
-  }
+): Promise<StationLocalState | null> {
+  return idbGet<StationLocalState>(`${IDB_KEY_PREFIX}${stationId}`);
 }
 
-export function saveStationLocalState(state: StationLocalState): void {
-  localStorage.setItem(
-    `${STORAGE_PREFIX}${state.station.stationId}`,
-    JSON.stringify(state),
-  );
+export async function saveStationLocalState(
+  state: StationLocalState,
+): Promise<void> {
+  await idbSet(`${IDB_KEY_PREFIX}${state.station.stationId}`, state);
 }
 
-// ============================================================
-// Super Admin License Management (nabilalzuraigy@gmail.com)
-// ============================================================
-
-export async function fetchAllLicenses(): Promise<LicenseRecord[]> {
-  const path = 'licenses';
-  try {
-    const snap = await getDocs(
-      query(collection(db, 'licenses'), orderBy('createdAt', 'desc')),
-    );
-    return snap.docs.map((d) => {
-      const data = d.data();
-      return {
-        code: data.code as string,
-        stationId: data.stationId as string,
-        stationName: data.stationName as string,
-        maxCollectors: Number(data.maxCollectors ?? 5),
-        maxSubscribers: Number(data.maxSubscribers ?? 1000),
-        status: data.status as LicenseStatus,
-        activatedByUid: data.activatedByUid as string | undefined,
-        activatedByEmail: data.activatedByEmail as string | undefined,
-        activatedAt:
-          data.activatedAt instanceof Timestamp
-            ? data.activatedAt.toDate().toISOString()
-            : undefined,
-        expiresAt:
-          data.expiresAt instanceof Timestamp
-            ? data.expiresAt.toDate().toISOString()
-            : String(data.expiresAt ?? ''),
-        createdAt:
-          data.createdAt instanceof Timestamp
-            ? data.createdAt.toDate().toISOString()
-            : new Date().toISOString(),
-        updatedAt:
-          data.updatedAt instanceof Timestamp
-            ? data.updatedAt.toDate().toISOString()
-            : new Date().toISOString(),
-      };
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, path);
-  }
-}
-
-export async function fetchAllStationsAdmin(): Promise<StationConfig[]> {
-  const path = 'stations';
-  try {
-    const snap = await getDocs(collection(db, 'stations'));
-    return snap.docs.map((d) => {
-      const data = d.data();
-      return {
-        stationId: d.id,
-        stationName: String(data.stationName ?? ''),
-        kwhPriceYer: Number(data.kwhPriceYer ?? 450),
-        minimumFeeYer: Number(data.minimumFeeYer ?? 0),
-        mainGeneratorKwh: Number(data.mainGeneratorKwh ?? 0),
-        licenseCode: String(data.licenseCode ?? ''),
-        licenseStatus: (data.licenseStatus as 'active' | 'suspended') ?? 'active',
-        maxCollectors: Number(data.maxCollectors ?? 5),
-        maxSubscribers: Number(data.maxSubscribers ?? 1000),
-        ownerUid: String(data.ownerUid ?? ''),
-        updatedAt:
-          data.updatedAt instanceof Timestamp
-            ? data.updatedAt.toDate().toISOString()
-            : new Date().toISOString(),
-      };
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, path);
-  }
-}
-
-export async function issueStationLicense(params: {
-  stationName: string;
-  maxCollectors: number;
-  maxSubscribers: number;
-  validityDays: number;
-}): Promise<LicenseRecord> {
-  const code = generateRandomCode('YEM');
-  const stationId = sanitizeFirestoreId(
-    `st_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
-  );
-  const expiresDate = new Date(
-    Date.now() + params.validityDays * 24 * 60 * 60 * 1000,
-  );
-  const path = `licenses/${code}`;
-
-  try {
-    await setDoc(doc(db, 'licenses', code), {
-      code,
-      stationId,
-      stationName: params.stationName.trim(),
-      maxCollectors: Math.max(1, params.maxCollectors),
-      maxSubscribers: Math.max(1, params.maxSubscribers),
-      status: 'unused',
-      expiresAt: Timestamp.fromDate(expiresDate),
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.CREATE, path);
-  }
-
-  return {
-    code,
-    stationId,
-    stationName: params.stationName.trim(),
-    maxCollectors: Math.max(1, params.maxCollectors),
-    maxSubscribers: Math.max(1, params.maxSubscribers),
-    status: 'unused',
-    expiresAt: expiresDate.toISOString(),
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+async function apiRequest<T>(
+  url: string,
+  options: RequestInit = {},
+  bearerToken?: string | null,
+): Promise<T> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...((options.headers as Record<string, string>) || {}),
   };
-}
-
-export async function setStationLicenseStatus(params: {
-  licenseCode: string;
-  stationId: string;
-  nextStatus: 'active' | 'suspended';
-}): Promise<void> {
-  try {
-    await updateDoc(doc(db, 'licenses', params.licenseCode), {
-      status: params.nextStatus,
-      updatedAt: serverTimestamp(),
-    });
-    const stRef = doc(db, 'stations', params.stationId);
-    const stSnap = await getDoc(stRef);
-    if (stSnap.exists()) {
-      await updateDoc(stRef, {
-        licenseStatus: params.nextStatus,
-        updatedAt: serverTimestamp(),
-      });
-    }
-  } catch (error) {
-    handleFirestoreError(
-      error,
-      OperationType.UPDATE,
-      `licenses/${params.licenseCode}`,
-    );
+  if (bearerToken) {
+    headers.Authorization = `Bearer ${bearerToken}`;
   }
+  const res = await fetch(url, { ...options, headers });
+  const data = (await res.json().catch(() => ({}))) as T & { error?: string };
+  if (!res.ok) {
+    throw new Error(data.error || `خطأ في الاتصال بالخادم (${res.status})`);
+  }
+  return data;
 }
 
 // ============================================================
-// User Role Resolution & Code Activation (Manager & Collector)
+// Developer Admin API (Server-verified scrypt / env passcode)
 // ============================================================
 
-export async function resolveUserRoleBinding(
-  uid: string,
-): Promise<UserRoleBinding | null> {
-  const path = `userRoles/${uid}`;
-  try {
-    const snap = await getDoc(doc(db, 'userRoles', uid));
-    if (!snap.exists()) return null;
-    const data = snap.data();
-    return {
-      role: data.role as 'manager' | 'collector',
-      stationId: data.stationId as string,
-      stationName: data.stationName as string,
-      codeUsed: data.codeUsed as string,
-      active: Boolean(data.active),
-      updatedAt:
-        data.updatedAt instanceof Timestamp
-          ? data.updatedAt.toDate().toISOString()
-          : new Date().toISOString(),
-    };
-  } catch (error) {
-    handleFirestoreError(error, OperationType.GET, path);
-  }
+export async function getAdminStatus(): Promise<{ configured: boolean }> {
+  return apiRequest<{ configured: boolean }>('/api/admin/status');
 }
 
-export async function redeemStationLicenseCode(params: {
-  codeInput: string;
-  user: User;
-  customStationName?: string;
-}): Promise<UserRoleBinding> {
-  const code = normalizeActivationCode(params.codeInput);
-  if (!code || code.length < 6) {
-    throw new Error('يرجى إدخال كود ترخيص صالح.');
-  }
-
-  const licRef = doc(db, 'licenses', code);
-  const licSnap = await getDoc(licRef);
-  if (!licSnap.exists()) {
-    throw new Error('كود الترخيص غير موجود. تأكد من الكود الصادر من الأدمن.');
-  }
-
-  const lic = licSnap.data();
-  if (lic.status !== 'unused') {
-    throw new Error('هذا الكود مستخدم مسبقاً أو موقوف.');
-  }
-
-  const expiresAt =
-    lic.expiresAt instanceof Timestamp ? lic.expiresAt.toDate() : null;
-  if (expiresAt && expiresAt.getTime() < Date.now()) {
-    throw new Error('انتهت صلاحية كود الترخيص هذا.');
-  }
-
-  const stationId = String(lic.stationId);
-  const stationName =
-    params.customStationName?.trim() || String(lic.stationName);
-
-  const batch = writeBatch(db);
-  batch.update(licRef, {
-    status: 'active',
-    activatedByUid: params.user.uid,
-    activatedByEmail: params.user.email ?? '',
-    activatedAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
+export async function claimAdminPasscode(
+  passcode: string,
+): Promise<{ token: string; name: string }> {
+  return apiRequest<{ token: string; name: string }>('/api/admin/claim', {
+    method: 'POST',
+    body: JSON.stringify({ passcode }),
   });
-
-  batch.set(doc(db, 'stations', stationId), {
-    stationName,
-    kwhPriceYer: 450,
-    minimumFeeYer: 0,
-    mainGeneratorKwh: 0,
-    licenseCode: code,
-    licenseStatus: 'active',
-    maxCollectors: Number(lic.maxCollectors ?? 5),
-    maxSubscribers: Number(lic.maxSubscribers ?? 1000),
-    ownerUid: params.user.uid,
-    updatedAt: serverTimestamp(),
-  });
-
-  batch.set(doc(db, 'userRoles', params.user.uid), {
-    role: 'manager',
-    stationId,
-    stationName,
-    codeUsed: code,
-    active: true,
-    updatedAt: serverTimestamp(),
-  });
-
-  try {
-    await batch.commit();
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `licenses/${code}`);
-  }
-
-  return {
-    role: 'manager',
-    stationId,
-    stationName,
-    codeUsed: code,
-    active: true,
-    updatedAt: new Date().toISOString(),
-  };
 }
 
-export async function redeemCollectorInviteCode(params: {
-  inviteCodeInput: string;
-  user: User;
-}): Promise<UserRoleBinding> {
-  const inviteCode = normalizeActivationCode(params.inviteCodeInput);
-  if (!inviteCode || inviteCode.length < 6) {
-    throw new Error('يرجى إدخال كود تفعيل المحصّل بشكل صحيح.');
-  }
-
-  const invRef = doc(db, 'collectorInvites', inviteCode);
-  const invSnap = await getDoc(invRef);
-  if (!invSnap.exists()) {
-    throw new Error('كود المحصّل غير موجود. اطلب الكود من مدير محطتك.');
-  }
-
-  const inv = invSnap.data();
-  if (inv.status !== 'unused') {
-    throw new Error('كود المحصّل هذا مستخدم مسبقاً أو ملغى.');
-  }
-
-  const stationId = String(inv.stationId);
-  const stationName = String(inv.stationName);
-
-  const batch = writeBatch(db);
-  batch.update(invRef, {
-    status: 'claimed',
-    claimedByUid: params.user.uid,
-    claimedAt: serverTimestamp(),
+export async function loginAdminPasscode(
+  passcode: string,
+): Promise<{ token: string; name: string }> {
+  return apiRequest<{ token: string; name: string }>('/api/admin/login', {
+    method: 'POST',
+    body: JSON.stringify({ passcode }),
   });
+}
 
-  batch.set(
-    doc(db, 'stations', stationId, 'collectors', params.user.uid),
+export async function fetchAdminOverview(adminToken: string): Promise<{
+  stations: StationConfig[];
+  codes: AccessCodeRecord[];
+}> {
+  return apiRequest<{
+    stations: StationConfig[];
+    codes: AccessCodeRecord[];
+  }>('/api/admin/overview', {}, adminToken);
+}
+
+export async function createStationAdmin(
+  adminToken: string,
+  params: {
+    stationName: string;
+    kwhPriceYer?: number;
+    maxCollectors?: number;
+    maxSubscribers?: number;
+  },
+): Promise<{ station: StationConfig }> {
+  return apiRequest<{ station: StationConfig }>(
+    '/api/admin/stations',
     {
-      name: String(inv.collectorName),
-      email: params.user.email ?? '',
-      phone: String(inv.phone),
-      assignedZones: (inv.assignedZones as string[]) ?? [],
-      permissions: inv.permissions as CollectorPermissions,
-      active: true,
-      inviteCode,
-      createdAt: serverTimestamp(),
+      method: 'POST',
+      body: JSON.stringify(params),
     },
+    adminToken,
   );
-
-  batch.set(doc(db, 'userRoles', params.user.uid), {
-    role: 'collector',
-    stationId,
-    stationName,
-    codeUsed: inviteCode,
-    active: true,
-    updatedAt: serverTimestamp(),
-  });
-
-  try {
-    await batch.commit();
-  } catch (error) {
-    handleFirestoreError(
-      error,
-      OperationType.WRITE,
-      `collectorInvites/${inviteCode}`,
-    );
-  }
-
-  return {
-    role: 'collector',
-    stationId,
-    stationName,
-    codeUsed: inviteCode,
-    active: true,
-    updatedAt: new Date().toISOString(),
-  };
 }
 
-// ============================================================
-// Station Manager: Collector Invites, Permissions & Activation
-// ============================================================
-
-export async function createCollectorInvite(params: {
-  station: StationConfig;
-  collectorName: string;
-  phone: string;
-  assignedZones: string[];
-  permissions: CollectorPermissions;
-}): Promise<CollectorInvite> {
-  const inviteCode = generateRandomCode('COL');
-  const path = `collectorInvites/${inviteCode}`;
-  try {
-    await setDoc(doc(db, 'collectorInvites', inviteCode), {
-      inviteCode,
-      stationId: params.station.stationId,
-      stationName: params.station.stationName,
-      ownerUid: params.station.ownerUid,
-      collectorName: params.collectorName.trim(),
-      phone: params.phone.trim(),
-      assignedZones: params.assignedZones,
-      permissions: params.permissions,
-      status: 'unused',
-      createdAt: serverTimestamp(),
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.CREATE, path);
-  }
-
-  return {
-    inviteCode,
-    stationId: params.station.stationId,
-    stationName: params.station.stationName,
-    ownerUid: params.station.ownerUid,
-    collectorName: params.collectorName.trim(),
-    phone: params.phone.trim(),
-    assignedZones: params.assignedZones,
-    permissions: params.permissions,
-    status: 'unused',
-    createdAt: new Date().toISOString(),
-  };
+export async function toggleStationStatusAdmin(
+  adminToken: string,
+  stationId: string,
+  licenseStatus: 'active' | 'suspended',
+): Promise<{ station: StationConfig }> {
+  return apiRequest<{ station: StationConfig }>(
+    `/api/admin/stations/${encodeURIComponent(stationId)}/status`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ licenseStatus }),
+    },
+    adminToken,
+  );
 }
 
-export async function updateCollectorInCloud(params: {
-  stationId: string;
-  collector: CollectorProfile;
-}): Promise<void> {
-  const path = `stations/${params.stationId}/collectors/${params.collector.id}`;
-  try {
-    await updateDoc(
-      doc(db, 'stations', params.stationId, 'collectors', params.collector.id),
+export async function generateAccessCodeAdmin(
+  adminToken: string,
+  params: {
+    name: string;
+    role: 'manager' | 'collector';
+    stationId?: string;
+    newStationName?: string;
+    phone?: string;
+    assignedZones?: string[];
+    permissions?: CollectorPermissions;
+    customCode?: string;
+  },
+): Promise<{ codeRecord: AccessCodeRecord; station: StationConfig }> {
+  return apiRequest<{ codeRecord: AccessCodeRecord; station: StationConfig }>(
+    '/api/admin/codes',
+    {
+      method: 'POST',
+      body: JSON.stringify(params),
+    },
+    adminToken,
+  );
+}
+
+export async function toggleAccessCodeAdmin(
+  adminToken: string,
+  code: string,
+  updates: {
+    active?: boolean;
+    permissions?: CollectorPermissions;
+    assignedZones?: string[];
+  },
+): Promise<{ codeRecord: AccessCodeRecord }> {
+  return apiRequest<{ codeRecord: AccessCodeRecord }>(
+    `/api/admin/codes/${encodeURIComponent(code)}/toggle`,
+    {
+      method: 'POST',
+      body: JSON.stringify(updates),
+    },
+    adminToken,
+  );
+}
+
+export async function uploadSubscribersChunkedAdmin(
+  adminToken: string,
+  params: {
+    stationId: string;
+    subscribers: Subscriber[];
+    replaceAll?: boolean;
+    onProgress?: (uploaded: number, total: number) => void;
+  },
+): Promise<{ totalSubscribers: number }> {
+  const chunkSize = 400;
+  let uploaded = 0;
+  let totalSubscribers = 0;
+
+  for (let i = 0; i < params.subscribers.length; i += chunkSize) {
+    const chunk = params.subscribers.slice(i, i + chunkSize);
+    const res = await apiRequest<{
+      importedCount: number;
+      totalSubscribers: number;
+    }>(
+      `/api/admin/stations/${encodeURIComponent(params.stationId)}/subscribers/upload-chunk`,
       {
-        name: params.collector.name,
-        email: params.collector.email,
-        phone: params.collector.phone,
-        assignedZones: params.collector.assignedZones,
-        permissions: params.collector.permissions,
-        active: params.collector.active,
+        method: 'POST',
+        body: JSON.stringify({
+          subscribers: chunk,
+          replaceAll: Boolean(params.replaceAll && i === 0),
+        }),
       },
+      adminToken,
     );
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, path);
+    uploaded += chunk.length;
+    totalSubscribers = res.totalSubscribers;
+    params.onProgress?.(uploaded, params.subscribers.length);
   }
+
+  return { totalSubscribers };
 }
 
 // ============================================================
-// Isolated Station Data Loader (Manager & Collector)
+// Public Code Entry & Staff Session Operations
 // ============================================================
 
-export async function fetchIsolatedStationState(params: {
-  stationId: string;
-  role: 'manager' | 'collector';
-  uid: string;
-}): Promise<StationLocalState> {
-  const stSnap = await getDoc(doc(db, 'stations', params.stationId));
-  if (!stSnap.exists()) {
-    throw new Error('لم يتم العثور على بيانات هذه المحطة.');
-  }
-  const stData = stSnap.data();
-  const station: StationConfig = {
-    stationId: params.stationId,
-    stationName: String(stData.stationName ?? ''),
-    kwhPriceYer: Number(stData.kwhPriceYer ?? 450),
-    minimumFeeYer: Number(stData.minimumFeeYer ?? 0),
-    mainGeneratorKwh: Number(stData.mainGeneratorKwh ?? 0),
-    licenseCode: String(stData.licenseCode ?? ''),
-    licenseStatus: (stData.licenseStatus as 'active' | 'suspended') ?? 'active',
-    maxCollectors: Number(stData.maxCollectors ?? 5),
-    maxSubscribers: Number(stData.maxSubscribers ?? 1000),
-    ownerUid: String(stData.ownerUid ?? ''),
-    updatedAt:
-      stData.updatedAt instanceof Timestamp
-        ? stData.updatedAt.toDate().toISOString()
-        : new Date().toISOString(),
+function mapServerState(raw: {
+  station: StationConfig;
+  collectors?: AccessCodeRecord[];
+  subscribers?: Subscriber[];
+  readings?: MeterReading[];
+  receipts?: PaymentReceipt[];
+}): StationLocalState {
+  const collectors: CollectorProfile[] = (raw.collectors ?? []).map((c) => ({
+    id: c.code,
+    code: c.code,
+    name: c.name,
+    email: '',
+    phone: c.phone,
+    assignedZones: c.assignedZones ?? [],
+    permissions: c.permissions,
+    active: c.active,
+    inviteCode: c.code,
+    createdAt: c.createdAt,
+  }));
+
+  return {
+    station: raw.station,
+    collectors,
+    subscribers: (raw.subscribers ?? []).map((s) => ({
+      ...s,
+      syncStatus: 'synced',
+    })),
+    readings: (raw.readings ?? []).map((r) => ({
+      ...r,
+      syncStatus: 'synced',
+    })),
+    receipts: (raw.receipts ?? []).map((rc) => ({
+      ...rc,
+      syncStatus: 'synced',
+    })),
   };
-
-  let collectors: CollectorProfile[] = [];
-  let invites: CollectorInvite[] = [];
-
-  if (params.role === 'manager') {
-    const colSnap = await getDocs(
-      collection(db, 'stations', params.stationId, 'collectors'),
-    );
-    collectors = colSnap.docs.map((d) => {
-      const c = d.data();
-      return {
-        id: d.id,
-        name: String(c.name ?? ''),
-        email: String(c.email ?? ''),
-        phone: String(c.phone ?? ''),
-        assignedZones: (c.assignedZones as string[]) ?? [],
-        permissions: (c.permissions as CollectorPermissions) ?? {
-          canRecordReadings: true,
-          canCollectCash: true,
-          canSendInvoices: true,
-          canViewDebts: true,
-        },
-        active: Boolean(c.active),
-        inviteCode: c.inviteCode as string | undefined,
-        createdAt:
-          c.createdAt instanceof Timestamp
-            ? c.createdAt.toDate().toISOString()
-            : new Date().toISOString(),
-      };
-    });
-
-    const invSnap = await getDocs(collection(db, 'collectorInvites'));
-    invites = invSnap.docs
-      .filter((d) => d.data().stationId === params.stationId)
-      .map((d) => {
-        const iv = d.data();
-        return {
-          inviteCode: String(iv.inviteCode ?? d.id),
-          stationId: String(iv.stationId),
-          stationName: String(iv.stationName),
-          ownerUid: String(iv.ownerUid),
-          collectorName: String(iv.collectorName),
-          phone: String(iv.phone),
-          assignedZones: (iv.assignedZones as string[]) ?? [],
-          permissions: iv.permissions as CollectorPermissions,
-          status: iv.status as 'unused' | 'claimed' | 'revoked',
-          claimedByUid: iv.claimedByUid as string | undefined,
-          createdAt:
-            iv.createdAt instanceof Timestamp
-              ? iv.createdAt.toDate().toISOString()
-              : new Date().toISOString(),
-        };
-      });
-  } else {
-    const selfCol = await getDoc(
-      doc(db, 'stations', params.stationId, 'collectors', params.uid),
-    );
-    if (selfCol.exists()) {
-      const c = selfCol.data();
-      collectors = [
-        {
-          id: selfCol.id,
-          name: String(c.name ?? ''),
-          email: String(c.email ?? ''),
-          phone: String(c.phone ?? ''),
-          assignedZones: (c.assignedZones as string[]) ?? [],
-          permissions: (c.permissions as CollectorPermissions) ?? {
-            canRecordReadings: false,
-            canCollectCash: false,
-            canSendInvoices: false,
-            canViewDebts: false,
-          },
-          active: Boolean(c.active),
-          inviteCode: c.inviteCode as string | undefined,
-          createdAt:
-            c.createdAt instanceof Timestamp
-              ? c.createdAt.toDate().toISOString()
-              : new Date().toISOString(),
-        },
-      ];
-    }
-  }
-
-  const subSnap = await getDocs(
-    collection(db, 'stations', params.stationId, 'subscribers'),
-  );
-  const subscribers: Subscriber[] = subSnap.docs.map((d) => {
-    const s = d.data();
-    return {
-      id: d.id,
-      meterNumber: String(s.meterNumber ?? ''),
-      subscriberName: String(s.subscriberName ?? ''),
-      phone: String(s.phone ?? ''),
-      previousReading: Number(s.previousReading ?? 0),
-      currentReading: Number(s.currentReading ?? 0),
-      previousDebtYer: Number(s.previousDebtYer ?? 0),
-      zoneStreet: String(s.zoneStreet ?? ''),
-      sequenceOrder: Number(s.sequenceOrder ?? 1),
-      assignedCollectorId: s.assignedCollectorId as string | undefined,
-      syncStatus: 'synced',
-      updatedAt:
-        s.updatedAt instanceof Timestamp
-          ? s.updatedAt.toDate().toISOString()
-          : new Date().toISOString(),
-    };
-  });
-
-  const rdSnap = await getDocs(
-    collection(db, 'stations', params.stationId, 'readings'),
-  );
-  const readings: MeterReading[] = rdSnap.docs.map((d) => {
-    const r = d.data();
-    return {
-      id: d.id,
-      subscriberId: String(r.subscriberId ?? ''),
-      meterNumber: String(r.meterNumber ?? ''),
-      subscriberName: String(r.subscriberName ?? ''),
-      previousReading: Number(r.previousReading ?? 0),
-      currentReading: Number(r.currentReading ?? 0),
-      consumptionKwh: Number(r.consumptionKwh ?? 0),
-      kwhPriceYer: Number(r.kwhPriceYer ?? 0),
-      currentBillYer: Number(r.currentBillYer ?? 0),
-      previousDebtYer: Number(r.previousDebtYer ?? 0),
-      totalDueYer: Number(r.totalDueYer ?? 0),
-      photoUrl: String(r.photoUrl ?? ''),
-      photoSizeKb: Number(r.photoSizeKb ?? 0),
-      collectorUid: String(r.collectorUid ?? ''),
-      collectorName: String(r.collectorName ?? ''),
-      recordedAt:
-        r.recordedAt instanceof Timestamp
-          ? r.recordedAt.toDate().toISOString()
-          : new Date().toISOString(),
-      syncStatus: 'synced',
-    };
-  });
-
-  const rcSnap = await getDocs(
-    collection(db, 'stations', params.stationId, 'receipts'),
-  );
-  const receipts: PaymentReceipt[] = rcSnap.docs.map((d) => {
-    const rc = d.data();
-    return {
-      id: d.id,
-      subscriberId: String(rc.subscriberId ?? ''),
-      meterNumber: String(rc.meterNumber ?? ''),
-      subscriberName: String(rc.subscriberName ?? ''),
-      readingId: String(rc.readingId ?? ''),
-      amountPaidYer: Number(rc.amountPaidYer ?? 0),
-      remainingBalanceYer: Number(rc.remainingBalanceYer ?? 0),
-      collectorUid: String(rc.collectorUid ?? ''),
-      collectorName: String(rc.collectorName ?? ''),
-      paidAt:
-        rc.paidAt instanceof Timestamp
-          ? rc.paidAt.toDate().toISOString()
-          : new Date().toISOString(),
-      syncStatus: 'synced',
-    };
-  });
-
-  const merged = mergeLocalPendingWithCloud(
-    loadStationLocalState(params.stationId),
-    {
-      station,
-      collectors,
-      invites,
-      subscribers,
-      readings,
-      receipts,
-    },
-  );
-  saveStationLocalState(merged);
-  return merged;
 }
 
 function mergeLocalPendingWithCloud(
@@ -726,64 +288,516 @@ function mergeLocalPendingWithCloud(
   };
 }
 
+export type UnifiedLoginResult =
+  | { kind: 'admin'; token: string; name: string }
+  | {
+      kind: 'staff';
+      token: string;
+      access: AccessCodeRecord;
+      state: StationLocalState;
+    }
+  | { kind: 'subscriber'; result: SubscriberLookupResult };
+
+export async function loginUnified(
+  credential: string,
+): Promise<UnifiedLoginResult> {
+  const clean = credential.trim();
+  if (!clean) {
+    throw new Error('يرجى إدخال بيانات الدخول.');
+  }
+
+  const res = await apiRequest<
+    | { kind: 'admin'; token: string; name: string }
+    | {
+        kind: 'staff';
+        token: string;
+        access: AccessCodeRecord;
+        state: {
+          station: StationConfig;
+          collectors?: AccessCodeRecord[];
+          subscribers?: Subscriber[];
+          readings?: MeterReading[];
+          receipts?: PaymentReceipt[];
+        };
+      }
+    | { kind: 'subscriber'; result: SubscriberLookupResult }
+  >('/api/auth/unified', {
+    method: 'POST',
+    body: JSON.stringify({ credential: clean }),
+  });
+
+  if (res.kind === 'staff') {
+    const cloudState = mapServerState(res.state);
+    const local = await loadStationLocalState(cloudState.station.stationId);
+    const merged = mergeLocalPendingWithCloud(local, cloudState);
+    await saveStationLocalState(merged);
+    return {
+      kind: 'staff',
+      token: res.token,
+      access: res.access,
+      state: merged,
+    };
+  }
+
+  return res;
+}
+
+export async function loginWithAccessCode(codeInput: string): Promise<{
+  token: string;
+  access: AccessCodeRecord;
+  state: StationLocalState;
+}> {
+  const code = normalizeActivationCode(codeInput);
+  if (!code || code.length < 4) {
+    throw new Error('يرجى إدخال كود الدخول الصحيح.');
+  }
+
+  const res = await apiRequest<{
+    token: string;
+    access: AccessCodeRecord;
+    state: {
+      station: StationConfig;
+      collectors?: AccessCodeRecord[];
+      subscribers?: Subscriber[];
+      readings?: MeterReading[];
+      receipts?: PaymentReceipt[];
+    };
+  }>('/api/auth/code', {
+    method: 'POST',
+    body: JSON.stringify({ code }),
+  });
+
+  const cloudState = mapServerState(res.state);
+  const local = await loadStationLocalState(cloudState.station.stationId);
+  const merged = mergeLocalPendingWithCloud(local, cloudState);
+  await saveStationLocalState(merged);
+
+  return {
+    token: res.token,
+    access: res.access,
+    state: merged,
+  };
+}
+
+export async function refreshStationState(
+  stationId: string,
+  staffToken: string,
+): Promise<StationLocalState> {
+  const res = await apiRequest<{
+    station: StationConfig;
+    collectors?: AccessCodeRecord[];
+    subscribers?: Subscriber[];
+    readings?: MeterReading[];
+    receipts?: PaymentReceipt[];
+  }>(`/api/stations/${encodeURIComponent(stationId)}/state`, {}, staffToken);
+
+  const cloudState = mapServerState(res);
+  const local = await loadStationLocalState(stationId);
+  const merged = mergeLocalPendingWithCloud(local, cloudState);
+  await saveStationLocalState(merged);
+  return merged;
+}
+
+export async function saveStationTariffInCloud(
+  staffToken: string,
+  station: StationConfig,
+): Promise<void> {
+  await apiRequest(
+    `/api/stations/${encodeURIComponent(station.stationId)}/config`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({
+        stationName: station.stationName,
+        kwhPriceYer: station.kwhPriceYer,
+        minimumFeeYer: station.minimumFeeYer,
+        mainGeneratorKwh: station.mainGeneratorKwh,
+      }),
+    },
+    staffToken,
+  );
+}
+
+export async function updateCollectorInCloud(params: {
+  staffToken: string;
+  stationId: string;
+  collector: CollectorProfile;
+}): Promise<void> {
+  const code = params.collector.code || params.collector.id;
+  await apiRequest(
+    `/api/stations/${encodeURIComponent(params.stationId)}/collectors/${encodeURIComponent(code)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({
+        active: params.collector.active,
+        permissions: params.collector.permissions,
+      }),
+    },
+    params.staffToken,
+  );
+}
+
+// ============================================================
+// Chunked Batch Offline Sync (20 readings+photos per batch)
+// ============================================================
+
+export async function syncStationPendingBatches(params: {
+  state: StationLocalState;
+  staffToken: string;
+  role: 'manager' | 'collector';
+  onProgress?: (progress: SyncProgress) => void;
+}): Promise<{
+  updatedState: StationLocalState;
+  syncedCount: number;
+}> {
+  let working = { ...params.state };
+  const stationId = working.station.stationId;
+
+  if (params.role === 'manager') {
+    await saveStationTariffInCloud(params.staffToken, working.station);
+  }
+
+  const pendingSubs = working.subscribers.filter((s) => s.syncStatus === 'pending');
+  const pendingReadings = working.readings.filter((r) => r.syncStatus === 'pending');
+  const pendingReceipts = working.receipts.filter((rc) => rc.syncStatus === 'pending');
+
+  const subChunkSize = 300;
+  const readingChunkSize = 20;
+
+  const subBatches: Subscriber[][] = [];
+  for (let i = 0; i < pendingSubs.length; i += subChunkSize) {
+    subBatches.push(pendingSubs.slice(i, i + subChunkSize));
+  }
+
+  const readingBatches: MeterReading[][] = [];
+  for (let i = 0; i < pendingReadings.length; i += readingChunkSize) {
+    readingBatches.push(pendingReadings.slice(i, i + readingChunkSize));
+  }
+
+  const receiptBatches: PaymentReceipt[][] = [];
+  for (let i = 0; i < pendingReceipts.length; i += readingChunkSize) {
+    receiptBatches.push(pendingReceipts.slice(i, i + readingChunkSize));
+  }
+
+  const totalItems =
+    pendingSubs.length + pendingReadings.length + pendingReceipts.length;
+  const totalBatches =
+    subBatches.length + readingBatches.length + receiptBatches.length;
+
+  let completed = 0;
+  let currentBatch = 0;
+  let syncedCount = 0;
+
+  const commitLocalProgress = async (
+    syncedSubIds: Set<string>,
+    syncedRdIds: Set<string>,
+    syncedRcIds: Set<string>,
+  ) => {
+    working = {
+      ...working,
+      subscribers: working.subscribers.map((s) =>
+        syncedSubIds.has(s.id) ? { ...s, syncStatus: 'synced' } : s,
+      ),
+      readings: working.readings.map((r) =>
+        syncedRdIds.has(r.id) ? { ...r, syncStatus: 'synced' } : r,
+      ),
+      receipts: working.receipts.map((rc) =>
+        syncedRcIds.has(rc.id) ? { ...rc, syncStatus: 'synced' } : rc,
+      ),
+    };
+    await saveStationLocalState(working);
+  };
+
+  for (const batch of subBatches) {
+    currentBatch++;
+    await apiRequest(
+      `/api/stations/${encodeURIComponent(stationId)}/sync-batch`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ subscribers: batch, readings: [], receipts: [] }),
+      },
+      params.staffToken,
+    );
+    const ids = new Set(batch.map((b) => b.id));
+    await commitLocalProgress(ids, new Set(), new Set());
+    completed += batch.length;
+    syncedCount += batch.length;
+    params.onProgress?.({ completed, total: totalItems, currentBatch, totalBatches });
+  }
+
+  for (const batch of readingBatches) {
+    currentBatch++;
+    const textOnlyReadings = batch.map((r) => ({
+      ...r,
+      photoUrl: '',
+      hasLocalPhoto: Boolean(r.photoUrl || r.hasLocalPhoto),
+    }));
+    await apiRequest(
+      `/api/stations/${encodeURIComponent(stationId)}/sync-batch`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          subscribers: [],
+          readings: textOnlyReadings,
+          receipts: [],
+        }),
+      },
+      params.staffToken,
+    );
+    const ids = new Set(batch.map((b) => b.id));
+    await commitLocalProgress(new Set(), ids, new Set());
+    completed += batch.length;
+    syncedCount += batch.length;
+    params.onProgress?.({ completed, total: totalItems, currentBatch, totalBatches });
+  }
+
+  for (const batch of receiptBatches) {
+    currentBatch++;
+    await apiRequest(
+      `/api/stations/${encodeURIComponent(stationId)}/sync-batch`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ subscribers: [], readings: [], receipts: batch }),
+      },
+      params.staffToken,
+    );
+    const ids = new Set(batch.map((b) => b.id));
+    await commitLocalProgress(new Set(), new Set(), ids);
+    completed += batch.length;
+    syncedCount += batch.length;
+    params.onProgress?.({ completed, total: totalItems, currentBatch, totalBatches });
+  }
+
+  return { updatedState: working, syncedCount };
+}
+
+// ============================================================
+// Public Subscriber Portal Lookup (Name + Phone)
+// ============================================================
+
+export async function lookupSubscriberPublic(params: {
+  subscriberName: string;
+  phone: string;
+}): Promise<SubscriberLookupResult> {
+  return apiRequest<SubscriberLookupResult>('/api/subscriber/lookup', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}
+
 // ============================================================
 // Excel Import & Export
 // ============================================================
 
+function normalizeArabicDigits(raw: string): string {
+  return raw.replace(/[٠-٩]/g, (d) => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)));
+}
+
+function normalizeExcelHeader(raw: unknown): string {
+  return String(raw ?? '')
+    .trim()
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/ى/g, 'ي')
+    .replace(/ة/g, 'ه')
+    .replace(/[\u064B-\u065F]/g, '')
+    .replace(/[_/\\\-:،,.\s()]+/g, '')
+    .toLowerCase();
+}
+
+function parseExcelNumber(raw: unknown): number {
+  const cleaned = normalizeArabicDigits(String(raw ?? ''))
+    .replace(/[,،\s]/g, '')
+    .replace(/[^\d.-]/g, '');
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : 0;
+}
+
+const EXCEL_HEADER_ALIASES = {
+  meterNumber: [
+    'meternumber',
+    'meter',
+    'meterno',
+    'رقم العداد'.replace(/\s+/g, ''),
+    'العداد',
+    'رقمالاشتراك',
+    'كودالعداد',
+  ],
+  subscriberName: [
+    'subscribername',
+    'name',
+    'fullname',
+    'customername',
+    'اسمالمشترك',
+    'الاسم',
+    'اسمالعميل',
+    'الاسمالكامل',
+    'المشترك',
+    'اسمالمشتركين',
+  ],
+  phone: [
+    'phone',
+    'phonenumber',
+    'mobile',
+    'tel',
+    'رقمهاتف',
+    'رقمالهاف',
+    'رقمالھاتف',
+    'رقمالهاتف',
+    'الهاتف',
+    'التلفون',
+    'رقمتلفون',
+    'رقمالجوال',
+    'الجوال',
+    'رقمالموبايل',
+    'الموبايل',
+    'جوال',
+    'تلفون',
+  ],
+  previousReading: [
+    'previousreading',
+    'prevreading',
+    'القراءهالسابقه',
+    'قراءهسابقه',
+    'السابقه',
+  ],
+  previousDebt: [
+    'previousdebt',
+    'debt',
+    'balance',
+    'المتاخرات',
+    'متاخرات',
+    'الرصيدالسابق',
+    'الديون',
+    'المتبقي',
+    'مديونيه',
+  ],
+  zoneStreet: [
+    'zonestreet',
+    'zone',
+    'street',
+    'area',
+    'الحارهالشارع',
+    'الحاره',
+    'الشارع',
+    'المنطقه',
+    'المربع',
+    'الحي',
+  ],
+  sequenceOrder: [
+    'sequenceorder',
+    'sequence',
+    'seq',
+    'order',
+    'ترتيبالبيت',
+    'الترتيب',
+    'تسلسل',
+    'التسلسل',
+    'رقمالسلسله',
+    'م',
+  ],
+};
+
 export async function parseSubscribersExcelFile(
   file: File,
+  options?: { importedLocally?: boolean },
 ): Promise<Subscriber[]> {
   const buffer = await file.arrayBuffer();
   const workbook = XLSX.read(buffer, { type: 'array' });
   const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(firstSheet, {
+  const matrix = XLSX.utils.sheet_to_json<unknown[]>(firstSheet, {
+    header: 1,
     defval: '',
   });
 
+  if (matrix.length === 0) return [];
+
+  // Auto-detect actual header row in first 10 rows (handles title banners in old sheets)
+  let headerRowIndex = 0;
+  let bestScore = -1;
+  const maxScan = Math.min(10, matrix.length);
+  const allKnownHeaders = new Set(Object.values(EXCEL_HEADER_ALIASES).flat());
+
+  for (let r = 0; r < maxScan; r++) {
+    const row = matrix[r] ?? [];
+    let score = 0;
+    for (const cell of row) {
+      const norm = normalizeExcelHeader(cell);
+      if (norm && allKnownHeaders.has(norm)) score++;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      headerRowIndex = r;
+    }
+  }
+
+  const headerCells = (matrix[headerRowIndex] ?? []).map(normalizeExcelHeader);
+  const findColIndex = (aliases: string[]): number =>
+    headerCells.findIndex((h) => h && aliases.includes(h));
+
+  const idxMeter = findColIndex(EXCEL_HEADER_ALIASES.meterNumber);
+  const idxName = findColIndex(EXCEL_HEADER_ALIASES.subscriberName);
+  const idxPhone = findColIndex(EXCEL_HEADER_ALIASES.phone);
+  const idxPrevReading = findColIndex(EXCEL_HEADER_ALIASES.previousReading);
+  const idxPrevDebt = findColIndex(EXCEL_HEADER_ALIASES.previousDebt);
+  const idxZone = findColIndex(EXCEL_HEADER_ALIASES.zoneStreet);
+  const idxSeq = findColIndex(EXCEL_HEADER_ALIASES.sequenceOrder);
+
+  if (idxName === -1) {
+    return [];
+  }
+
   const ts = new Date().toISOString();
   const parsed: Subscriber[] = [];
+  const seenIds = new Set<string>();
 
-  rows.forEach((row, index) => {
-    const normalizeKey = (candidates: string[]): string => {
-      for (const key of Object.keys(row)) {
-        const lower = key.trim().toLowerCase();
-        if (candidates.includes(lower)) {
-          return String(row[key] ?? '').trim();
-        }
-      }
-      return '';
-    };
+  for (let r = headerRowIndex + 1; r < matrix.length; r++) {
+    const row = matrix[r] ?? [];
+    const subscriberName = String(row[idxName] ?? '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!subscriberName) continue;
 
-    const meterNumber = normalizeKey(['meter_number', 'رقم العداد']);
-    const subscriberName = normalizeKey(['subscriber_name', 'اسم المشترك']);
-    if (!meterNumber || !subscriberName) return;
+    const rawMeter =
+      idxMeter >= 0 ? normalizeArabicDigits(String(row[idxMeter] ?? '')).trim() : '';
+    const meterNumber = rawMeter || String(parsed.length + 1001);
 
-    const phone = normalizeKey(['phone', 'رقم الهاتف', 'الهاتف']);
+    const rawPhone =
+      idxPhone >= 0
+        ? normalizeArabicDigits(String(row[idxPhone] ?? ''))
+            .replace(/[^\d+]/g, '')
+            .trim()
+        : '';
+
     const prevReading =
-      Number(normalizeKey(['previous_reading', 'القراءة السابقة'])) || 0;
-    const prevDebt =
-      Number(normalizeKey(['previous_debt', 'المتأخرات'])) || 0;
+      idxPrevReading >= 0 ? parseExcelNumber(row[idxPrevReading]) : 0;
+    const prevDebt = idxPrevDebt >= 0 ? parseExcelNumber(row[idxPrevDebt]) : 0;
     const zoneStreet =
-      normalizeKey(['zone_street', 'الحارة/الشارع', 'الشارع', 'الحارة']) ||
-      'شارع عام';
+      (idxZone >= 0 ? String(row[idxZone] ?? '').trim() : '') || 'شارع عام';
     const seqOrder =
-      Number(normalizeKey(['sequence_order', 'ترتيب البيت', 'الترتيب'])) ||
-      index + 1;
+      idxSeq >= 0 && parseExcelNumber(row[idxSeq]) > 0
+        ? parseExcelNumber(row[idxSeq])
+        : parsed.length + 1;
+
+    let subId = sanitizeFirestoreId(`sub_${meterNumber}`);
+    if (seenIds.has(subId)) {
+      subId = sanitizeFirestoreId(`sub_${meterNumber}_${parsed.length + 1}`);
+    }
+    seenIds.add(subId);
 
     parsed.push({
-      id: sanitizeFirestoreId(`sub_${meterNumber}`),
+      id: subId,
       meterNumber,
       subscriberName,
-      phone: phone || '770000000',
+      phone: rawPhone || '770000000',
       previousReading: Math.max(0, prevReading),
       currentReading: Math.max(0, prevReading),
       previousDebtYer: Math.max(0, prevDebt),
       zoneStreet,
       sequenceOrder: Math.max(1, Math.round(seqOrder)),
-      syncStatus: 'pending',
+      ...(options?.importedLocally ? { importedLocally: true } : {}),
+      syncStatus: 'synced',
       updatedAt: ts,
     });
-  });
+  }
 
   return parsed;
 }
@@ -791,19 +805,151 @@ export async function parseSubscribersExcelFile(
 export function downloadExcelTemplate(): void {
   const sampleRows = [
     {
-      meter_number: '50101',
-      subscriber_name: 'اسم المشترك الكامل',
-      phone: '771112233',
-      previous_reading: 1200,
-      previous_debt: 0,
-      zone_street: 'اسم الحارة أو الشارع',
-      sequence_order: 1,
+      'رقم العداد': '50101',
+      'اسم المشترك': 'محمد علي صالح الحداد',
+      'رقم الهاتف': '771112233',
+      'القراءة السابقة': 1250,
+      'المتأخرات': 0,
+      'الحارة/الشارع': 'شارع تعز - جولة سواد',
+      'ترتيب البيت': 1,
+    },
+    {
+      'رقم العداد': '50102',
+      'اسم المشترك': 'عبدالله أحمد قاسم',
+      'رقم الهاتف': '773334455',
+      'القراءة السابقة': 840,
+      'المتأخرات': 3500,
+      'الحارة/الشارع': 'شارع تعز - جولة سواد',
+      'ترتيب البيت': 2,
     },
   ];
-  const worksheet = XLSX.utils.json_to_sheet(sampleRows);
+
+  const guideRows = [
+    {
+      'رأس العمود المطلوب (عربي)': 'اسم المشترك',
+      'البديل الإنجليزي المقبول': 'subscriber_name',
+      'الحالة': 'إلزامي',
+      'التوضيح': 'الاسم الكامل للمشترك كما سيستعلم به المشترك أو يبحث به المحصّل',
+    },
+    {
+      'رأس العمود المطلوب (عربي)': 'رقم الهاتف',
+      'البديل الإنجليزي المقبول': 'phone',
+      'الحالة': 'إلزامي لدخول المشترك',
+      'التوضيح': 'رقم الهاتف المسجل (مثال: 771112233) بدون مسافات',
+    },
+    {
+      'رأس العمود المطلوب (عربي)': 'رقم العداد',
+      'البديل الإنجليزي المقبول': 'meter_number',
+      'الحالة': 'موصى به جداً',
+      'التوضيح': 'رقم العداد الفريد لعدم تكرار أو دمج المشتركين خطأً',
+    },
+    {
+      'رأس العمود المطلوب (عربي)': 'القراءة السابقة',
+      'البديل الإنجليزي المقبول': 'previous_reading',
+      'الحالة': 'اختياري (الافتراضي 0)',
+      'التوضيح': 'آخر قراءة معتمدة للعداد بالكيلوواط ساعة',
+    },
+    {
+      'رأس العمود المطلوب (عربي)': 'المتأخرات',
+      'البديل الإنجليزي المقبول': 'previous_debt',
+      'الحالة': 'اختياري (الافتراضي 0)',
+      'التوضيح': 'الرصيد المتبقي أو المديونية السابقة بالريال اليمني',
+    },
+    {
+      'رأس العمود المطلوب (عربي)': 'الحارة/الشارع',
+      'البديل الإنجليزي المقبول': 'zone_street',
+      'الحالة': 'اختياري',
+      'التوضيح': 'اسم الحارة أو الشارع لتوزيع خط سير المحصّلين',
+    },
+    {
+      'رأس العمود المطلوب (عربي)': 'ترتيب البيت',
+      'البديل الإنجليزي المقبول': 'sequence_order',
+      'الحالة': 'اختياري',
+      'التوضيح': 'رقم تسلسلي لترتيب المنازل في خط السير الميداني',
+    },
+  ];
+
+  const mainSheet = XLSX.utils.json_to_sheet(sampleRows);
+  mainSheet['!cols'] = [
+    { wch: 14 },
+    { wch: 28 },
+    { wch: 15 },
+    { wch: 16 },
+    { wch: 14 },
+    { wch: 26 },
+    { wch: 14 },
+  ];
+
+  const guideSheet = XLSX.utils.json_to_sheet(guideRows);
+  guideSheet['!cols'] = [
+    { wch: 26 },
+    { wch: 24 },
+    { wch: 20 },
+    { wch: 52 },
+  ];
+
   const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, worksheet, 'subscribers');
-  XLSX.writeFile(workbook, 'نموذج_استيراد_المشتركين.xlsx');
+  XLSX.utils.book_append_sheet(workbook, mainSheet, 'كشف_المشتركين');
+  XLSX.utils.book_append_sheet(workbook, guideSheet, 'توضيح_الأعمدة');
+  XLSX.writeFile(workbook, 'نموذج_كشف_المشتركين_المعتمد.xlsx');
+}
+
+export function exportCollectorReadingsExcel(
+  state: StationLocalState,
+  collectorName?: string,
+): void {
+  const readingRows = state.readings.map((r) => ({
+    'رقم العداد': r.meterNumber,
+    'اسم المشترك': r.subscriberName,
+    'القراءة السابقة': r.previousReading,
+    'القراءة الحالية': r.currentReading,
+    'الاستهلاك (ك.و.س)': r.consumptionKwh,
+    'سعر الوحدة (ر.ي)': r.kwhPriceYer,
+    'مبلغ الاستهلاك (ر.ي)': r.currentBillYer,
+    'المتأخرات السابقة (ر.ي)': r.previousDebtYer,
+    'الإجمالي المستحق (ر.ي)': r.totalDueYer,
+    'صورة محفوظة بالهاتف': r.photoUrl || r.hasLocalPhoto ? 'نعم' : 'لا',
+    'المحصّل': r.collectorName,
+    'وقت القراءة': new Date(r.recordedAt).toLocaleString('ar-YE'),
+    'حالة المزامنة': r.syncStatus === 'synced' ? 'متزامن' : 'محلي غير مرفوع',
+  }));
+
+  const receiptRows = state.receipts.map((rc) => ({
+    'رقم السند': rc.id,
+    'رقم العداد': rc.meterNumber,
+    'اسم المشترك': rc.subscriberName,
+    'المبلغ المدفوع (ر.ي)': rc.amountPaidYer,
+    'الرصيد المتبقي (ر.ي)': rc.remainingBalanceYer,
+    'المحصّل': rc.collectorName,
+    'التاريخ': new Date(rc.paidAt).toLocaleString('ar-YE'),
+    'حالة المزامنة': rc.syncStatus === 'synced' ? 'متزامن' : 'محلي غير مرفوع',
+  }));
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.json_to_sheet(
+      readingRows.length > 0
+        ? readingRows
+        : [{ ملاحظة: 'لا توجد قراءات مسجلة حتى الآن' }],
+    ),
+    'القراءات_المسجلة',
+  );
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.json_to_sheet(
+      receiptRows.length > 0
+        ? receiptRows
+        : [{ ملاحظة: 'لا توجد سندات قبض مسجلة حتى الآن' }],
+    ),
+    'سندات_القبض',
+  );
+
+  const safeDate = new Date().toISOString().slice(0, 10);
+  const safeName = (collectorName || state.station.stationName)
+    .trim()
+    .replace(/\s+/g, '_');
+  XLSX.writeFile(wb, `قراءات_${safeName}_${safeDate}.xlsx`);
 }
 
 export function exportStationReportExcel(state: StationLocalState): void {
@@ -848,176 +994,4 @@ export function exportStationReportExcel(state: StationLocalState): void {
     wb,
     `تقرير_${state.station.stationName.replace(/\s+/g, '_')}.xlsx`,
   );
-}
-
-// ============================================================
-// Sync Pending Offline Changes to Isolated Station in Firestore
-// ============================================================
-
-export async function syncStationPendingToFirestore(
-  state: StationLocalState,
-  user: User,
-  role: 'manager' | 'collector',
-): Promise<{
-  updatedState: StationLocalState;
-  syncedCount: number;
-}> {
-  const stationId = state.station.stationId;
-  if (state.station.licenseStatus !== 'active') {
-    throw new Error('ترخيص هذه المحطة موقوف من قِبل الإدارة العليا.');
-  }
-
-  let syncedCount = 0;
-
-  if (role === 'manager') {
-    try {
-      await updateDoc(doc(db, 'stations', stationId), {
-        stationName: state.station.stationName,
-        kwhPriceYer: state.station.kwhPriceYer,
-        minimumFeeYer: state.station.minimumFeeYer,
-        mainGeneratorKwh: state.station.mainGeneratorKwh,
-        updatedAt: serverTimestamp(),
-      });
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, `stations/${stationId}`);
-    }
-  }
-
-  const pendingSubs = state.subscribers.filter((s) => s.syncStatus === 'pending');
-  if (pendingSubs.length > 0) {
-    const chunkSize = 350;
-    for (let i = 0; i < pendingSubs.length; i += chunkSize) {
-      const chunk = pendingSubs.slice(i, i + chunkSize);
-      const batch = writeBatch(db);
-      for (const sub of chunk) {
-        const subId = sanitizeFirestoreId(sub.id);
-        const subRef = doc(db, 'stations', stationId, 'subscribers', subId);
-        if (role === 'manager') {
-          batch.set(
-            subRef,
-            {
-              meterNumber: sub.meterNumber,
-              subscriberName: sub.subscriberName,
-              phone: sub.phone,
-              previousReading: sub.previousReading,
-              currentReading: sub.currentReading,
-              previousDebtYer: sub.previousDebtYer,
-              zoneStreet: sub.zoneStreet,
-              sequenceOrder: sub.sequenceOrder,
-              assignedCollectorId: sub.assignedCollectorId || '',
-              updatedAt: serverTimestamp(),
-            },
-            { merge: true },
-          );
-        } else {
-          batch.update(subRef, {
-            previousReading: sub.previousReading,
-            currentReading: sub.currentReading,
-            previousDebtYer: sub.previousDebtYer,
-            updatedAt: serverTimestamp(),
-          });
-        }
-        syncedCount++;
-      }
-      try {
-        await batch.commit();
-      } catch (error) {
-        handleFirestoreError(
-          error,
-          OperationType.WRITE,
-          `stations/${stationId}/subscribers`,
-        );
-      }
-    }
-  }
-
-  const pendingReadings = state.readings.filter((r) => r.syncStatus === 'pending');
-  for (const reading of pendingReadings) {
-    const rdId = sanitizeFirestoreId(reading.id);
-    const subId = sanitizeFirestoreId(reading.subscriberId);
-    const rdPath = `stations/${stationId}/readings/${rdId}`;
-    try {
-      await setDoc(doc(db, 'stations', stationId, 'readings', rdId), {
-        subscriberId: subId,
-        meterNumber: reading.meterNumber,
-        subscriberName: reading.subscriberName,
-        previousReading: reading.previousReading,
-        currentReading: reading.currentReading,
-        consumptionKwh: reading.consumptionKwh,
-        kwhPriceYer: reading.kwhPriceYer,
-        currentBillYer: reading.currentBillYer,
-        previousDebtYer: reading.previousDebtYer,
-        totalDueYer: reading.totalDueYer,
-        photoUrl: reading.photoUrl.slice(0, 215000),
-        photoSizeKb: Math.min(200, reading.photoSizeKb),
-        collectorUid: sanitizeFirestoreId(user.uid),
-        collectorName: reading.collectorName,
-        recordedAt: serverTimestamp(),
-        createdAt: serverTimestamp(),
-      });
-
-      const sub = state.subscribers.find((s) => s.id === reading.subscriberId);
-      if (sub) {
-        const portalHash = await computeSubscriberPortalHash(
-          sub.meterNumber,
-          sub.phone,
-        );
-        const lastReceipt = state.receipts.find(
-          (rc) => rc.readingId === reading.id,
-        );
-        await setDoc(doc(db, 'subscriberPortals', portalHash), {
-          stationId,
-          stationName: state.station.stationName,
-          meterNumber: sub.meterNumber,
-          subscriberName: sub.subscriberName,
-          zoneStreet: sub.zoneStreet,
-          previousReading: reading.previousReading,
-          currentReading: reading.currentReading,
-          consumptionKwh: reading.consumptionKwh,
-          currentBillYer: reading.currentBillYer,
-          previousDebtYer: sub.previousDebtYer,
-          totalDueYer: reading.totalDueYer,
-          lastReadingPhotoUrl: reading.photoUrl.slice(0, 215000),
-          lastPaymentYer: lastReceipt ? lastReceipt.amountPaidYer : 0,
-          updatedAt: serverTimestamp(),
-        });
-      }
-      syncedCount++;
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, rdPath);
-    }
-  }
-
-  const pendingReceipts = state.receipts.filter((rc) => rc.syncStatus === 'pending');
-  for (const receipt of pendingReceipts) {
-    const rcId = sanitizeFirestoreId(receipt.id);
-    const rcPath = `stations/${stationId}/receipts/${rcId}`;
-    try {
-      await setDoc(doc(db, 'stations', stationId, 'receipts', rcId), {
-        subscriberId: sanitizeFirestoreId(receipt.subscriberId),
-        meterNumber: receipt.meterNumber,
-        subscriberName: receipt.subscriberName,
-        readingId: sanitizeFirestoreId(receipt.readingId),
-        amountPaidYer: Math.max(1, receipt.amountPaidYer),
-        remainingBalanceYer: Math.max(0, receipt.remainingBalanceYer),
-        collectorUid: sanitizeFirestoreId(user.uid),
-        collectorName: receipt.collectorName,
-        paidAt: serverTimestamp(),
-        createdAt: serverTimestamp(),
-      });
-      syncedCount++;
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, rcPath);
-    }
-  }
-
-  const updatedState: StationLocalState = {
-    ...state,
-    subscribers: state.subscribers.map((s) => ({ ...s, syncStatus: 'synced' })),
-    readings: state.readings.map((r) => ({ ...r, syncStatus: 'synced' })),
-    receipts: state.receipts.map((rc) => ({ ...rc, syncStatus: 'synced' })),
-  };
-  saveStationLocalState(updatedState);
-
-  return { updatedState, syncedCount };
 }

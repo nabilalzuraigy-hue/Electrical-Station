@@ -1,95 +1,272 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Check,
   Copy,
+  Download,
+  FileSpreadsheet,
   KeyRound,
+  Lock,
+  LogOut,
   PlusCircle,
   RefreshCw,
   ShieldCheck,
+  Upload,
 } from 'lucide-react';
 import {
-  fetchAllLicenses,
-  fetchAllStationsAdmin,
-  issueStationLicense,
-  setStationLicenseStatus,
+  claimAdminPasscode,
+  downloadExcelTemplate,
+  fetchAdminOverview,
+  generateAccessCodeAdmin,
+  getAdminStatus,
+  loginAdminPasscode,
+  parseSubscribersExcelFile,
+  toggleAccessCodeAdmin,
+  toggleStationStatusAdmin,
+  uploadSubscribersChunkedAdmin,
 } from '../lib/offlineDb';
-import type { LicenseRecord, StationConfig } from '../types/station';
+import type { AccessCodeRecord, StationConfig } from '../types/station';
 
-export const AdminLicensingPanel: React.FC = () => {
-  const [licenses, setLicenses] = useState<LicenseRecord[]>([]);
+interface AdminLicensingPanelProps {
+  adminToken: string | null;
+  onAdminAuthenticated: (token: string) => void;
+  onLogoutAdmin: () => void;
+}
+
+export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
+  adminToken,
+  onAdminAuthenticated,
+  onLogoutAdmin,
+}) => {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const [checkingStatus, setCheckingStatus] = useState(true);
+  const [configured, setConfigured] = useState(true);
+  const [passcodeInput, setPasscodeInput] = useState('');
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+
   const [stations, setStations] = useState<StationConfig[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [issuing, setIssuing] = useState(false);
-  const [copiedCode, setCopiedCode] = useState<string | null>(null);
+  const [codes, setCodes] = useState<AccessCodeRecord[]>([]);
+  const [loading, setLoading] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [copiedCode, setCopiedCode] = useState<string | null>(null);
 
-  // Issue license form
-  const [stationName, setStationName] = useState('');
-  const [maxCollectors, setMaxCollectors] = useState('5');
-  const [maxSubscribers, setMaxSubscribers] = useState('1500');
-  const [validityDays, setValidityDays] = useState('365');
+  // Manual code generation state
+  const [personName, setPersonName] = useState('');
+  const [personRole, setPersonRole] = useState<'manager' | 'collector'>('manager');
+  const [targetStationId, setTargetStationId] = useState('');
+  const [newStationName, setNewStationName] = useState('');
+  const [personPhone, setPersonPhone] = useState('');
+  const [assignedZones, setAssignedZones] = useState('');
+  const [customCode, setCustomCode] = useState('');
+  const [permReadings, setPermReadings] = useState(true);
+  const [permCash, setPermCash] = useState(true);
+  const [permInvoices, setPermInvoices] = useState(true);
+  const [permDebts, setPermDebts] = useState(true);
+  const [issuing, setIssuing] = useState(false);
 
-  const loadAdminData = async () => {
+  // Admin-exclusive Excel upload state
+  const [excelStationId, setExcelStationId] = useState('');
+  const [replaceAllSubs, setReplaceAllSubs] = useState(false);
+  const [uploadingExcel, setUploadingExcel] = useState(false);
+  const [excelProgress, setExcelProgress] = useState<{
+    uploaded: number;
+    total: number;
+  } | null>(null);
+
+  useEffect(() => {
+    if (adminToken) {
+      setCheckingStatus(false);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await getAdminStatus();
+        if (!cancelled) {
+          setConfigured(res.configured);
+        }
+      } catch {
+        if (!cancelled) setConfigured(true);
+      } finally {
+        if (!cancelled) setCheckingStatus(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [adminToken]);
+
+  const loadAdminData = useCallback(async () => {
+    if (!adminToken) return;
     setLoading(true);
     try {
-      const [lics, sts] = await Promise.all([
-        fetchAllLicenses(),
-        fetchAllStationsAdmin(),
-      ]);
-      setLicenses(lics);
-      setStations(sts);
+      const data = await fetchAdminOverview(adminToken);
+      setStations(data.stations);
+      setCodes(data.codes);
+      if (data.stations.length > 0) {
+        setTargetStationId((prev) => prev || data.stations[0].stationId);
+        setExcelStationId((prev) => prev || data.stations[0].stationId);
+      }
     } catch (err) {
       setFeedback(
-        err instanceof Error ? err.message : 'تعذر تحميل التراخيص من Firestore',
+        err instanceof Error ? err.message : 'تعذر تحميل بيانات الإدارة.',
       );
     } finally {
       setLoading(false);
     }
-  };
+  }, [adminToken]);
 
   useEffect(() => {
-    void loadAdminData();
-  }, []);
+    if (adminToken) {
+      void loadAdminData();
+    }
+  }, [adminToken, loadAdminData]);
 
-  const handleIssueLicense = async (e: React.FormEvent) => {
+  const handlePasscodeSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!stationName.trim()) {
-      setFeedback('يرجى كتابة اسم المحطة المشتَرية للنسخة.');
+    if (!passcodeInput.trim()) return;
+    setAuthSubmitting(true);
+    setAuthError(null);
+    try {
+      const res = configured
+        ? await loginAdminPasscode(passcodeInput.trim())
+        : await claimAdminPasscode(passcodeInput.trim());
+      setPasscodeInput('');
+      onAdminAuthenticated(res.token);
+    } catch (err) {
+      setAuthError(
+        err instanceof Error ? err.message : 'تعذر التحقق من كلمة مرور الأدمن.',
+      );
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleGenerateCode = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!adminToken) return;
+    if (personName.trim().length < 2) {
+      setFeedback('يرجى إدخال اسم الشخص (حرفان على الأقل).');
       return;
     }
+    if (!targetStationId && newStationName.trim().length < 2) {
+      setFeedback('يرجى اختيار محطة قائمة أو كتابة اسم محطة جديدة.');
+      return;
+    }
+
     setIssuing(true);
     setFeedback(null);
     try {
-      const created = await issueStationLicense({
-        stationName,
-        maxCollectors: Number(maxCollectors) || 5,
-        maxSubscribers: Number(maxSubscribers) || 1500,
-        validityDays: Number(validityDays) || 365,
+      const zonesList = assignedZones
+        .split(/[،,]/)
+        .map((z) => z.trim())
+        .filter(Boolean);
+
+      const res = await generateAccessCodeAdmin(adminToken, {
+        name: personName.trim(),
+        role: personRole,
+        stationId: targetStationId || undefined,
+        newStationName: !targetStationId ? newStationName.trim() : undefined,
+        phone: personPhone.trim(),
+        assignedZones: zonesList,
+        customCode: customCode.trim() || undefined,
+        permissions: {
+          canRecordReadings: permReadings,
+          canCollectCash: permCash,
+          canSendInvoices: permInvoices,
+          canViewDebts: permDebts,
+        },
       });
-      setLicenses((prev) => [created, ...prev]);
-      setStationName('');
-      setFeedback(`تم إصدار كود التفعيل بنجاح: ${created.code}`);
+
+      setPersonName('');
+      setPersonPhone('');
+      setAssignedZones('');
+      setCustomCode('');
+      setNewStationName('');
+      setTargetStationId(res.station.stationId);
+      setExcelStationId(res.station.stationId);
+      setFeedback(
+        `تم توليد كود ${res.codeRecord.role === 'manager' ? 'مدير المحطة' : 'المحصّل'} (${res.codeRecord.name}): ${res.codeRecord.code}`,
+      );
+      await loadAdminData();
     } catch (err) {
       setFeedback(
-        err instanceof Error ? err.message : 'تعذر إصدار كود الترخيص.',
+        err instanceof Error ? err.message : 'تعذر توليد الكود.',
       );
     } finally {
       setIssuing(false);
     }
   };
 
-  const handleToggleStatus = async (lic: LicenseRecord) => {
-    const nextStatus = lic.status === 'suspended' ? 'active' : 'suspended';
+  const handleExcelUpload = async (
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = event.target.files?.[0];
+    if (!file || !adminToken) return;
+    if (!excelStationId) {
+      setFeedback('يرجى اختيار المحطة المستهدفة لرفع كشف المشتركين إليها.');
+      event.target.value = '';
+      return;
+    }
+
+    setUploadingExcel(true);
+    setFeedback(null);
+    setExcelProgress(null);
+
     try {
-      await setStationLicenseStatus({
-        licenseCode: lic.code,
-        stationId: lic.stationId,
-        nextStatus,
+      const parsed = await parseSubscribersExcelFile(file);
+      if (parsed.length === 0) {
+        setFeedback(
+          'لم يتم العثور على صفوف صالحة. تأكد من وجود عمود الاسم (subscriber_name / اسم المشترك) ورقم الهاتف (phone / رقم الهاتف).',
+        );
+        return;
+      }
+
+      const res = await uploadSubscribersChunkedAdmin(adminToken, {
+        stationId: excelStationId,
+        subscribers: parsed,
+        replaceAll: replaceAllSubs,
+        onProgress: (uploaded, total) => setExcelProgress({ uploaded, total }),
       });
+
+      setFeedback(
+        `تم رفع ${parsed.length} مشترك بنجاح إلى المحطة (إجمالي المشتركين الآن: ${res.totalSubscribers}).`,
+      );
       await loadAdminData();
     } catch (err) {
       setFeedback(
-        err instanceof Error ? err.message : 'تعذر تحديث حالة الترخيص.',
+        err instanceof Error ? err.message : 'تعذر قراءة أو رفع ملف Excel.',
+      );
+    } finally {
+      setUploadingExcel(false);
+      setExcelProgress(null);
+      event.target.value = '';
+    }
+  };
+
+  const handleToggleCode = async (rec: AccessCodeRecord) => {
+    if (!adminToken) return;
+    try {
+      await toggleAccessCodeAdmin(adminToken, rec.code, { active: !rec.active });
+      await loadAdminData();
+    } catch (err) {
+      setFeedback(err instanceof Error ? err.message : 'تعذر تحديث حالة الكود.');
+    }
+  };
+
+  const handleToggleStation = async (st: StationConfig) => {
+    if (!adminToken) return;
+    try {
+      await toggleStationStatusAdmin(
+        adminToken,
+        st.stationId,
+        st.licenseStatus === 'active' ? 'suspended' : 'active',
+      );
+      await loadAdminData();
+    } catch (err) {
+      setFeedback(
+        err instanceof Error ? err.message : 'تعذر تحديث حالة المحطة.',
       );
     }
   };
@@ -100,177 +277,493 @@ export const AdminLicensingPanel: React.FC = () => {
     setTimeout(() => setCopiedCode(null), 2000);
   };
 
-  const activeCount = licenses.filter((l) => l.status === 'active').length;
-  const unusedCount = licenses.filter((l) => l.status === 'unused').length;
-  const suspendedCount = licenses.filter((l) => l.status === 'suspended').length;
+  if (!adminToken) {
+    return (
+      <div className="max-w-md mx-auto py-10">
+        <div className="bg-white border border-slate-200 rounded-xl p-6 sm:p-8 space-y-5">
+          <div className="space-y-1.5">
+            <h1 className="text-xl font-bold text-slate-900 flex items-center gap-2">
+              <Lock className="w-5 h-5 text-teal-700" />
+              {checkingStatus
+                ? 'جاري التحقق من لوحة الأدمن...'
+                : configured
+                  ? 'دخول الأدمن المطور'
+                  : 'تعيين كلمة مرور الأدمن المطور لأول مرة'}
+            </h1>
+            <p className="text-xs text-slate-600 leading-relaxed">
+              {configured
+                ? 'أدخل كلمة مرور الأدمن المطور لإدارة المحطات، رفع كشوفات Excel للمشتركين، وتوليد أكواد مديري المحطات والمحصّلين.'
+                : 'لم يتم حفظ كلمة مرور للأدمن بعد على الخادم. أدخل كلمة المرور المعتمدة الآن لتثبيتها بشكل دائم ومشفّر.'}
+            </p>
+          </div>
+
+          <form onSubmit={handlePasscodeSubmit} className="space-y-4">
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                كلمة مرور الأدمن
+              </label>
+              <input
+                type="password"
+                dir="ltr"
+                value={passcodeInput}
+                onChange={(e) => setPasscodeInput(e.target.value)}
+                placeholder="••••••••"
+                className="w-full min-h-[46px] px-3 py-2 text-sm font-mono-nums border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+              />
+            </div>
+
+            {authError && (
+              <p className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-3">
+                {authError}
+              </p>
+            )}
+
+            <button
+              type="submit"
+              disabled={authSubmitting || checkingStatus}
+              className="w-full min-h-[46px] py-2.5 px-4 bg-teal-700 hover:bg-teal-800 text-white text-sm font-bold rounded-lg transition-colors cursor-pointer"
+            >
+              {authSubmitting
+                ? 'جاري التحقق...'
+                : configured
+                  ? 'دخول لوحة الأدمن المطور'
+                  : 'تثبيت كلمة المرور والدخول'}
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-8">
+      {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-200 pb-6">
         <div>
           <h1 className="text-2xl font-bold text-slate-900 flex items-center gap-2">
             <ShieldCheck className="w-6 h-6 text-teal-700" />
-            لوحة الأدمن · إصدار أكواد الترخيص والنسخ المستقلة
+            لوحة الأدمن المطور · الصلاحية المطلقة
           </h1>
           <p className="text-sm text-slate-600 mt-1">
-            كل كود ترخيص ينشئ نسخة محطة مستقلة ومعزولة بالكامل عن بقية المحطات في قاعدة البيانات.
+            توليد أكواد مديري المحطات والمحصّلين يدوياً، ورفع كشوفات Excel للمشتركين لكل محطة معزولة.
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={() => void loadAdminData()}
-          disabled={loading}
-          className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium bg-white border border-slate-300 text-slate-800 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
-        >
-          <RefreshCw className="w-4 h-4" />
-          تحديث السجل
-        </button>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={() => void loadAdminData()}
+            disabled={loading}
+            className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium bg-white border border-slate-300 text-slate-800 rounded-lg hover:bg-slate-50 cursor-pointer"
+          >
+            <RefreshCw className="w-4 h-4" />
+            تحديث
+          </button>
+          <button
+            type="button"
+            onClick={onLogoutAdmin}
+            className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg cursor-pointer"
+          >
+            <LogOut className="w-4 h-4" />
+            قفل لوحة الأدمن
+          </button>
+        </div>
       </div>
 
-      {/* Summary Metrics */}
+      {/* Summary Cards */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="bg-white border border-slate-200 rounded-xl p-5">
-          <div className="text-xs text-slate-500">إجمالي التراخيص المصدرة</div>
+          <div className="text-xs text-slate-500">المحطات المستقلة</div>
           <div className="text-2xl font-bold text-slate-900 font-mono-nums mt-2">
-            {licenses.length}
+            {stations.length}
           </div>
         </div>
         <div className="bg-white border border-slate-200 rounded-xl p-5">
-          <div className="text-xs text-slate-500">محطات نشطة ومعزولة</div>
+          <div className="text-xs text-slate-500">أكواد مديري المحطات</div>
           <div className="text-2xl font-bold text-teal-700 font-mono-nums mt-2">
-            {activeCount}
+            {codes.filter((c) => c.role === 'manager').length}
           </div>
         </div>
         <div className="bg-white border border-slate-200 rounded-xl p-5">
-          <div className="text-xs text-slate-500">أكواد جاهزة للبيع</div>
+          <div className="text-xs text-slate-500">أكواد المحصّلين</div>
           <div className="text-2xl font-bold text-slate-900 font-mono-nums mt-2">
-            {unusedCount}
+            {codes.filter((c) => c.role === 'collector').length}
           </div>
         </div>
         <div className="bg-white border border-slate-200 rounded-xl p-5">
-          <div className="text-xs text-slate-500">محطات موقوفة</div>
-          <div className="text-2xl font-bold text-rose-700 font-mono-nums mt-2">
-            {suspendedCount}
+          <div className="text-xs text-slate-500">إجمالي المشتركين المرفوعين</div>
+          <div className="text-2xl font-bold text-slate-900 font-mono-nums mt-2">
+            {stations.reduce((sum, s) => sum + (s.subscriberCount ?? 0), 0)}
           </div>
         </div>
       </div>
 
-      {/* Issue New License Code */}
-      <section className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
-        <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
-          <KeyRound className="w-5 h-5 text-teal-700" />
-          إصدار كود ترخيص جديد لمحطة مستقلة
-        </h2>
-
-        <form
-          onSubmit={handleIssueLicense}
-          className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 items-end"
-        >
-          <div className="lg:col-span-2">
-            <label className="block text-xs font-medium text-slate-700 mb-1">
-              اسم المحطة التجارية
-            </label>
-            <input
-              type="text"
-              value={stationName}
-              onChange={(e) => setStationName(e.target.value)}
-              placeholder="مثال: محطة الفتح التجارية - تعز"
-              className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-slate-700 mb-1">
-              الحد الأقصى للمحصّلين
-            </label>
-            <input
-              type="number"
-              min={1}
-              value={maxCollectors}
-              onChange={(e) => setMaxCollectors(e.target.value)}
-              className="w-full px-3 py-2 text-sm font-mono-nums border border-slate-300 rounded-lg"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-slate-700 mb-1">
-              المدة (بالأيام)
-            </label>
-            <input
-              type="number"
-              min={30}
-              value={validityDays}
-              onChange={(e) => setValidityDays(e.target.value)}
-              className="w-full px-3 py-2 text-sm font-mono-nums border border-slate-300 rounded-lg"
-            />
-          </div>
-          <button
-            type="submit"
-            disabled={issuing}
-            className="min-h-[42px] px-4 py-2 bg-teal-700 hover:bg-teal-800 text-white text-sm font-medium rounded-lg inline-flex items-center justify-center gap-2 whitespace-nowrap cursor-pointer"
-          >
-            <PlusCircle className="w-4 h-4" />
-            {issuing ? 'جاري الإصدار...' : 'توليد كود ترخيص'}
-          </button>
-        </form>
-
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-md">
-          <div>
-            <label className="block text-xs font-medium text-slate-700 mb-1">
-              سعة المشتركين المسموحة للنسخة
-            </label>
-            <input
-              type="number"
-              min={50}
-              value={maxSubscribers}
-              onChange={(e) => setMaxSubscribers(e.target.value)}
-              className="w-full px-3 py-2 text-sm font-mono-nums border border-slate-300 rounded-lg"
-            />
-          </div>
+      {feedback && (
+        <div className="text-xs font-medium text-teal-900 bg-teal-50 border border-teal-200 rounded-lg px-4 py-3">
+          {feedback}
         </div>
+      )}
 
-        {feedback && (
-          <div className="text-xs font-medium text-teal-900 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2.5">
-            {feedback}
+      {/* Main Grid: Manual Code Generator + Admin-Exclusive Excel Upload */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+        {/* Manual Manager/Collector Code Generator */}
+        <section className="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-6 space-y-4">
+          <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+            <KeyRound className="w-5 h-5 text-teal-700" />
+            توليد كود يدوي (مدير محطة / محصّل)
+          </h2>
+
+          <form onSubmit={handleGenerateCode} className="space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  الاسم الكامل
+                </label>
+                <input
+                  type="text"
+                  value={personName}
+                  onChange={(e) => setPersonName(e.target.value)}
+                  placeholder="أدخل اسم المدير أو المحصّل"
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  الصفة الوظيفية
+                </label>
+                <select
+                  value={personRole}
+                  onChange={(e) =>
+                    setPersonRole(
+                      e.target.value === 'collector' ? 'collector' : 'manager',
+                    )
+                  }
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white"
+                >
+                  <option value="manager">مدير محطة</option>
+                  <option value="collector">محصّل ميداني</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  المحطة المرتبطة
+                </label>
+                <select
+                  value={targetStationId}
+                  onChange={(e) => setTargetStationId(e.target.value)}
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white"
+                >
+                  <option value="">+ إنشاء محطة جديدة</option>
+                  {stations.map((st) => (
+                    <option key={st.stationId} value={st.stationId}>
+                      {st.stationName} ({st.subscriberCount ?? 0} مشترك)
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {!targetStationId ? (
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    اسم المحطة الجديدة
+                  </label>
+                  <input
+                    type="text"
+                    value={newStationName}
+                    onChange={(e) => setNewStationName(e.target.value)}
+                    placeholder="اكتب اسم المحطة الجديدة"
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
+                  />
+                </div>
+              ) : (
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    رقم الهاتف (اختياري)
+                  </label>
+                  <input
+                    type="tel"
+                    value={personPhone}
+                    onChange={(e) => setPersonPhone(e.target.value)}
+                    placeholder="77xxxxxxx"
+                    className="w-full px-3 py-2 text-sm font-mono-nums border border-slate-300 rounded-lg"
+                  />
+                </div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  كود مخصص (اختياري — يُولّد تلقائياً إذا تُرك فارغاً)
+                </label>
+                <input
+                  type="text"
+                  dir="ltr"
+                  value={customCode}
+                  onChange={(e) => setCustomCode(e.target.value.toUpperCase())}
+                  placeholder={
+                    personRole === 'manager' ? 'MGR-XXXX-XXXX' : 'COL-XXXX-XXXX'
+                  }
+                  className="w-full px-3 py-2 text-sm font-mono-nums border border-slate-300 rounded-lg"
+                />
+              </div>
+
+              {personRole === 'collector' && (
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    الحارات / الشوارع المخصصة (مفصولة بفاصلة)
+                  </label>
+                  <input
+                    type="text"
+                    value={assignedZones}
+                    onChange={(e) => setAssignedZones(e.target.value)}
+                    placeholder="اتركه فارغاً لجميع الحارات"
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
+                  />
+                </div>
+              )}
+            </div>
+
+            {personRole === 'collector' && (
+              <div className="flex flex-wrap items-center gap-4 text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-lg p-3">
+                <span className="font-semibold text-slate-900">صلاحيات المحصّل:</span>
+                <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={permReadings}
+                    onChange={(e) => setPermReadings(e.target.checked)}
+                    className="accent-teal-700"
+                  />
+                  تسجيل القراءات والتصوير
+                </label>
+                <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={permCash}
+                    onChange={(e) => setPermCash(e.target.checked)}
+                    className="accent-teal-700"
+                  />
+                  تحصيل النقد والسندات
+                </label>
+                <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={permInvoices}
+                    onChange={(e) => setPermInvoices(e.target.checked)}
+                    className="accent-teal-700"
+                  />
+                  إرسال فواتير واتساب / SMS
+                </label>
+                <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={permDebts}
+                    onChange={(e) => setPermDebts(e.target.checked)}
+                    className="accent-teal-700"
+                  />
+                  الاطلاع على المتأخرات
+                </label>
+              </div>
+            )}
+
+            <button
+              type="submit"
+              disabled={issuing}
+              className="w-full sm:w-auto min-h-[44px] px-5 py-2.5 bg-teal-700 hover:bg-teal-800 text-white text-sm font-medium rounded-lg inline-flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <PlusCircle className="w-4 h-4" />
+              {issuing ? 'جاري التوليد...' : 'توليد الكود الآن'}
+            </button>
+          </form>
+        </section>
+
+        {/* Admin-Exclusive Excel Upload (supports 3,000 - 5,000+ subscribers in chunks) */}
+        <section className="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-6 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+              <FileSpreadsheet className="w-5 h-5 text-teal-700" />
+              رفع كشف Excel المشتركين
+            </h2>
           </div>
-        )}
-      </section>
 
-      {/* Licenses & Isolated Stations Table */}
+          <p className="text-xs text-slate-600 leading-relaxed">
+            صلاحية حصرية للأدمن المطور. يدعم رفع كشوفات كبيرة (3,000 إلى 5,000+ مشترك) عبر دفعات آمنة. يدخل المشترك لاحقاً بالاسم الكامل ورقم الهاتف المرفوع في الكشف.
+          </p>
+
+          <button
+            type="button"
+            onClick={downloadExcelTemplate}
+            className="w-full min-h-[42px] px-4 py-2 bg-teal-50 hover:bg-teal-100 border border-teal-200 text-teal-900 text-xs font-bold rounded-lg inline-flex items-center justify-center gap-2 transition-colors cursor-pointer"
+          >
+            <Download className="w-4 h-4 text-teal-700" />
+            تنزيل ملف Excel نموذجي يوضح رؤوس الأعمدة المطلوبة
+          </button>
+
+          <div>
+            <label className="block text-xs font-medium text-slate-700 mb-1">
+              اختر المحطة المستهدفة
+            </label>
+            <select
+              value={excelStationId}
+              onChange={(e) => setExcelStationId(e.target.value)}
+              className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white"
+            >
+              <option value="">-- اختر محطة --</option>
+              {stations.map((st) => (
+                <option key={st.stationId} value={st.stationId}>
+                  {st.stationName} ({st.subscriberCount ?? 0} مشترك)
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={replaceAllSubs}
+              onChange={(e) => setReplaceAllSubs(e.target.checked)}
+              className="accent-teal-700"
+            />
+            استبدال الكشف السابق للمحطة بالكامل عند الرفع
+          </label>
+
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".xlsx,.xls,.csv"
+            onChange={handleExcelUpload}
+            className="hidden"
+          />
+
+          <button
+            type="button"
+            disabled={uploadingExcel || !excelStationId}
+            onClick={() => fileInputRef.current?.click()}
+            className="w-full min-h-[46px] py-2.5 px-4 bg-slate-900 hover:bg-slate-800 disabled:bg-slate-300 text-white text-sm font-medium rounded-lg inline-flex items-center justify-center gap-2 cursor-pointer"
+          >
+            <Upload className="w-4 h-4" />
+            {uploadingExcel
+              ? excelProgress
+                ? `جاري الرفع (${excelProgress.uploaded} / ${excelProgress.total})...`
+                : 'جاري قراءة الملف...'
+              : 'اختيار ملف Excel ورفع الكشف للمحطة'}
+          </button>
+
+          <div className="text-[11px] text-slate-600 bg-slate-50 border border-slate-200 rounded-lg p-3 leading-relaxed space-y-1">
+            <div className="font-semibold text-slate-800">رؤوس الأعمدة المطلوبة (بالعربية أو الإنجليزية):</div>
+            <div>رقم العداد · اسم المشترك · رقم الهاتف · القراءة السابقة · المتأخرات · الحارة/الشارع · ترتيب البيت</div>
+          </div>
+        </section>
+      </div>
+
+      {/* Stations Table */}
       <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-        <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+        <div className="px-6 py-4 border-b border-slate-200">
           <h2 className="text-base font-bold text-slate-900">
-            سجل الأكواد والتراخيص ({stations.length} محطة مفعّلة)
+            المحطات المعزولة المسجلة ({stations.length})
           </h2>
         </div>
-
         <div className="overflow-x-auto">
           <table className="w-full text-sm text-right">
             <thead className="bg-slate-50 text-slate-600 text-xs border-b border-slate-200">
               <tr>
-                <th className="py-3 px-4 font-medium">كود التفعيل</th>
-                <th className="py-3 px-4 font-medium">اسم المحطة المعزولة</th>
-                <th className="py-3 px-4 font-medium">الحساب المفعّل</th>
-                <th className="py-3 px-4 font-medium">السعة</th>
-                <th className="py-3 px-4 font-medium">تاريخ الانتهاء</th>
+                <th className="py-3 px-4 font-medium">اسم المحطة</th>
+                <th className="py-3 px-4 font-medium">المشتركين</th>
+                <th className="py-3 px-4 font-medium">القراءات</th>
+                <th className="py-3 px-4 font-medium">التعرفة</th>
                 <th className="py-3 px-4 font-medium">الحالة</th>
-                <th className="py-3 px-4 font-medium">تحكم الأدمن</th>
+                <th className="py-3 px-4 font-medium">إجراء</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {licenses.map((lic) => (
-                <tr key={lic.code} className="hover:bg-slate-50/70">
+              {stations.map((st) => (
+                <tr key={st.stationId}>
+                  <td className="py-3 px-4 font-semibold text-slate-900">
+                    {st.stationName}
+                  </td>
+                  <td className="py-3 px-4 font-mono-nums">
+                    {st.subscriberCount ?? 0}
+                  </td>
+                  <td className="py-3 px-4 font-mono-nums">
+                    {st.readingCount ?? 0}
+                  </td>
+                  <td className="py-3 px-4 font-mono-nums">
+                    {st.kwhPriceYer} ر.ي
+                  </td>
+                  <td className="py-3 px-4 text-xs font-semibold">
+                    {st.licenseStatus === 'active' ? (
+                      <span className="text-teal-700">نشطة</span>
+                    ) : (
+                      <span className="text-rose-700">موقوفة</span>
+                    )}
+                  </td>
+                  <td className="py-3 px-4">
+                    <button
+                      type="button"
+                      onClick={() => void handleToggleStation(st)}
+                      className={`px-3 py-1.5 text-xs font-medium rounded-lg border cursor-pointer ${
+                        st.licenseStatus === 'active'
+                          ? 'border-rose-200 bg-rose-50 text-rose-800'
+                          : 'border-teal-200 bg-teal-50 text-teal-800'
+                      }`}
+                    >
+                      {st.licenseStatus === 'active' ? 'إيقاف' : 'تفعيل'}
+                    </button>
+                  </td>
+                </tr>
+              ))}
+              {stations.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="py-8 text-center text-slate-500 text-xs">
+                    لا توجد محطات بعد. ولّد أول كود مدير محطة من النموذج أعلاه ليتم إنشاء المحطة تلقائياً.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      {/* Generated Access Codes Table */}
+      <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+        <div className="px-6 py-4 border-b border-slate-200">
+          <h2 className="text-base font-bold text-slate-900">
+            سجل أكواد مديري المحطات والمحصّلين ({codes.length})
+          </h2>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm text-right">
+            <thead className="bg-slate-50 text-slate-600 text-xs border-b border-slate-200">
+              <tr>
+                <th className="py-3 px-4 font-medium">الكود</th>
+                <th className="py-3 px-4 font-medium">الاسم</th>
+                <th className="py-3 px-4 font-medium">الصفة</th>
+                <th className="py-3 px-4 font-medium">المحطة</th>
+                <th className="py-3 px-4 font-medium">الحالة</th>
+                <th className="py-3 px-4 font-medium">تحكم</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {codes.map((rec) => (
+                <tr key={rec.code}>
                   <td className="py-3 px-4">
                     <div className="flex items-center gap-2">
-                      <span className="font-mono-nums font-bold text-slate-900">
-                        {lic.code}
+                      <span
+                        dir="ltr"
+                        className="font-mono-nums font-bold text-slate-900"
+                      >
+                        {rec.code}
                       </span>
                       <button
                         type="button"
-                        onClick={() => void handleCopyCode(lic.code)}
+                        onClick={() => void handleCopyCode(rec.code)}
                         className="p-1 text-slate-500 hover:text-teal-700 cursor-pointer"
-                        title="نسخ الكود"
                       >
-                        {copiedCode === lic.code ? (
+                        {copiedCode === rec.code ? (
                           <Check className="w-3.5 h-3.5 text-teal-700" />
                         ) : (
                           <Copy className="w-3.5 h-3.5" />
@@ -278,60 +771,45 @@ export const AdminLicensingPanel: React.FC = () => {
                       </button>
                     </div>
                   </td>
-                  <td className="py-3 px-4">
-                    <div className="font-medium text-slate-900">
-                      {lic.stationName}
-                    </div>
-                    <div className="text-xs text-slate-500 font-mono-nums">
-                      {lic.stationId}
-                    </div>
-                  </td>
-                  <td className="py-3 px-4 text-xs text-slate-600">
-                    {lic.activatedByEmail || 'لم يُفعّل بعد'}
-                  </td>
-                  <td className="py-3 px-4 text-xs text-slate-600 font-mono-nums">
-                    {lic.maxCollectors} محصّل · {lic.maxSubscribers} مشترك
-                  </td>
-                  <td className="py-3 px-4 text-xs text-slate-600 font-mono-nums">
-                    {new Date(lic.expiresAt).toLocaleDateString('ar-YE')}
+                  <td className="py-3 px-4 font-medium text-slate-900">
+                    {rec.name}
                   </td>
                   <td className="py-3 px-4 text-xs font-semibold">
-                    {lic.status === 'active' && (
-                      <span className="text-teal-700">مفعّلة ونشطة</span>
+                    {rec.role === 'manager' ? (
+                      <span className="text-teal-800">مدير محطة</span>
+                    ) : (
+                      <span className="text-slate-700">محصّل ميداني</span>
                     )}
-                    {lic.status === 'unused' && (
-                      <span className="text-slate-700">جاهز للتفعيل</span>
-                    )}
-                    {lic.status === 'suspended' && (
-                      <span className="text-rose-700">موقوفة</span>
-                    )}
-                    {lic.status === 'expired' && (
-                      <span className="text-amber-700">منتهية</span>
+                  </td>
+                  <td className="py-3 px-4 text-xs text-slate-600">
+                    {rec.stationName}
+                  </td>
+                  <td className="py-3 px-4 text-xs font-semibold">
+                    {rec.active ? (
+                      <span className="text-teal-700">مفعّل</span>
+                    ) : (
+                      <span className="text-rose-700">موقوف</span>
                     )}
                   </td>
                   <td className="py-3 px-4">
-                    {lic.status !== 'unused' && (
-                      <button
-                        type="button"
-                        onClick={() => void handleToggleStatus(lic)}
-                        className={`px-3 py-1.5 text-xs font-medium rounded-lg border whitespace-nowrap cursor-pointer ${
-                          lic.status === 'suspended'
-                            ? 'border-teal-200 bg-teal-50 text-teal-800 hover:bg-teal-100'
-                            : 'border-rose-200 bg-rose-50 text-rose-800 hover:bg-rose-100'
-                        }`}
-                      >
-                        {lic.status === 'suspended'
-                          ? 'إعادة تفعيل'
-                          : 'إيقاف النسخة'}
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      onClick={() => void handleToggleCode(rec)}
+                      className={`px-3 py-1.5 text-xs font-medium rounded-lg border cursor-pointer ${
+                        rec.active
+                          ? 'border-rose-200 bg-rose-50 text-rose-800'
+                          : 'border-teal-200 bg-teal-50 text-teal-800'
+                      }`}
+                    >
+                      {rec.active ? 'إيقاف' : 'تفعيل'}
+                    </button>
                   </td>
                 </tr>
               ))}
-              {!loading && licenses.length === 0 && (
+              {codes.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="py-10 text-center text-slate-500">
-                    لم يتم إصدار أي أكواد ترخيص بعد. أنشئ أول كود ترخيص من النموذج أعلاه.
+                  <td colSpan={6} className="py-8 text-center text-slate-500 text-xs">
+                    لم يتم توليد أي أكواد بعد.
                   </td>
                 </tr>
               )}

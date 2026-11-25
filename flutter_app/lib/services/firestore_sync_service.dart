@@ -1,9 +1,7 @@
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:crypto/crypto.dart';
-import 'package:firebase_storage/firebase_storage.dart';
 
 import '../models/meter_reading.dart';
 import '../models/payment_receipt.dart';
@@ -25,13 +23,28 @@ class SyncReport {
 
 class FirestoreSyncService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
-  final FirebaseStorage _storage = FirebaseStorage.instance;
   final DatabaseHelper _db = DatabaseHelper.instance;
 
   static String computeSubscriberPortalHash(String meterNumber, String phone) {
     final normalizedMeter = meterNumber.trim();
     final normalizedPhone = phone.replaceAll(RegExp(r'\s+'), '').trim();
     final bytes = utf8.encode('$normalizedMeter:$normalizedPhone');
+    return sha256.convert(bytes).toString();
+  }
+
+  static String computeSubscriberNamePortalHash(
+    String subscriberName,
+    String phone,
+  ) {
+    final normalizedName = subscriberName
+        .trim()
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .replaceAll(RegExp(r'[أإآ]'), 'ا')
+        .replaceAll('ى', 'ي')
+        .replaceAll('ة', 'ه')
+        .toLowerCase();
+    final normalizedPhone = phone.replaceAll(RegExp(r'\s+'), '').trim();
+    final bytes = utf8.encode('name:$normalizedName:$normalizedPhone');
     return sha256.convert(bytes).toString();
   }
 
@@ -89,83 +102,119 @@ class FirestoreSyncService {
   Future<SyncReport> pushOfflineChanges({
     required String stationId,
     required String stationName,
+    void Function(int done, int total)? onProgress,
   }) async {
     final pendingReadings = await _db.getPendingReadings();
     final pendingReceipts = await _db.getPendingReceipts();
     final pendingSubscribers = await _db.getPendingSubscribers();
 
+    final totalItems =
+        pendingSubscribers.length + pendingReadings.length + pendingReceipts.length;
+    int doneItems = 0;
     int readingsCount = 0;
     int receiptsCount = 0;
     int subscribersCount = 0;
 
-    for (final sub in pendingSubscribers) {
-      await _firestore
-          .collection('stations')
-          .doc(stationId)
-          .collection('subscribers')
-          .doc(sub.id)
-          .set(sub.toFirestoreMap(FieldValue.serverTimestamp()),
-              SetOptions(merge: true));
-      await _db.markSubscriberSynced(sub.id);
-      subscribersCount++;
+    // Upload subscriber updates in chunks of 300
+    const subChunkSize = 300;
+    for (var i = 0; i < pendingSubscribers.length; i += subChunkSize) {
+      final chunk = pendingSubscribers.sublist(
+        i,
+        i + subChunkSize > pendingSubscribers.length
+            ? pendingSubscribers.length
+            : i + subChunkSize,
+      );
+      final batch = _firestore.batch();
+      for (final sub in chunk) {
+        final ref = _firestore
+            .collection('stations')
+            .doc(stationId)
+            .collection('subscribers')
+            .doc(sub.id);
+        batch.set(ref, sub.toFirestoreMap(FieldValue.serverTimestamp()),
+            SetOptions(merge: true));
+      }
+      await batch.commit();
+      for (final sub in chunk) {
+        await _db.markSubscriberSynced(sub.id);
+        subscribersCount++;
+        doneItems++;
+      }
+      onProgress?.(doneItems, totalItems);
     }
 
-    for (final reading in pendingReadings) {
-      String photoUrl = reading.photoCloudUrl ?? '';
-      if (photoUrl.isEmpty && reading.photoLocalPath.isNotEmpty) {
-        final file = File(reading.photoLocalPath);
-        if (await file.exists()) {
-          final storageRef = _storage.ref(
-              'stations/$stationId/meter_proofs/${reading.meterNumber}_${reading.id}.jpg');
-          await storageRef.putFile(
-            file,
-            SettableMetadata(contentType: 'image/jpeg'),
+    // Upload readings + compressed photos in safe chunks of 20
+    const readingChunkSize = 20;
+    for (var i = 0; i < pendingReadings.length; i += readingChunkSize) {
+      final chunk = pendingReadings.sublist(
+        i,
+        i + readingChunkSize > pendingReadings.length
+            ? pendingReadings.length
+            : i + readingChunkSize,
+      );
+      for (final reading in chunk) {
+        // Keep compressed meter proof photos stored locally on the collector device
+        // to prioritize ultra-fast text reading synchronization (< 2 MB total).
+        const String photoUrl = '';
+
+        await _firestore
+            .collection('stations')
+            .doc(stationId)
+            .collection('readings')
+            .doc(reading.id)
+            .set(
+              reading.toFirestoreMap(
+                Timestamp.fromDate(reading.recordedAt),
+                FieldValue.serverTimestamp(),
+                photoUrl,
+              ),
+            );
+
+        final subs = await _db.getRouteSubscribers(query: reading.meterNumber);
+        final matchedSub =
+            subs.where((s) => s.id == reading.subscriberId).firstOrNull;
+        if (matchedSub != null) {
+          final portalPayload = {
+            'stationId': stationId,
+            'stationName': stationName,
+            'meterNumber': matchedSub.meterNumber,
+            'subscriberName': matchedSub.subscriberName,
+            'zoneStreet': matchedSub.zoneStreet,
+            'previousReading': reading.previousReading,
+            'currentReading': reading.currentReading,
+            'consumptionKwh': reading.consumptionKwh,
+            'currentBillYer': reading.currentBillYer,
+            'previousDebtYer': matchedSub.previousDebtYer,
+            'totalDueYer': reading.totalDueYer,
+            'lastReadingPhotoUrl': photoUrl,
+            'lastPaymentYer': 0,
+            'updatedAt': FieldValue.serverTimestamp(),
+          };
+
+          final meterHash = computeSubscriberPortalHash(
+            matchedSub.meterNumber,
+            matchedSub.phone,
           );
-          photoUrl = await storageRef.getDownloadURL();
+          final nameHash = computeSubscriberNamePortalHash(
+            matchedSub.subscriberName,
+            matchedSub.phone,
+          );
+
+          await _firestore
+              .collection('subscriberPortals')
+              .doc(meterHash)
+              .set(portalPayload, SetOptions(merge: true));
+          await _firestore
+              .collection('subscriberPortals')
+              .doc(nameHash)
+              .set(portalPayload, SetOptions(merge: true));
         }
+
+        await _db.markReadingSynced(reading.id, photoUrl);
+        readingsCount++;
+        doneItems++;
+        onProgress?.(doneItems, totalItems);
       }
-
-      await _firestore
-          .collection('stations')
-          .doc(stationId)
-          .collection('readings')
-          .doc(reading.id)
-          .set(
-            reading.toFirestoreMap(
-              Timestamp.fromDate(reading.recordedAt),
-              FieldValue.serverTimestamp(),
-              photoUrl,
-            ),
-          );
-
-      // Update subscriber portal lookup hash for dispute-free subscriber access
-      final subs = await _db.getRouteSubscribers(query: reading.meterNumber);
-      final matchedSub = subs.where((s) => s.id == reading.subscriberId).firstOrNull;
-      if (matchedSub != null) {
-        final portalHash = computeSubscriberPortalHash(
-          matchedSub.meterNumber,
-          matchedSub.phone,
-        );
-        await _firestore.collection('subscriberPortals').doc(portalHash).set({
-          'stationId': stationId,
-          'stationName': stationName,
-          'meterNumber': matchedSub.meterNumber,
-          'subscriberName': matchedSub.subscriberName,
-          'zoneStreet': matchedSub.zoneStreet,
-          'previousReading': reading.previousReading,
-          'currentReading': reading.currentReading,
-          'consumptionKwh': reading.consumptionKwh,
-          'currentBillYer': reading.currentBillYer,
-          'previousDebtYer': matchedSub.previousDebtYer,
-          'totalDueYer': reading.totalDueYer,
-          'lastReadingPhotoUrl': photoUrl,
-          'lastPaymentYer': 0,
-          'updatedAt': FieldValue.serverTimestamp(),
-        }, SetOptions(merge: true));
-      }
-
-      await _db.markReadingSynced(reading.id, photoUrl);
-      readingsCount++;
     }
 
     for (final receipt in pendingReceipts) {
@@ -182,6 +231,8 @@ class FirestoreSyncService {
           );
       await _db.markReceiptSynced(receipt.id);
       receiptsCount++;
+      doneItems++;
+      onProgress?.(doneItems, totalItems);
     }
 
     return SyncReport(
@@ -192,13 +243,18 @@ class FirestoreSyncService {
   }
 
   Future<Map<String, dynamic>?> fetchSubscriberPortal({
-    required String meterNumber,
+    required String identifier,
     required String phone,
   }) async {
-    final lookupHash = computeSubscriberPortalHash(meterNumber, phone);
-    final doc =
-        await _firestore.collection('subscriberPortals').doc(lookupHash).get();
-    if (!doc.exists) return null;
-    return doc.data();
+    final nameHash = computeSubscriberNamePortalHash(identifier, phone);
+    final nameDoc =
+        await _firestore.collection('subscriberPortals').doc(nameHash).get();
+    if (nameDoc.exists) return nameDoc.data();
+
+    final meterHash = computeSubscriberPortalHash(identifier, phone);
+    final meterDoc =
+        await _firestore.collection('subscriberPortals').doc(meterHash).get();
+    if (!meterDoc.exists) return null;
+    return meterDoc.data();
   }
 }

@@ -1,107 +1,140 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Bell, Eye, FileText, KeyRound, Receipt, X } from 'lucide-react';
-import { doc, getDoc } from 'firebase/firestore';
-import { computeSubscriberPortalHash, db } from '../lib/firebase';
-import type { StationLocalState } from '../lib/offlineDb';
+import { lookupSubscriberPublic, type StationLocalState } from '../lib/offlineDb';
 import { formatKwh, formatYer } from '../lib/formatters';
 import type {
   MeterReading,
   PaymentReceipt,
   Subscriber,
-  SubscriberPortalRecord,
+  SubscriberLookupResult,
 } from '../types/station';
 
 interface SubscriberPortalProps {
   state?: StationLocalState | null;
+  initialResult?: SubscriberLookupResult | null;
+}
+
+function normalizeArabicText(value: string): string {
+  return value
+    .trim()
+    .replace(/\s+/g, ' ')
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/ى/g, 'ي')
+    .replace(/ة/g, 'ه')
+    .toLowerCase();
+}
+
+function normalizePhoneDigits(phone: string): string {
+  const digits = phone.replace(/\D/g, '');
+  if (digits.startsWith('00967')) return digits.slice(5);
+  if (digits.startsWith('967') && digits.length >= 11) return digits.slice(3);
+  if (digits.startsWith('0') && digits.length === 10) return digits.slice(1);
+  return digits;
 }
 
 export const SubscriberPortal: React.FC<SubscriberPortalProps> = ({
   state,
+  initialResult,
 }) => {
-  const [meterNumber, setMeterNumber] = useState('');
-  const [phone, setPhone] = useState('');
+  const [subscriberName, setSubscriberName] = useState(
+    initialResult?.subscriber.subscriberName ?? '',
+  );
+  const [phone, setPhone] = useState(initialResult?.subscriber.phone ?? '');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fcmEnabled, setFcmEnabled] = useState(false);
   const [zoomPhotoUrl, setZoomPhotoUrl] = useState<string | null>(null);
 
-  const [matchedLocal, setMatchedLocal] = useState<{
+  const [matchedResult, setMatchedResult] = useState<{
+    stationName: string;
     subscriber: Subscriber;
     readings: MeterReading[];
     receipts: PaymentReceipt[];
-  } | null>(null);
+  } | null>(initialResult ?? null);
 
-  const [cloudRecord, setCloudRecord] =
-    useState<SubscriberPortalRecord | null>(null);
+  useEffect(() => {
+    if (initialResult) {
+      setMatchedResult(initialResult);
+      setSubscriberName(initialResult.subscriber.subscriberName);
+      setPhone(initialResult.subscriber.phone);
+      setError(null);
+    }
+  }, [initialResult]);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    const cleanMeter = meterNumber.trim();
-    const cleanPhone = phone.replace(/\s+/g, '').trim();
-    if (!cleanMeter || !cleanPhone) {
-      setError('يرجى إدخال رقم العداد ورقم الهاتف المسجل.');
+    const cleanName = subscriberName.trim();
+    const cleanPhone = phone.trim();
+    if (!cleanName || !cleanPhone) {
+      setError('يرجى إدخال اسم المشترك الكامل ورقم الهاتف المسجل.');
       return;
     }
 
     setLoading(true);
     setError(null);
-    setCloudRecord(null);
-    setMatchedLocal(null);
+    setMatchedResult(null);
 
     try {
-      // Check hashed Firestore subscriberPortals record first
-      const hash = await computeSubscriberPortalHash(cleanMeter, cleanPhone);
-      const snap = await getDoc(doc(db, 'subscriberPortals', hash));
-      if (snap.exists()) {
-        setCloudRecord(snap.data() as SubscriberPortalRecord);
-        setLoading(false);
-        return;
-      }
-
-      // Fallback to active local station cache if available
-      const localSub = state?.subscribers.find(
-        (s) =>
-          s.meterNumber === cleanMeter &&
-          s.phone.replace(/\s+/g, '').trim() === cleanPhone,
-      );
-
-      if (localSub && state) {
-        setMatchedLocal({
-          subscriber: localSub,
-          readings: state.readings.filter(
-            (r) =>
-              r.subscriberId === localSub.id || r.meterNumber === cleanMeter,
-          ),
-          receipts: state.receipts.filter(
-            (rc) =>
-              rc.subscriberId === localSub.id || rc.meterNumber === cleanMeter,
-          ),
+      const serverResult = await lookupSubscriberPublic({
+        subscriberName: cleanName,
+        phone: cleanPhone,
+      });
+      setMatchedResult(serverResult);
+      setLoading(false);
+      return;
+    } catch (err) {
+      // Fallback to active local cache when offline
+      if (state) {
+        const targetName = normalizeArabicText(cleanName);
+        const targetPhone = normalizePhoneDigits(cleanPhone);
+        const localSub = state.subscribers.find((s) => {
+          if (normalizePhoneDigits(s.phone) !== targetPhone) return false;
+          return (
+            normalizeArabicText(s.subscriberName) === targetName ||
+            s.meterNumber.trim().toLowerCase() === cleanName.toLowerCase()
+          );
         });
-      } else {
-        setError(
-          'لم يتم العثور على سجل مطابق لرقم العداد والهاتف. تأكد من رفع القراءة من قِبل محصّل المحطة.',
-        );
+        if (localSub) {
+          setMatchedResult({
+            stationName: state.station.stationName,
+            subscriber: localSub,
+            readings: state.readings.filter(
+              (r) =>
+                r.subscriberId === localSub.id ||
+                r.meterNumber === localSub.meterNumber,
+            ),
+            receipts: state.receipts.filter(
+              (rc) =>
+                rc.subscriberId === localSub.id ||
+                rc.meterNumber === localSub.meterNumber,
+            ),
+          });
+          setLoading(false);
+          return;
+        }
       }
-    } catch {
-      setError('تعذر التحقق من البيانات حالياً. تأكد من الاتصال بالإنترنت.');
+
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'لم يتم العثور على مشترك مطابق للاسم ورقم الهاتف.',
+      );
     } finally {
       setLoading(false);
     }
   };
 
-  const latestPhoto =
-    matchedLocal?.readings[0]?.photoUrl ||
-    cloudRecord?.lastReadingPhotoUrl ||
-    '';
+  const latestReading = matchedResult?.readings[0];
+  const latestPhoto = latestReading?.photoUrl || '';
 
   return (
     <div className="space-y-8">
       <div className="border-b border-slate-200 pb-6">
         <h1 className="text-2xl font-bold text-slate-900">
-          بوابة المشترك · الشفافية وإثبات القراءة بالصورة
+          تفاصيل الفاتورة والاستهلاك
         </h1>
         <p className="text-sm text-slate-600 mt-1">
-          سجّل الدخول برقم العداد ورقم الهاتف فقط لمتابعة فواتيرك ومشاهدة صورة العداد الملتقطة وقت القراءة.
+          استعلم بالاسم المسجل في كشف المحطة ورقم الهاتف لمتابعة الاستهلاك والفواتير وسجل السداد.
         </p>
       </div>
 
@@ -109,26 +142,26 @@ export const SubscriberPortal: React.FC<SubscriberPortalProps> = ({
         <section className="lg:col-span-4 bg-white border border-slate-200 rounded-xl p-6 space-y-4">
           <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
             <KeyRound className="w-4 h-4 text-teal-700" />
-            دخول المشترك المبسط
+            بيانات المشترك
           </h2>
 
           <form onSubmit={handleLogin} className="space-y-4">
             <div>
               <label className="block text-xs font-medium text-slate-700 mb-1">
-                رقم العداد (meter_number)
+                اسم المشترك الكامل (كما في كشف Excel)
               </label>
               <input
                 type="text"
-                value={meterNumber}
-                onChange={(e) => setMeterNumber(e.target.value)}
-                placeholder="أدخل رقم العداد"
-                className="w-full min-h-[44px] px-3 py-2 text-sm font-mono-nums border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+                value={subscriberName}
+                onChange={(e) => setSubscriberName(e.target.value)}
+                placeholder="أدخل الاسم الكامل"
+                className="w-full min-h-[44px] px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
               />
             </div>
 
             <div>
               <label className="block text-xs font-medium text-slate-700 mb-1">
-                رقم الهاتف المسجل (phone)
+                رقم الهاتف المسجل
               </label>
               <input
                 type="tel"
@@ -156,22 +189,18 @@ export const SubscriberPortal: React.FC<SubscriberPortalProps> = ({
         </section>
 
         <section className="lg:col-span-8 bg-white border border-slate-200 rounded-xl p-6">
-          {matchedLocal || cloudRecord ? (
+          {matchedResult ? (
             <div className="space-y-6">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-200 pb-4">
                 <div>
                   <h2 className="text-xl font-bold text-slate-900">
-                    {matchedLocal?.subscriber.subscriberName ||
-                      cloudRecord?.subscriberName}
+                    {matchedResult.subscriber.subscriberName}
                   </h2>
                   <p className="text-xs text-slate-500 mt-1">
-                    {cloudRecord?.stationName || state?.station.stationName} ·{' '}
-                    {matchedLocal?.subscriber.zoneStreet ||
-                      cloudRecord?.zoneStreet}{' '}
-                    · عداد رقم{' '}
+                    {matchedResult.stationName} ·{' '}
+                    {matchedResult.subscriber.zoneStreet} · عداد رقم{' '}
                     <span className="font-mono-nums font-semibold">
-                      {matchedLocal?.subscriber.meterNumber ||
-                        cloudRecord?.meterNumber}
+                      {matchedResult.subscriber.meterNumber}
                     </span>
                   </p>
                 </div>
@@ -187,7 +216,7 @@ export const SubscriberPortal: React.FC<SubscriberPortalProps> = ({
                 >
                   <Bell className="w-4 h-4" />
                   {fcmEnabled
-                    ? 'إشعارات الفواتير (FCM) مفعّلة'
+                    ? 'إشعارات الفواتير مفعّلة'
                     : 'تفعيل إشعارات الفاتورة والسداد'}
                 </button>
               </div>
@@ -198,81 +227,38 @@ export const SubscriberPortal: React.FC<SubscriberPortalProps> = ({
                     <FileText className="w-4 h-4 text-teal-700" />
                     ملخص الفاتورة الحالية
                   </h3>
-                  {matchedLocal ? (
-                    <>
-                      <div className="flex justify-between text-sm">
-                        <span className="text-slate-600">القراءة السابقة</span>
-                        <span className="font-mono-nums font-medium">
-                          {matchedLocal.readings[0]?.previousReading ??
-                            matchedLocal.subscriber.previousReading}
-                        </span>
-                      </div>
-                      <div className="flex justify-between text-sm">
-                        <span className="text-slate-600">القراءة الحالية</span>
-                        <span className="font-mono-nums font-medium">
-                          {matchedLocal.readings[0]?.currentReading ??
-                            matchedLocal.subscriber.currentReading}
-                        </span>
-                      </div>
-                      <div className="flex justify-between text-sm">
-                        <span className="text-slate-600">الاستهلاك</span>
-                        <span className="font-mono-nums font-semibold">
-                          {formatKwh(
-                            matchedLocal.readings[0]?.consumptionKwh ?? 0,
-                          )}
-                        </span>
-                      </div>
-                      <div className="flex justify-between text-sm">
-                        <span className="text-slate-600">مبلغ الاستهلاك</span>
-                        <span className="font-mono-nums">
-                          {formatYer(
-                            matchedLocal.readings[0]?.currentBillYer ?? 0,
-                          )}
-                        </span>
-                      </div>
-                      <div className="border-t border-slate-200 pt-2 flex justify-between text-base font-bold">
-                        <span>الرصيد المتبقي المستحق</span>
-                        <span className="font-mono-nums text-rose-700">
-                          {formatYer(matchedLocal.subscriber.previousDebtYer)}
-                        </span>
-                      </div>
-                    </>
-                  ) : (
-                    cloudRecord && (
-                      <>
-                        <div className="flex justify-between text-sm">
-                          <span className="text-slate-600">القراءة السابقة</span>
-                          <span className="font-mono-nums font-medium">
-                            {cloudRecord.previousReading}
-                          </span>
-                        </div>
-                        <div className="flex justify-between text-sm">
-                          <span className="text-slate-600">القراءة الحالية</span>
-                          <span className="font-mono-nums font-medium">
-                            {cloudRecord.currentReading}
-                          </span>
-                        </div>
-                        <div className="flex justify-between text-sm">
-                          <span className="text-slate-600">الاستهلاك</span>
-                          <span className="font-mono-nums font-semibold">
-                            {formatKwh(cloudRecord.consumptionKwh)}
-                          </span>
-                        </div>
-                        <div className="flex justify-between text-sm">
-                          <span className="text-slate-600">مبلغ الاستهلاك</span>
-                          <span className="font-mono-nums">
-                            {formatYer(cloudRecord.currentBillYer)}
-                          </span>
-                        </div>
-                        <div className="border-t border-slate-200 pt-2 flex justify-between text-base font-bold">
-                          <span>الإجمالي المستحق</span>
-                          <span className="font-mono-nums text-rose-700">
-                            {formatYer(cloudRecord.totalDueYer)}
-                          </span>
-                        </div>
-                      </>
-                    )
-                  )}
+                  <div className="flex justify-between text-sm">
+                    <span className="text-slate-600">القراءة السابقة</span>
+                    <span className="font-mono-nums font-medium">
+                      {latestReading?.previousReading ??
+                        matchedResult.subscriber.previousReading}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-slate-600">القراءة الحالية</span>
+                    <span className="font-mono-nums font-medium">
+                      {latestReading?.currentReading ??
+                        matchedResult.subscriber.currentReading}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-slate-600">الاستهلاك</span>
+                    <span className="font-mono-nums font-semibold">
+                      {formatKwh(latestReading?.consumptionKwh ?? 0)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-slate-600">مبلغ الاستهلاك</span>
+                    <span className="font-mono-nums">
+                      {formatYer(latestReading?.currentBillYer ?? 0)}
+                    </span>
+                  </div>
+                  <div className="border-t border-slate-200 pt-2 flex justify-between text-base font-bold">
+                    <span>الرصيد المتبقي المستحق</span>
+                    <span className="font-mono-nums text-rose-700">
+                      {formatYer(matchedResult.subscriber.previousDebtYer)}
+                    </span>
+                  </div>
                 </div>
 
                 <div className="md:col-span-6 space-y-2">
@@ -301,53 +287,53 @@ export const SubscriberPortal: React.FC<SubscriberPortalProps> = ({
                       />
                     </div>
                   ) : (
-                    <div className="aspect-[4/3] rounded-xl border border-slate-200 bg-slate-50 flex items-center justify-center text-xs text-slate-500 p-4 text-center">
-                      لم تُرفق صورة عداد لهذه القراءة بعد.
+                    <div className="aspect-[4/3] rounded-xl border border-slate-200 bg-slate-50 flex items-center justify-center text-xs text-slate-600 p-4 text-center leading-relaxed">
+                      {latestReading?.hasLocalPhoto
+                        ? 'تم توثيق قراءة العداد بصورة محفوظة محلياً في جهاز المحصّل لتسريع المزامنة وتوفير البيانات.'
+                        : 'لم تُرفق صورة عداد لهذه القراءة بعد.'}
                     </div>
                   )}
                 </div>
               </div>
 
-              {matchedLocal && (
-                <div className="space-y-3 border-t border-slate-200 pt-5">
-                  <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-                    <Receipt className="w-4 h-4 text-teal-700" />
-                    سجل سندات القبض والمدفوعات
-                  </h3>
-                  {matchedLocal.receipts.length > 0 ? (
-                    <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
-                      {matchedLocal.receipts.map((rc) => (
-                        <div
-                          key={rc.id}
-                          className="p-3.5 flex items-center justify-between text-sm bg-white"
-                        >
-                          <div>
-                            <div className="font-semibold text-slate-900 font-mono-nums">
-                              {formatYer(rc.amountPaidYer)}
-                            </div>
-                            <div className="text-xs text-slate-500 mt-0.5">
-                              بواسطة {rc.collectorName} ·{' '}
-                              {new Date(rc.paidAt).toLocaleDateString('ar-YE')}
-                            </div>
+              <div className="space-y-3 border-t border-slate-200 pt-5">
+                <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                  <Receipt className="w-4 h-4 text-teal-700" />
+                  سجل سندات القبض والمدفوعات
+                </h3>
+                {matchedResult.receipts.length > 0 ? (
+                  <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
+                    {matchedResult.receipts.map((rc) => (
+                      <div
+                        key={rc.id}
+                        className="p-3.5 flex items-center justify-between text-sm bg-white"
+                      >
+                        <div>
+                          <div className="font-semibold text-slate-900 font-mono-nums">
+                            {formatYer(rc.amountPaidYer)}
                           </div>
-                          <div className="text-xs text-slate-600 font-mono-nums">
-                            المتبقي: {formatYer(rc.remainingBalanceYer)}
+                          <div className="text-xs text-slate-500 mt-0.5">
+                            بواسطة {rc.collectorName} ·{' '}
+                            {new Date(rc.paidAt).toLocaleDateString('ar-YE')}
                           </div>
                         </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="text-xs text-slate-500">
-                      لا توجد سندات دفع مسجلة حتى الآن لهذا العداد.
-                    </p>
-                  )}
-                </div>
-              )}
+                        <div className="text-xs text-slate-600 font-mono-nums">
+                          المتبقي: {formatYer(rc.remainingBalanceYer)}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-xs text-slate-500">
+                    لا توجد سندات دفع مسجلة حتى الآن لهذا المشترك.
+                  </p>
+                )}
+              </div>
             </div>
           ) : (
             <div className="py-16 text-center space-y-2">
               <p className="text-sm font-medium text-slate-700">
-                أدخل رقم العداد ورقم الهاتف المسجل لعرض الفاتورة وصورة العداد.
+                أدخل الاسم الكامل ورقم الهاتف المسجل في كشف المحطة لعرض الفاتورة وصورة العداد.
               </p>
               <p className="text-xs text-slate-500">
                 تتيح هذه البوابة للمشترك التأكد من قراءة عداده بالصورة الحقيقية لمنع أي خلافات.

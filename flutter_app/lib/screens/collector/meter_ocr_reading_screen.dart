@@ -276,7 +276,7 @@ class _MeterOcrReadingScreenState extends State<MeterOcrReadingScreen> {
                     icon: const Icon(Icons.camera_alt_rounded),
                     label: Text(_processingImage
                         ? 'جاري المسح الضوئي...'
-                        : 'تصوير العداد وقراءة الأرقام (OCR)'),
+                        : 'تصوير العداد وقراءة الأرقام'),
                   ),
                 ),
               ],

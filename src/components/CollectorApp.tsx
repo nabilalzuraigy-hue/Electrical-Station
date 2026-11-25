@@ -4,6 +4,8 @@ import {
   CheckCircle2,
   CloudUpload,
   Copy,
+  Download,
+  FileSpreadsheet,
   MessageCircle,
   MessageSquare,
   ScanLine,
@@ -13,7 +15,12 @@ import {
   Wifi,
   WifiOff,
 } from 'lucide-react';
-import { sanitizeFirestoreId, type StationLocalState } from '../lib/offlineDb';
+import {
+  exportCollectorReadingsExcel,
+  parseSubscribersExcelFile,
+  sanitizeFirestoreId,
+  type StationLocalState,
+} from '../lib/offlineDb';
 import {
   buildArabicInvoiceMessage,
   compressImageUnder150Kb,
@@ -36,7 +43,7 @@ interface CollectorAppProps {
   onUpdateState: (next: StationLocalState) => void;
   onSyncNow: () => Promise<void>;
   isSyncing: boolean;
-  isSignedIn: boolean;
+  syncProgress: import('../types/station').SyncProgress | null;
   activeCollector?: CollectorProfile;
   isManagerPreview?: boolean;
 }
@@ -46,11 +53,12 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   onUpdateState,
   onSyncNow,
   isSyncing,
-  isSignedIn,
+  syncProgress,
   activeCollector,
   isManagerPreview = false,
 }) => {
   const cameraInputRef = useRef<HTMLInputElement>(null);
+  const localExcelInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
 
   const [isOnline, setIsOnline] = useState<boolean>(
@@ -62,7 +70,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     state.subscribers[0]?.id ?? '',
   );
 
-  // Reading & OCR workspace state
+  // Reading & meter photo workspace state
   const [readingInput, setReadingInput] = useState('');
   const [cashPaidInput, setCashPaidInput] = useState('');
   const [proofPhotoUrl, setProofPhotoUrl] = useState<string>('');
@@ -72,6 +80,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   const [savedInvoiceText, setSavedInvoiceText] = useState<string | null>(null);
   const [copiedInvoice, setCopiedInvoice] = useState(false);
   const [cameraStreamActive, setCameraStreamActive] = useState(false);
+  const [localExcelNotice, setLocalExcelNotice] = useState<string | null>(null);
 
   useEffect(() => {
     const handleOnline = () => setIsOnline(true);
@@ -106,7 +115,11 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   const zones = useMemo(() => {
     const s = new Set<string>();
     state.subscribers.forEach((sub) => {
-      if (assignedZones.length === 0 || assignedZones.includes(sub.zoneStreet)) {
+      if (
+        sub.importedLocally ||
+        assignedZones.length === 0 ||
+        assignedZones.includes(sub.zoneStreet)
+      ) {
         s.add(sub.zoneStreet);
       }
     });
@@ -119,6 +132,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       .sort((a, b) => a.sequenceOrder - b.sequenceOrder)
       .filter((sub) => {
         if (
+          !sub.importedLocally &&
           assignedZones.length > 0 &&
           !assignedZones.includes(sub.zoneStreet)
         ) {
@@ -130,7 +144,8 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         return (
           sub.meterNumber.toLowerCase().includes(q) ||
           sub.meterNumber.slice(-4).toLowerCase().includes(q) ||
-          sub.subscriberName.toLowerCase().includes(q)
+          sub.subscriberName.toLowerCase().includes(q) ||
+          sub.phone.includes(q)
         );
       });
   }, [state.subscribers, searchTerm, selectedZone, assignedZones]);
@@ -218,7 +233,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     setProofSizeKb(compressed.sizeKb);
     stopLiveCamera();
     setPhotoStatus(
-      `تم التقاط وضغط صورة العداد (${compressed.sizeKb} KB). أدخل أرقام القراءة الظاهرة في الصورة.`,
+      `تم التقاط وضغط صورة العداد (${compressed.sizeKb} KB) وحفظها محلياً في جهازك. أدخل أرقام القراءة الظاهرة في الصورة.`,
     );
   };
 
@@ -233,10 +248,64 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       setProofPhotoUrl(compressed.dataUrl);
       setProofSizeKb(compressed.sizeKb);
       setPhotoStatus(
-        `تم حفظ وضغط صورة إثبات العداد إلى ${compressed.sizeKb} كيلوبايت (< 150 KB).`,
+        `تم حفظ وضغط صورة إثبات العداد محلياً في جهازك بحجم ${compressed.sizeKb} كيلوبايت (ترتفع القراءة النصية فقط عند المزامنة).`,
       );
     } catch {
       setPhotoStatus('تعذر معالجة الصورة المختارة.');
+    } finally {
+      event.target.value = '';
+    }
+  };
+
+  const handleCollectorLocalExcelImport = async (
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setLocalExcelNotice(null);
+    try {
+      const parsed = await parseSubscribersExcelFile(file, {
+        importedLocally: true,
+      });
+      if (parsed.length === 0) {
+        setLocalExcelNotice(
+          'لم يتم التعرف على أسماء مشتركين في الملف. تأكد من وجود عمود باسم "اسم المشترك" أو "الاسم".',
+        );
+        return;
+      }
+
+      const mergedMap = new Map<string, Subscriber>();
+      state.subscribers.forEach((existing) => mergedMap.set(existing.id, existing));
+      parsed.forEach((item) => {
+        const existing = mergedMap.get(item.id);
+        if (existing) {
+          mergedMap.set(item.id, {
+            ...existing,
+            subscriberName: item.subscriberName || existing.subscriberName,
+            phone:
+              item.phone && item.phone !== '770000000'
+                ? item.phone
+                : existing.phone,
+            importedLocally: true,
+          });
+        } else {
+          mergedMap.set(item.id, item);
+        }
+      });
+
+      const mergedList = Array.from(mergedMap.values());
+      onUpdateState({
+        ...state,
+        subscribers: mergedList,
+      });
+      if (!selectedSubscriberId && parsed[0]) {
+        setSelectedSubscriberId(parsed[0].id);
+      }
+      setLocalExcelNotice(
+        `تم استيراد ${parsed.length} اسم مشترك من ذاكرة هاتفك وحفظهم محلياً للعمل أوفلاين.`,
+      );
+    } catch {
+      setLocalExcelNotice('تعذر قراءة ملف Excel من ذاكرة الهاتف.');
     } finally {
       event.target.value = '';
     }
@@ -298,6 +367,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       totalDueYer,
       photoUrl: proofPhotoUrl,
       photoSizeKb: proofSizeKb,
+      hasLocalPhoto: true,
       collectorUid,
       collectorName,
       recordedAt: now,
@@ -392,25 +462,50 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
           </p>
         </div>
 
-        <button
-          type="button"
-          disabled={!isOnline || isSyncing || !isSignedIn}
-          onClick={() => void onSyncNow()}
-          className="min-h-[44px] px-4 py-2 text-xs font-medium rounded-lg bg-teal-700 hover:bg-teal-800 disabled:bg-slate-200 disabled:text-slate-500 text-white transition-colors inline-flex items-center gap-2 whitespace-nowrap cursor-pointer"
-        >
-          {pendingCount === 0 ? (
-            <CheckCircle2 className="w-4 h-4" />
-          ) : (
-            <CloudUpload className="w-4 h-4" />
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <button
+            type="button"
+            onClick={() =>
+              exportCollectorReadingsExcel(state, activeCollector?.name)
+            }
+            className="min-h-[44px] px-3.5 py-2 text-xs font-medium rounded-lg bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 transition-colors inline-flex items-center gap-2 whitespace-nowrap cursor-pointer"
+          >
+            <Download className="w-4 h-4 text-teal-700" />
+            حفظ القراءات للكمبيوتر (USB)
+          </button>
+
+          <button
+            type="button"
+            disabled={!isOnline || isSyncing || pendingCount === 0}
+            onClick={() => void onSyncNow()}
+            className="min-h-[44px] px-4 py-2 text-xs font-medium rounded-lg bg-teal-700 hover:bg-teal-800 disabled:bg-slate-200 disabled:text-slate-500 text-white transition-colors inline-flex items-center gap-2 whitespace-nowrap cursor-pointer"
+          >
+            {pendingCount === 0 ? (
+              <CheckCircle2 className="w-4 h-4" />
+            ) : (
+              <CloudUpload className="w-4 h-4" />
+            )}
+            {isSyncing
+              ? syncProgress
+                ? `دفعة ${syncProgress.currentBatch} / ${syncProgress.totalBatches} (${syncProgress.completed} / ${syncProgress.total})`
+                : 'جاري المزامنة...'
+              : !isOnline
+                ? 'بانتظار توفر الإنترنت'
+                : pendingCount > 0
+                  ? `مزامنة آمنة على دفعات (${pendingCount} معلق)`
+                  : 'تمت المزامنة السحابية'}
+          </button>
+          {isSyncing && syncProgress && syncProgress.total > 0 && (
+            <div className="w-full min-w-[200px] bg-slate-200 rounded-full h-1.5 overflow-hidden">
+              <div
+                className="bg-teal-700 h-full transition-all"
+                style={{
+                  width: `${Math.round((syncProgress.completed / syncProgress.total) * 100)}%`,
+                }}
+              />
+            </div>
           )}
-          {isSyncing
-            ? 'جاري المزامنة...'
-            : !isOnline
-              ? 'بانتظار توفر الإنترنت'
-              : pendingCount > 0
-                ? `مزامنة السحابة (${pendingCount} معلق)`
-                : 'تمت المزامنة السحابية'}
-        </button>
+        </div>
       </div>
 
       {/* Main 2-Column Field Workspace */}
@@ -418,14 +513,36 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         {/* Route List */}
         <section className="lg:col-span-5 bg-white border border-slate-200 rounded-xl overflow-hidden">
           <div className="p-4 border-b border-slate-200 space-y-3">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <h2 className="text-base font-bold text-slate-900">
                 خط السير الميداني ({assignedZones.length > 0 ? assignedZones.join('، ') : 'جميع الحارات'})
               </h2>
-              <span className="text-xs text-slate-500 font-mono-nums">
+              <span className="text-xs text-slate-500 font-mono-nums shrink-0">
                 {routeSubscribers.length} عداد
               </span>
             </div>
+
+            <input
+              ref={localExcelInputRef}
+              type="file"
+              accept=".xlsx,.xls,.csv"
+              onChange={handleCollectorLocalExcelImport}
+              className="hidden"
+            />
+            <button
+              type="button"
+              onClick={() => localExcelInputRef.current?.click()}
+              className="w-full min-h-[40px] px-3 py-2 text-xs font-medium bg-slate-50 hover:bg-slate-100 border border-slate-300 text-slate-800 rounded-lg inline-flex items-center justify-center gap-2 transition-colors cursor-pointer"
+            >
+              <FileSpreadsheet className="w-4 h-4 text-teal-700" />
+              خيار إضافي: رفع ملف Excel قديم من ذاكرة الهاتف
+            </button>
+
+            {localExcelNotice && (
+              <p className="text-xs text-teal-800 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2">
+                {localExcelNotice}
+              </p>
+            )}
 
             <div className="relative">
               <Search className="w-4 h-4 text-slate-400 absolute right-3 top-1/2 -translate-y-1/2" />
@@ -570,7 +687,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                         <div className="text-center px-4 space-y-1">
                           <ScanLine className="w-8 h-8 text-teal-400 mx-auto" />
                           <p className="text-xs text-slate-300">
-                            صوّر شاشة العداد الرقمي بوضوح لحفظ صورة الإثبات (&lt; 150 KB)
+                            صوّر شاشة العداد بوضوح؛ تُضغط الصورة وتُحفظ محلياً في جهازك وتُرفع القراءة النصية بسرعة فائقة
                           </p>
                         </div>
                       )}

@@ -1,21 +1,15 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
-  Check,
-  Copy,
   Download,
-  FileSpreadsheet,
-  KeyRound,
+  RefreshCw,
   Search,
   Upload,
-  UserPlus,
   Users,
   Zap,
 } from 'lucide-react';
 import {
-  createCollectorInvite,
-  downloadExcelTemplate,
   exportStationReportExcel,
-  parseSubscribersExcelFile,
+  refreshStationState,
   updateCollectorInCloud,
   type StationLocalState,
 } from '../lib/offlineDb';
@@ -23,28 +17,31 @@ import { formatCompactYer, formatKwh, formatYer } from '../lib/formatters';
 import type {
   CollectorPermissions,
   CollectorProfile,
-  Subscriber,
+  SyncProgress,
 } from '../types/station';
 
 interface ManagerDashboardProps {
   state: StationLocalState;
+  staffToken: string;
   onUpdateState: (next: StationLocalState) => void;
   onSyncNow: () => Promise<void>;
   isSyncing: boolean;
+  syncProgress: SyncProgress | null;
 }
 
 export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
   state,
+  staffToken,
   onUpdateState,
   onSyncNow,
   isSyncing,
+  syncProgress,
 }) => {
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
   const [searchQuery, setSearchQuery] = useState('');
   const [zoneFilter, setZoneFilter] = useState<string>('all');
-  const [importFeedback, setImportFeedback] = useState<string | null>(null);
   const [tariffSaved, setTariffSaved] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [collectorError, setCollectorError] = useState<string | null>(null);
 
   const [stationName, setStationName] = useState(state.station.stationName);
   const [kwhPrice, setKwhPrice] = useState(String(state.station.kwhPriceYer));
@@ -52,18 +49,6 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
   const [mainGenKwh, setMainGenKwh] = useState(
     String(state.station.mainGeneratorKwh),
   );
-
-  // Collector invite creation with granular permissions
-  const [collectorName, setCollectorName] = useState('');
-  const [collectorPhone, setCollectorPhone] = useState('');
-  const [collectorZones, setCollectorZones] = useState('');
-  const [permReadings, setPermReadings] = useState(true);
-  const [permCash, setPermCash] = useState(true);
-  const [permInvoices, setPermInvoices] = useState(true);
-  const [permDebts, setPermDebts] = useState(true);
-  const [collectorError, setCollectorError] = useState<string | null>(null);
-  const [creatingInvite, setCreatingInvite] = useState(false);
-  const [copiedCode, setCopiedCode] = useState<string | null>(null);
 
   const metrics = useMemo(() => {
     const activeSubscribers = state.subscribers.length;
@@ -120,43 +105,16 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
       });
   }, [state.subscribers, searchQuery, zoneFilter]);
 
-  const handleExcelUpload = async (
-    event: React.ChangeEvent<HTMLInputElement>,
-  ) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
+  const handleRefreshFromServer = async () => {
+    setRefreshing(true);
     try {
-      const imported = await parseSubscribersExcelFile(file);
-      if (imported.length === 0) {
-        setImportFeedback(
-          'لم يتم العثور على صفوف صالحة. تأكد من أعمدة meter_number و subscriber_name.',
-        );
-        return;
-      }
-
-      const byMeter = new Map<string, Subscriber>();
-      state.subscribers.forEach((s) => byMeter.set(s.meterNumber, s));
-      imported.forEach((s) => byMeter.set(s.meterNumber, s));
-
-      const mergedList = Array.from(byMeter.values());
-      if (mergedList.length > state.station.maxSubscribers) {
-        setImportFeedback(
-          `يتجاوز العدد السعة المرخصة للنسخة (${state.station.maxSubscribers} مشترك).`,
-        );
-        return;
-      }
-
-      onUpdateState({
-        ...state,
-        subscribers: mergedList,
-      });
-      setImportFeedback(
-        `تم استيراد ${imported.length} مشترك محلياً. اضغط "حفظ ومزامنة السحابة" لرفعهم لقاعدة المحطة.`,
+      const updated = await refreshStationState(
+        state.station.stationId,
+        staffToken,
       );
-    } catch {
-      setImportFeedback('تعذر قراءة ملف Excel. يرجى استخدام ملف .xlsx قياسي.');
+      onUpdateState(updated);
     } finally {
-      event.target.value = '';
+      setRefreshing(false);
     }
   };
 
@@ -180,81 +138,36 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
     setTimeout(() => setTariffSaved(false), 2500);
   };
 
-  const handleCreateCollectorInvite = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!collectorName.trim() || !collectorPhone.trim()) {
-      setCollectorError('يرجى إدخال اسم المحصّل ورقم الهاتف.');
-      return;
-    }
-    if (
-      state.collectors.length +
-        state.invites.filter((i) => i.status === 'unused').length >=
-      state.station.maxCollectors
-    ) {
-      setCollectorError(
-        `تم بلوغ الحد الأقصى للمحصّلين المرخصين في هذه النسخة (${state.station.maxCollectors}).`,
-      );
-      return;
-    }
-
-    setCollectorError(null);
-    setCreatingInvite(true);
-    try {
-      const assignedZones = collectorZones
-        .split(/[،,]/)
-        .map((z) => z.trim())
-        .filter(Boolean);
-
-      const invite = await createCollectorInvite({
-        station: state.station,
-        collectorName,
-        phone: collectorPhone,
-        assignedZones,
-        permissions: {
-          canRecordReadings: permReadings,
-          canCollectCash: permCash,
-          canSendInvoices: permInvoices,
-          canViewDebts: permDebts,
-        },
-      });
-
-      onUpdateState({
-        ...state,
-        invites: [invite, ...state.invites],
-      });
-      setCollectorName('');
-      setCollectorPhone('');
-      setCollectorZones('');
-    } catch (err) {
-      setCollectorError(
-        err instanceof Error ? err.message : 'تعذر إصدار كود المحصّل.',
-      );
-    } finally {
-      setCreatingInvite(false);
-    }
-  };
-
   const handleToggleCollectorActive = async (collector: CollectorProfile) => {
+    setCollectorError(null);
     const updated: CollectorProfile = {
       ...collector,
       active: !collector.active,
     };
-    await updateCollectorInCloud({
-      stationId: state.station.stationId,
-      collector: updated,
-    });
-    onUpdateState({
-      ...state,
-      collectors: state.collectors.map((c) =>
-        c.id === collector.id ? updated : c,
-      ),
-    });
+    try {
+      await updateCollectorInCloud({
+        staffToken,
+        stationId: state.station.stationId,
+        collector: updated,
+      });
+      onUpdateState({
+        ...state,
+        collectors: state.collectors.map((c) =>
+          c.id === collector.id ? updated : c,
+        ),
+      });
+    } catch (err) {
+      setCollectorError(
+        err instanceof Error ? err.message : 'تعذر تحديث حالة المحصّل.',
+      );
+    }
   };
 
   const handleToggleCollectorPermission = async (
     collector: CollectorProfile,
     permKey: keyof CollectorPermissions,
   ) => {
+    setCollectorError(null);
     const updated: CollectorProfile = {
       ...collector,
       permissions: {
@@ -262,22 +175,23 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
         [permKey]: !collector.permissions[permKey],
       },
     };
-    await updateCollectorInCloud({
-      stationId: state.station.stationId,
-      collector: updated,
-    });
-    onUpdateState({
-      ...state,
-      collectors: state.collectors.map((c) =>
-        c.id === collector.id ? updated : c,
-      ),
-    });
-  };
-
-  const handleCopyCode = async (code: string) => {
-    await navigator.clipboard.writeText(code);
-    setCopiedCode(code);
-    setTimeout(() => setCopiedCode(null), 2000);
+    try {
+      await updateCollectorInCloud({
+        staffToken,
+        stationId: state.station.stationId,
+        collector: updated,
+      });
+      onUpdateState({
+        ...state,
+        collectors: state.collectors.map((c) =>
+          c.id === collector.id ? updated : c,
+        ),
+      });
+    } catch (err) {
+      setCollectorError(
+        err instanceof Error ? err.message : 'تعذر تحديث صلاحية المحصّل.',
+      );
+    }
   };
 
   return (
@@ -289,16 +203,24 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
             لوحة مدير المحطة · {state.station.stationName}
           </h1>
           <p className="text-xs text-slate-600 mt-1">
-            نسخة مستقلة مرخصة ({state.station.licenseCode}) ·{' '}
             {state.station.licenseStatus === 'active'
-              ? 'الترخيص نشط'
-              : 'الترخيص موقوف من الأدمن'}{' '}
-            · السعة القصوى: {state.station.maxSubscribers} مشترك /{' '}
-            {state.station.maxCollectors} محصّل
+              ? 'النسخة نشطة ومستقلة'
+              : 'النسخة موقوفة من الأدمن المطور'}{' '}
+            · رفع كشوفات Excel وتوليد الأكواد يتم حصراً عبر الأدمن المطور
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-3 shrink-0">
+          <button
+            type="button"
+            disabled={refreshing}
+            onClick={() => void handleRefreshFromServer()}
+            className="inline-flex items-center gap-2 px-3.5 py-2.5 text-sm font-medium bg-white border border-slate-300 text-slate-800 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <RefreshCw className="w-4 h-4 text-slate-700" />
+            تحديث البيانات
+          </button>
+
           <button
             type="button"
             disabled={isSyncing}
@@ -307,10 +229,12 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
           >
             <Upload className="w-4 h-4" />
             {isSyncing
-              ? 'جاري الحفظ السحابي...'
+              ? syncProgress
+                ? `دفعة ${syncProgress.currentBatch}/${syncProgress.totalBatches}...`
+                : 'جاري الحفظ...'
               : metrics.pendingSyncCount > 0
-                ? `حفظ ومزامنة السحابة (${metrics.pendingSyncCount})`
-                : 'مزامنة مع السحابة'}
+                ? `حفظ ومزامنة (${metrics.pendingSyncCount})`
+                : 'حفظ التعرفة والمزامنة'}
           </button>
 
           <button
@@ -328,13 +252,13 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col justify-between gap-3">
           <span className="text-xs font-medium text-slate-500">
-            إجمالي المشتركين النشطين
+            إجمالي المشتركين المسجلين
           </span>
           <div className="flex items-baseline justify-between">
             <span className="text-2xl font-bold text-slate-900 font-mono-nums">
               {metrics.activeSubscribers}
             </span>
-            <span className="text-xs text-slate-500">عداد مسجل</span>
+            <span className="text-xs text-slate-500">مشترك</span>
           </div>
         </div>
 
@@ -376,55 +300,8 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
         </div>
       </div>
 
-      {/* Main Grid: Excel Rapid Setup + Tariff Settings */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
-        <section className="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-6 flex flex-col justify-between gap-5">
-          <div>
-            <div className="flex items-center justify-between gap-4">
-              <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
-                <FileSpreadsheet className="w-5 h-5 text-teal-700" />
-                التأسيس السريع عبر ملف Excel (.xlsx)
-              </h2>
-              <button
-                type="button"
-                onClick={downloadExcelTemplate}
-                className="text-xs font-medium text-teal-700 hover:text-teal-800 underline underline-offset-4 whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                تحميل نموذج Excel فارغ
-              </button>
-            </div>
-            <p className="text-sm text-slate-600 mt-2 leading-relaxed">
-              ارفع كشف المشتركين ليتم استيرادهم إلى محطتك المعزولة فوراً. الأعمدة المدعومة:
-            </p>
-            <div className="mt-3 text-xs text-slate-500 font-mono-nums bg-slate-50 border border-slate-200 rounded-lg p-3 leading-relaxed">
-              meter_number · subscriber_name · phone · previous_reading · previous_debt · zone_street · sequence_order
-            </div>
-          </div>
-
-          <div className="space-y-3">
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".xlsx,.xls"
-              onChange={handleExcelUpload}
-              className="hidden"
-            />
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              className="w-full py-3 px-4 bg-teal-700 hover:bg-teal-800 text-white text-sm font-medium rounded-lg transition-colors flex items-center justify-center gap-2 cursor-pointer"
-            >
-              <Upload className="w-4 h-4" />
-              اختيار ملف Excel واستيراد المشتركين
-            </button>
-            {importFeedback && (
-              <p className="text-xs font-medium text-teal-800 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2">
-                {importFeedback}
-              </p>
-            )}
-          </div>
-        </section>
-
+      {/* Main Grid: Tariff Settings + Collectors Supervision */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
         <section className="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-6">
           <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2 mb-4">
             <Zap className="w-5 h-5 text-teal-700" />
@@ -484,233 +361,113 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
               type="submit"
               className="w-full py-2.5 px-4 bg-slate-900 hover:bg-slate-800 text-white text-sm font-medium rounded-lg transition-colors cursor-pointer"
             >
-              {tariffSaved ? 'تم الحفظ محلياً (اضغط مزامنة للرفع)' : 'حفظ التعرفة وإعدادات المولد'}
+              {tariffSaved
+                ? 'تم الحفظ محلياً (اضغط حفظ التعرفة والمزامنة)'
+                : 'حفظ التعرفة وإعدادات المولد'}
             </button>
           </form>
         </section>
-      </div>
 
-      {/* Collectors Activation & Granular Permissions */}
-      <section className="bg-white border border-slate-200 rounded-xl p-6 space-y-6">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+        {/* Collectors Permissions & Activation Supervision */}
+        <section className="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-6 space-y-5">
           <div>
             <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
               <Users className="w-5 h-5 text-teal-700" />
-              إدارة المحصّلين وتحديد الصلاحيات والتفعيل
+              متابعة وتفعيل المحصّلين التابعين للمحطة
             </h2>
-            <p className="text-xs text-slate-500 mt-0.5">
-              أصدر كود تفعيل لكل محصّل وحدد صلاحياته بدقة (القراءة، القبض النقدي، إرسال الفواتير، عرض المتأخرات) أو أوقف حسابه فوراً.
+            <p className="text-xs text-slate-500 mt-1">
+              يُصدر الأدمن المطور أكواد المحصّلين، ويمكنك هنا التحكم بتفعيل المحصّل وصلاحياته الميدانية.
             </p>
           </div>
-          <span className="text-xs text-slate-500 font-mono-nums">
-            {state.collectors.length} / {state.station.maxCollectors} محصّل
-          </span>
-        </div>
 
-        <form onSubmit={handleCreateCollectorInvite} className="space-y-4">
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-            <input
-              type="text"
-              placeholder="اسم المحصّل الميداني"
-              value={collectorName}
-              onChange={(e) => setCollectorName(e.target.value)}
-              className="px-3 py-2 text-sm border border-slate-300 rounded-lg"
-            />
-            <input
-              type="tel"
-              placeholder="رقم الهاتف (77xxxxxxx)"
-              value={collectorPhone}
-              onChange={(e) => setCollectorPhone(e.target.value)}
-              className="px-3 py-2 text-sm border border-slate-300 rounded-lg font-mono-nums"
-            />
-            <input
-              type="text"
-              placeholder="الحارات المخصصة (مفصولة بفاصلة)"
-              value={collectorZones}
-              onChange={(e) => setCollectorZones(e.target.value)}
-              className="px-3 py-2 text-sm border border-slate-300 rounded-lg"
-            />
-            <button
-              type="submit"
-              disabled={creatingInvite}
-              className="inline-flex items-center justify-center gap-1.5 px-4 py-2 bg-teal-700 hover:bg-teal-800 text-white text-sm font-medium rounded-lg transition-colors whitespace-nowrap cursor-pointer"
-            >
-              <UserPlus className="w-4 h-4" />
-              {creatingInvite ? 'جاري التوليد...' : 'إصدار كود تفعيل محصّل'}
-            </button>
-          </div>
+          {collectorError && (
+            <p className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2.5">
+              {collectorError}
+            </p>
+          )}
 
-          {/* Granular Permissions Selection */}
-          <div className="flex flex-wrap items-center gap-4 text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-lg p-3">
-            <span className="font-semibold text-slate-900">صلاحيات المحصّل:</span>
-            <label className="inline-flex items-center gap-1.5 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={permReadings}
-                onChange={(e) => setPermReadings(e.target.checked)}
-                className="accent-teal-700"
-              />
-              تسجيل القراءات وتصوير العداد
-            </label>
-            <label className="inline-flex items-center gap-1.5 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={permCash}
-                onChange={(e) => setPermCash(e.target.checked)}
-                className="accent-teal-700"
-              />
-              إصدار سند قبض نقدي
-            </label>
-            <label className="inline-flex items-center gap-1.5 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={permInvoices}
-                onChange={(e) => setPermInvoices(e.target.checked)}
-                className="accent-teal-700"
-              />
-              إرسال فواتير واتساب / SMS
-            </label>
-            <label className="inline-flex items-center gap-1.5 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={permDebts}
-                onChange={(e) => setPermDebts(e.target.checked)}
-                className="accent-teal-700"
-              />
-              الاطلاع على المتأخرات
-            </label>
-          </div>
-        </form>
-
-        {collectorError && (
-          <p className="text-xs text-rose-700">{collectorError}</p>
-        )}
-
-        {/* Active Collector Invites */}
-        {state.invites.filter((i) => i.status === 'unused').length > 0 && (
-          <div className="space-y-2">
-            <div className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
-              <KeyRound className="w-3.5 h-3.5 text-teal-700" />
-              أكواد محصّلين بانتظار التفعيل:
-            </div>
-            <div className="divide-y divide-slate-100 border border-slate-200 rounded-lg">
-              {state.invites
-                .filter((i) => i.status === 'unused')
-                .map((inv) => (
-                  <div
-                    key={inv.inviteCode}
-                    className="px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs"
-                  >
-                    <div>
-                      <span className="font-bold text-slate-900">
-                        {inv.collectorName}
-                      </span>{' '}
-                      · <span className="font-mono-nums">{inv.phone}</span> ·
-                      المناطق:{' '}
-                      {inv.assignedZones.length > 0
-                        ? inv.assignedZones.join('، ')
-                        : 'جميع الشوارع'}
-                    </div>
-                    <div className="flex items-center gap-2 shrink-0">
+          <div className="divide-y divide-slate-100 border-t border-slate-100">
+            {state.collectors.map((col) => (
+              <div
+                key={col.id}
+                className="py-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4"
+              >
+                <div>
+                  <div className="text-sm font-semibold text-slate-900 flex items-center gap-2">
+                    <span>{col.name}</span>
+                    {col.code && (
                       <span
                         dir="ltr"
-                        className="font-mono-nums font-bold text-teal-800 bg-teal-50 border border-teal-200 px-2.5 py-1 rounded"
+                        className="text-[11px] font-mono-nums text-teal-800 bg-teal-50 border border-teal-200 px-2 py-0.5 rounded"
                       >
-                        {inv.inviteCode}
+                        {col.code}
                       </span>
-                      <button
-                        type="button"
-                        onClick={() => void handleCopyCode(inv.inviteCode)}
-                        className="p-1.5 text-slate-600 hover:text-teal-700 cursor-pointer"
-                        title="نسخ كود المحصّل"
-                      >
-                        {copiedCode === inv.inviteCode ? (
-                          <Check className="w-4 h-4 text-teal-700" />
-                        ) : (
-                          <Copy className="w-4 h-4" />
-                        )}
-                      </button>
-                    </div>
+                    )}
                   </div>
-                ))}
-            </div>
-          </div>
-        )}
+                  <div className="text-xs text-slate-500 mt-0.5">
+                    {col.phone || 'بدون هاتف'} · المناطق:{' '}
+                    {col.assignedZones.length > 0
+                      ? col.assignedZones.join('، ')
+                      : 'جميع المناطق'}
+                  </div>
+                  <div className="flex flex-wrap gap-3 mt-2.5 text-xs">
+                    {(
+                      [
+                        ['canRecordReadings', 'تسجيل القراءات'],
+                        ['canCollectCash', 'تحصيل نقدي'],
+                        ['canSendInvoices', 'إرسال فواتير'],
+                        ['canViewDebts', 'عرض المتأخرات'],
+                      ] as const
+                    ).map(([permKey, label]) => (
+                      <label
+                        key={permKey}
+                        className="inline-flex items-center gap-1.5 cursor-pointer text-slate-700"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={col.permissions[permKey]}
+                          onChange={() =>
+                            void handleToggleCollectorPermission(col, permKey)
+                          }
+                          className="accent-teal-700"
+                        />
+                        {label}
+                      </label>
+                    ))}
+                  </div>
+                </div>
 
-        {/* Activated Collectors List with Live Permission Toggles */}
-        <div className="divide-y divide-slate-100 border-t border-slate-100">
-          {state.collectors.map((col) => (
-            <div
-              key={col.id}
-              className="py-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4"
-            >
-              <div>
-                <div className="text-sm font-semibold text-slate-900">
-                  {col.name}
-                </div>
-                <div className="text-xs text-slate-500 mt-0.5">
-                  {col.phone} · {col.email} · المناطق:{' '}
-                  {col.assignedZones.length > 0
-                    ? col.assignedZones.join('، ')
-                    : 'جميع المناطق'}
-                </div>
-                <div className="flex flex-wrap gap-3 mt-2.5 text-xs">
-                  {(
-                    [
-                      ['canRecordReadings', 'تسجيل القراءات'],
-                      ['canCollectCash', 'تحصيل نقدي'],
-                      ['canSendInvoices', 'إرسال فواتير'],
-                      ['canViewDebts', 'عرض المتأخرات'],
-                    ] as const
-                  ).map(([permKey, label]) => (
-                    <label
-                      key={permKey}
-                      className="inline-flex items-center gap-1.5 cursor-pointer text-slate-700"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={col.permissions[permKey]}
-                        onChange={() =>
-                          void handleToggleCollectorPermission(col, permKey)
-                        }
-                        className="accent-teal-700"
-                      />
-                      {label}
-                    </label>
-                  ))}
-                </div>
+                <button
+                  type="button"
+                  onClick={() => void handleToggleCollectorActive(col)}
+                  className={`px-3.5 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    col.active
+                      ? 'border-teal-200 bg-teal-50 text-teal-800 hover:bg-teal-100'
+                      : 'border-rose-200 bg-rose-50 text-rose-800 hover:bg-rose-100'
+                  }`}
+                >
+                  {col.active ? 'حساب مفعّل (إيقاف)' : 'حساب موقوف (تفعيل)'}
+                </button>
               </div>
-
-              <button
-                type="button"
-                onClick={() => void handleToggleCollectorActive(col)}
-                className={`px-3.5 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  col.active
-                    ? 'border-teal-200 bg-teal-50 text-teal-800 hover:bg-teal-100'
-                    : 'border-rose-200 bg-rose-50 text-rose-800 hover:bg-rose-100'
-                }`}
-              >
-                {col.active ? 'حساب مفعّل (إيقاف)' : 'حساب موقوف (تفعيل)'}
-              </button>
-            </div>
-          ))}
-          {state.collectors.length === 0 && (
-            <div className="py-6 text-center text-xs text-slate-500">
-              لم يفعّل أي محصّل حسابه بعد. أصدر كود تفعيل من النموذج أعلاه وأرسله للمحصّل.
-            </div>
-          )}
-        </div>
-      </section>
+            ))}
+            {state.collectors.length === 0 && (
+              <div className="py-6 text-center text-xs text-slate-500">
+                لا يوجد محصّلون مرتبطون بهذه المحطة بعد. يولّد الأدمن المطور أكواد المحصّلين من لوحة الأدمن.
+              </div>
+            )}
+          </div>
+        </section>
+      </div>
 
       {/* Subscribers Ledger Table */}
       <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
         <div className="p-6 border-b border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div>
             <h2 className="text-lg font-bold text-slate-900">
-              سجل المشتركين والعدادات
+              سجل المشتركين والعدادات ({filteredSubscribers.length})
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              مرتّب حسب ترتيب البيت الميداني (sequence_order)
+              مرتّب حسب تسلسل خط السير الميداني
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-3">
@@ -754,7 +511,7 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {filteredSubscribers.map((sub) => (
+              {filteredSubscribers.slice(0, 200).map((sub) => (
                 <tr key={sub.id} className="hover:bg-slate-50/70 transition-colors">
                   <td className="py-3 px-4 font-mono-nums text-slate-500">
                     {sub.sequenceOrder}
@@ -796,7 +553,7 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
               {filteredSubscribers.length === 0 && (
                 <tr>
                   <td colSpan={8} className="py-10 text-center text-slate-500">
-                    لا يوجد مشتركين مسجلين في هذه المحطة بعد. قم برفع ملف Excel أعلاه لتأسيس المشتركين.
+                    لا يوجد مشتركين في هذه المحطة بعد. يرفع الأدمن المطور كشف Excel للمحطة.
                   </td>
                 </tr>
               )}

@@ -17,41 +17,17 @@ export interface CollectorPermissions {
   canViewDebts: boolean;
 }
 
-export interface LicenseRecord {
+export interface AccessCodeRecord {
   code: string;
-  stationId: string;
-  stationName: string;
-  maxCollectors: number;
-  maxSubscribers: number;
-  status: LicenseStatus;
-  activatedByUid?: string;
-  activatedByEmail?: string;
-  activatedAt?: string;
-  expiresAt: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface CollectorInvite {
-  inviteCode: string;
-  stationId: string;
-  stationName: string;
-  ownerUid: string;
-  collectorName: string;
+  role: 'manager' | 'collector';
+  name: string;
   phone: string;
+  stationId: string;
+  stationName: string;
   assignedZones: string[];
   permissions: CollectorPermissions;
-  status: 'unused' | 'claimed' | 'revoked';
-  claimedByUid?: string;
-  createdAt: string;
-}
-
-export interface UserRoleBinding {
-  role: 'manager' | 'collector';
-  stationId: string;
-  stationName: string;
-  codeUsed: string;
   active: boolean;
+  createdAt: string;
   updatedAt: string;
 }
 
@@ -67,10 +43,14 @@ export interface StationConfig {
   maxSubscribers: number;
   ownerUid: string;
   updatedAt: string;
+  subscriberCount?: number;
+  readingCount?: number;
+  receiptCount?: number;
 }
 
 export interface CollectorProfile {
   id: string;
+  code?: string;
   name: string;
   email: string;
   phone: string;
@@ -92,6 +72,7 @@ export interface Subscriber {
   zoneStreet: string;
   sequenceOrder: number;
   assignedCollectorId?: string;
+  importedLocally?: boolean;
   syncStatus: SyncStatus;
   updatedAt: string;
 }
@@ -110,6 +91,7 @@ export interface MeterReading {
   totalDueYer: number;
   photoUrl: string;
   photoSizeKb: number;
+  hasLocalPhoto?: boolean;
   collectorUid: string;
   collectorName: string;
   recordedAt: string;
@@ -130,19 +112,16 @@ export interface PaymentReceipt {
   syncStatus: SyncStatus;
 }
 
-export interface SubscriberPortalRecord {
-  stationId: string;
+export interface SubscriberLookupResult {
   stationName: string;
-  meterNumber: string;
-  subscriberName: string;
-  zoneStreet: string;
-  previousReading: number;
-  currentReading: number;
-  consumptionKwh: number;
-  currentBillYer: number;
-  previousDebtYer: number;
-  totalDueYer: number;
-  lastReadingPhotoUrl: string;
-  lastPaymentYer: number;
-  updatedAt: string;
+  subscriber: Subscriber;
+  readings: MeterReading[];
+  receipts: PaymentReceipt[];
+}
+
+export interface SyncProgress {
+  completed: number;
+  total: number;
+  currentBatch: number;
+  totalBatches: number;
 }

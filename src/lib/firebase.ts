@@ -92,6 +92,28 @@ export async function testFirestoreConnection(): Promise<boolean> {
   }
 }
 
+export function formatAuthError(error: unknown): string {
+  const code =
+    typeof error === 'object' && error !== null && 'code' in error
+      ? String((error as { code?: unknown }).code ?? '')
+      : '';
+  const msg = error instanceof Error ? error.message : String(error);
+
+  if (code === 'auth/operation-not-allowed' || msg.includes('operation-not-allowed')) {
+    return 'مزود تسجيل الدخول عبر Google غير مفعل بعد في مشروع Firebase (electricity-station-f5a90). يرجى تفعيل Google من Authentication -> Sign-in method ثم إعادة المحاولة.';
+  }
+  if (code === 'auth/unauthorized-domain' || msg.includes('unauthorized-domain')) {
+    return 'هذا النطاق غير مضاف في قائمة النطاقات المصرح بها (Authorized domains) في Firebase Authentication.';
+  }
+  if (code === 'auth/popup-blocked' || msg.includes('popup-blocked')) {
+    return 'تم حظر نافذة تسجيل الدخول من المتصفح. يرجى السماح بالنوافذ المنبثقة لهذا الموقع والمحاولة مجدداً.';
+  }
+  if (code === 'auth/popup-closed-by-user' || msg.includes('popup-closed-by-user')) {
+    return 'تم إغلاق نافذة تسجيل الدخول قبل إتمام العملية.';
+  }
+  return msg || 'تعذر إتمام تسجيل الدخول بحساب Google.';
+}
+
 export async function signInWithGooglePopup(): Promise<User> {
   const result = await signInWithPopup(auth, googleProvider);
   return result.user;

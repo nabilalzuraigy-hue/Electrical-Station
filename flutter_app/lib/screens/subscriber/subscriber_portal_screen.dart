@@ -29,19 +29,18 @@ class _SubscriberPortalScreenState extends State<SubscriberPortalScreen> {
     });
     try {
       final data = await _syncService.fetchSubscriberPortal(
-        meterNumber: _meterController.text.trim(),
+        identifier: _meterController.text.trim(),
         phone: _phoneController.text.trim(),
       );
       if (!mounted) return;
       if (data == null) {
         setState(() {
           _portalData = null;
-          _error = 'لم يتم العثور على بيانات مطابقة لرقم العداد والهاتف';
+          _error = 'لم يتم العثور على بيانات مطابقة للاسم ورقم الهاتف';
         });
       } else {
-        await _fcmService.initializeAndSubscribeMeter(
-          _meterController.text.trim(),
-        );
+        final meterNum = (data['meterNumber'] as String?) ?? _meterController.text.trim();
+        await _fcmService.initializeAndSubscribeMeter(meterNum);
         setState(() => _portalData = data);
       }
     } finally {
@@ -59,7 +58,7 @@ class _SubscriberPortalScreenState extends State<SubscriberPortalScreen> {
           TextField(
             controller: _meterController,
             decoration: const InputDecoration(
-              labelText: 'رقم العداد',
+              labelText: 'اسم المشترك الكامل (أو رقم العداد)',
               border: OutlineInputBorder(),
             ),
           ),

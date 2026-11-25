@@ -12,6 +12,8 @@ const webFilesMap = import.meta.glob(
   [
     '/index.html',
     '/package.json',
+    '/server.ts',
+    '/.env.example',
     '/tsconfig.json',
     '/vite.config.ts',
     '/firebase.json',
