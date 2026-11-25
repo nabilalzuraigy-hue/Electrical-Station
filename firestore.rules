@@ -1,0 +1,415 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global safety net: deny everything by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidCode(code) {
+      return code is string && code.size() >= 4 && code.size() <= 40 && code.matches('^[A-Z0-9\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 'nabilalzuraigy@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isStationActive(stationId) {
+      return exists(/databases/$(database)/documents/stations/$(stationId)) &&
+        get(/databases/$(database)/documents/stations/$(stationId)).data.licenseStatus == 'active';
+    }
+
+    function isStationOwner(stationId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/stations/$(stationId)) &&
+        get(/databases/$(database)/documents/stations/$(stationId)).data.ownerUid == request.auth.uid;
+    }
+
+    function isStationCollector(stationId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/stations/$(stationId)/collectors/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/stations/$(stationId)/collectors/$(request.auth.uid)).data.active == true;
+    }
+
+    function collectorHasPermission(stationId, permKey) {
+      return isStationCollector(stationId) &&
+        get(/databases/$(database)/documents/stations/$(stationId)/collectors/$(request.auth.uid)).data.permissions[permKey] == true;
+    }
+
+    function isStationStaff(stationId) {
+      return isAdmin() || isStationOwner(stationId) || isStationCollector(stationId);
+    }
+
+    function isValidPermissionsMap(perms) {
+      return perms is map
+        && perms.keys().hasAll(['canRecordReadings', 'canCollectCash', 'canSendInvoices', 'canViewDebts'])
+        && perms.keys().hasOnly(['canRecordReadings', 'canCollectCash', 'canSendInvoices', 'canViewDebts'])
+        && perms.canRecordReadings is bool
+        && perms.canCollectCash is bool
+        && perms.canSendInvoices is bool
+        && perms.canViewDebts is bool;
+    }
+
+    function isValidAdminDoc(data) {
+      return data.keys().hasAll(['email', 'createdAt'])
+        && data.keys().hasOnly(['email', 'createdAt'])
+        && data.email is string && data.email.size() >= 5 && data.email.size() <= 150
+        && data.createdAt is timestamp && data.createdAt == request.time;
+    }
+
+    function isValidLicense(data) {
+      return data.keys().hasAll(['code', 'stationId', 'stationName', 'maxCollectors', 'maxSubscribers', 'status', 'expiresAt', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['code', 'stationId', 'stationName', 'maxCollectors', 'maxSubscribers', 'status', 'activatedByUid', 'activatedByEmail', 'activatedAt', 'expiresAt', 'createdAt', 'updatedAt'])
+        && isValidCode(data.code)
+        && isValidId(data.stationId)
+        && data.stationName is string && data.stationName.size() >= 2 && data.stationName.size() <= 120
+        && data.maxCollectors is number && data.maxCollectors >= 1 && data.maxCollectors <= 500
+        && data.maxSubscribers is number && data.maxSubscribers >= 1 && data.maxSubscribers <= 100000
+        && data.status in ['unused', 'active', 'suspended', 'expired']
+        && (!('activatedByUid' in data) || (data.activatedByUid is string && data.activatedByUid.size() <= 128))
+        && (!('activatedByEmail' in data) || (data.activatedByEmail is string && data.activatedByEmail.size() <= 150))
+        && data.expiresAt is timestamp
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp && data.updatedAt == request.time;
+    }
+
+    function isValidUserRole(data) {
+      return data.keys().hasAll(['role', 'stationId', 'stationName', 'codeUsed', 'active', 'updatedAt'])
+        && data.keys().hasOnly(['role', 'stationId', 'stationName', 'codeUsed', 'active', 'updatedAt'])
+        && data.role in ['manager', 'collector']
+        && isValidId(data.stationId)
+        && data.stationName is string && data.stationName.size() >= 2 && data.stationName.size() <= 120
+        && data.codeUsed is string && data.codeUsed.size() >= 4 && data.codeUsed.size() <= 60
+        && data.active is bool
+        && data.updatedAt is timestamp && data.updatedAt == request.time;
+    }
+
+    function isValidCollectorInvite(data) {
+      return data.keys().hasAll(['inviteCode', 'stationId', 'stationName', 'ownerUid', 'collectorName', 'phone', 'assignedZones', 'permissions', 'status', 'createdAt'])
+        && data.keys().hasOnly(['inviteCode', 'stationId', 'stationName', 'ownerUid', 'collectorName', 'phone', 'assignedZones', 'permissions', 'status', 'claimedByUid', 'claimedAt', 'createdAt'])
+        && isValidCode(data.inviteCode)
+        && isValidId(data.stationId)
+        && data.stationName is string && data.stationName.size() >= 2 && data.stationName.size() <= 120
+        && isValidId(data.ownerUid)
+        && data.collectorName is string && data.collectorName.size() >= 2 && data.collectorName.size() <= 100
+        && data.phone is string && data.phone.size() >= 7 && data.phone.size() <= 25
+        && data.assignedZones is list && data.assignedZones.size() <= 20
+        && (data.assignedZones.size() == 0 || (data.assignedZones[0] is string && data.assignedZones[0].size() <= 100))
+        && isValidPermissionsMap(data.permissions)
+        && data.status in ['unused', 'claimed', 'revoked']
+        && (!('claimedByUid' in data) || (data.claimedByUid is string && data.claimedByUid.size() <= 128))
+        && data.createdAt is timestamp;
+    }
+
+    function isValidStation(data) {
+      return data.keys().hasAll(['stationName', 'kwhPriceYer', 'minimumFeeYer', 'mainGeneratorKwh', 'licenseCode', 'licenseStatus', 'maxCollectors', 'maxSubscribers', 'ownerUid', 'updatedAt'])
+        && data.keys().hasOnly(['stationName', 'kwhPriceYer', 'minimumFeeYer', 'mainGeneratorKwh', 'licenseCode', 'licenseStatus', 'maxCollectors', 'maxSubscribers', 'ownerUid', 'updatedAt'])
+        && data.stationName is string && data.stationName.size() >= 2 && data.stationName.size() <= 120
+        && data.kwhPriceYer is number && data.kwhPriceYer >= 0 && data.kwhPriceYer <= 100000
+        && data.minimumFeeYer is number && data.minimumFeeYer >= 0 && data.minimumFeeYer <= 500000
+        && data.mainGeneratorKwh is number && data.mainGeneratorKwh >= 0
+        && isValidCode(data.licenseCode)
+        && data.licenseStatus in ['active', 'suspended']
+        && data.maxCollectors is number && data.maxCollectors >= 1 && data.maxCollectors <= 500
+        && data.maxSubscribers is number && data.maxSubscribers >= 1 && data.maxSubscribers <= 100000
+        && isValidId(data.ownerUid)
+        && data.updatedAt is timestamp && data.updatedAt == request.time;
+    }
+
+    function isValidCollector(data) {
+      return data.keys().hasAll(['name', 'email', 'phone', 'assignedZones', 'permissions', 'active', 'createdAt'])
+        && data.keys().hasOnly(['name', 'email', 'phone', 'assignedZones', 'permissions', 'active', 'inviteCode', 'createdAt'])
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 100
+        && data.email is string && data.email.size() >= 5 && data.email.size() <= 150
+        && data.phone is string && data.phone.size() >= 7 && data.phone.size() <= 25
+        && data.assignedZones is list && data.assignedZones.size() <= 20
+        && (data.assignedZones.size() == 0 || (data.assignedZones[0] is string && data.assignedZones[0].size() <= 100))
+        && isValidPermissionsMap(data.permissions)
+        && data.active is bool
+        && (!('inviteCode' in data) || (data.inviteCode is string && data.inviteCode.size() <= 40))
+        && data.createdAt is timestamp;
+    }
+
+    function isValidSubscriber(data) {
+      return data.keys().hasAll(['meterNumber', 'subscriberName', 'phone', 'previousReading', 'currentReading', 'previousDebtYer', 'zoneStreet', 'sequenceOrder', 'updatedAt'])
+        && data.keys().hasOnly(['meterNumber', 'subscriberName', 'phone', 'previousReading', 'currentReading', 'previousDebtYer', 'zoneStreet', 'sequenceOrder', 'assignedCollectorId', 'updatedAt'])
+        && data.meterNumber is string && data.meterNumber.size() >= 2 && data.meterNumber.size() <= 40
+        && data.subscriberName is string && data.subscriberName.size() >= 2 && data.subscriberName.size() <= 120
+        && data.phone is string && data.phone.size() >= 7 && data.phone.size() <= 25
+        && data.previousReading is number && data.previousReading >= 0
+        && data.currentReading is number && data.currentReading >= data.previousReading
+        && data.previousDebtYer is number && data.previousDebtYer >= 0
+        && data.zoneStreet is string && data.zoneStreet.size() >= 1 && data.zoneStreet.size() <= 120
+        && data.sequenceOrder is number && data.sequenceOrder >= 0 && data.sequenceOrder <= 100000
+        && (!('assignedCollectorId' in data) || (data.assignedCollectorId is string && data.assignedCollectorId.size() <= 128))
+        && data.updatedAt is timestamp && data.updatedAt == request.time;
+    }
+
+    function isValidReading(data) {
+      return data.keys().hasAll(['subscriberId', 'meterNumber', 'subscriberName', 'previousReading', 'currentReading', 'consumptionKwh', 'kwhPriceYer', 'currentBillYer', 'previousDebtYer', 'totalDueYer', 'photoUrl', 'photoSizeKb', 'collectorUid', 'collectorName', 'recordedAt', 'createdAt'])
+        && data.keys().hasOnly(['subscriberId', 'meterNumber', 'subscriberName', 'previousReading', 'currentReading', 'consumptionKwh', 'kwhPriceYer', 'currentBillYer', 'previousDebtYer', 'totalDueYer', 'photoUrl', 'photoSizeKb', 'collectorUid', 'collectorName', 'recordedAt', 'createdAt'])
+        && isValidId(data.subscriberId)
+        && data.meterNumber is string && data.meterNumber.size() >= 2 && data.meterNumber.size() <= 40
+        && data.subscriberName is string && data.subscriberName.size() >= 2 && data.subscriberName.size() <= 120
+        && data.previousReading is number && data.previousReading >= 0
+        && data.currentReading is number && data.currentReading >= data.previousReading
+        && data.consumptionKwh is number && data.consumptionKwh >= 0
+        && data.kwhPriceYer is number && data.kwhPriceYer >= 0
+        && data.currentBillYer is number && data.currentBillYer >= 0
+        && data.previousDebtYer is number && data.previousDebtYer >= 0
+        && data.totalDueYer is number && data.totalDueYer >= 0
+        && data.photoUrl is string && data.photoUrl.size() <= 220000
+        && data.photoSizeKb is number && data.photoSizeKb >= 0 && data.photoSizeKb <= 200
+        && isValidId(data.collectorUid)
+        && data.collectorName is string && data.collectorName.size() >= 1 && data.collectorName.size() <= 120
+        && data.recordedAt is timestamp
+        && data.createdAt is timestamp;
+    }
+
+    function isValidReceipt(data) {
+      return data.keys().hasAll(['subscriberId', 'meterNumber', 'subscriberName', 'readingId', 'amountPaidYer', 'remainingBalanceYer', 'collectorUid', 'collectorName', 'paidAt', 'createdAt'])
+        && data.keys().hasOnly(['subscriberId', 'meterNumber', 'subscriberName', 'readingId', 'amountPaidYer', 'remainingBalanceYer', 'collectorUid', 'collectorName', 'paidAt', 'createdAt'])
+        && isValidId(data.subscriberId)
+        && data.meterNumber is string && data.meterNumber.size() >= 2 && data.meterNumber.size() <= 40
+        && data.subscriberName is string && data.subscriberName.size() >= 2 && data.subscriberName.size() <= 120
+        && isValidId(data.readingId)
+        && data.amountPaidYer is number && data.amountPaidYer > 0
+        && data.remainingBalanceYer is number && data.remainingBalanceYer >= 0
+        && isValidId(data.collectorUid)
+        && data.collectorName is string && data.collectorName.size() >= 1 && data.collectorName.size() <= 120
+        && data.paidAt is timestamp
+        && data.createdAt is timestamp;
+    }
+
+    function isValidPortalRecord(data) {
+      return data.keys().hasAll(['stationId', 'stationName', 'meterNumber', 'subscriberName', 'zoneStreet', 'previousReading', 'currentReading', 'consumptionKwh', 'currentBillYer', 'previousDebtYer', 'totalDueYer', 'lastReadingPhotoUrl', 'lastPaymentYer', 'updatedAt'])
+        && data.keys().hasOnly(['stationId', 'stationName', 'meterNumber', 'subscriberName', 'zoneStreet', 'previousReading', 'currentReading', 'consumptionKwh', 'currentBillYer', 'previousDebtYer', 'totalDueYer', 'lastReadingPhotoUrl', 'lastPaymentYer', 'updatedAt'])
+        && isValidId(data.stationId)
+        && data.stationName is string && data.stationName.size() >= 2 && data.stationName.size() <= 120
+        && data.meterNumber is string && data.meterNumber.size() >= 2 && data.meterNumber.size() <= 40
+        && data.subscriberName is string && data.subscriberName.size() >= 2 && data.subscriberName.size() <= 120
+        && data.zoneStreet is string && data.zoneStreet.size() >= 1 && data.zoneStreet.size() <= 120
+        && data.previousReading is number && data.previousReading >= 0
+        && data.currentReading is number && data.currentReading >= data.previousReading
+        && data.consumptionKwh is number && data.consumptionKwh >= 0
+        && data.currentBillYer is number && data.currentBillYer >= 0
+        && data.previousDebtYer is number && data.previousDebtYer >= 0
+        && data.totalDueYer is number && data.totalDueYer >= 0
+        && data.lastReadingPhotoUrl is string && data.lastReadingPhotoUrl.size() <= 220000
+        && data.lastPaymentYer is number && data.lastPaymentYer >= 0
+        && data.updatedAt is timestamp && data.updatedAt == request.time;
+    }
+
+    match /admins/{uid} {
+      allow get: if isValidId(uid) && isSignedIn() && (request.auth.uid == uid || isAdmin());
+      allow list: if false;
+      allow create: if isValidId(uid) && isAdmin() && isValidAdminDoc(incoming());
+      allow update, delete: if isValidId(uid) && isAdmin();
+    }
+
+    // Super Admin issues isolated station licenses; managers redeem unused codes atomically
+    match /licenses/{licenseCode} {
+      allow get: if isValidCode(licenseCode) && isSignedIn();
+      allow list: if isAdmin();
+      allow create: if isValidCode(licenseCode) && isAdmin() && isValidLicense(incoming())
+        && incoming().code == licenseCode
+        && incoming().createdAt == request.time;
+      allow update: if isValidCode(licenseCode) && isSignedIn() && isValidLicense(incoming())
+        && incoming().code == existing().code
+        && incoming().stationId == existing().stationId
+        && incoming().createdAt == existing().createdAt
+        && (
+          isAdmin() ||
+          (
+            existing().status == 'unused'
+            && incoming().status == 'active'
+            && incoming().activatedByUid == request.auth.uid
+            && incoming().activatedByEmail == request.auth.token.email
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'activatedByUid', 'activatedByEmail', 'activatedAt', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidCode(licenseCode) && isAdmin();
+    }
+
+    // Station Managers issue collector activation codes; collectors claim them atomically
+    match /collectorInvites/{inviteCode} {
+      allow get: if isValidCode(inviteCode) && isSignedIn();
+      allow list: if isAdmin() || (isSignedIn() && resource.data.ownerUid == request.auth.uid);
+      allow create: if isValidCode(inviteCode) && isSignedIn() && isValidCollectorInvite(incoming())
+        && incoming().inviteCode == inviteCode
+        && incoming().status == 'unused'
+        && incoming().createdAt == request.time
+        && (isAdmin() || (isStationOwner(incoming().stationId) && isStationActive(incoming().stationId) && incoming().ownerUid == request.auth.uid));
+      allow update: if isValidCode(inviteCode) && isSignedIn() && isValidCollectorInvite(incoming())
+        && incoming().inviteCode == existing().inviteCode
+        && incoming().stationId == existing().stationId
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && (
+          isAdmin() ||
+          isStationOwner(existing().stationId) ||
+          (
+            existing().status == 'unused'
+            && incoming().status == 'claimed'
+            && incoming().claimedByUid == request.auth.uid
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'claimedByUid', 'claimedAt'])
+          )
+        );
+      allow delete: if isValidCode(inviteCode) && (isAdmin() || isStationOwner(existing().stationId));
+    }
+
+    // Direct binding of user UID -> isolated station & role
+    match /userRoles/{uid} {
+      allow get: if isValidId(uid) && isSignedIn() && (request.auth.uid == uid || isAdmin());
+      allow list: if isAdmin();
+      allow create, update: if isValidId(uid) && isSignedIn() && isValidUserRole(incoming())
+        && (
+          isAdmin() ||
+          (
+            request.auth.uid == uid
+            && (
+              (
+                incoming().role == 'manager'
+                && isValidCode(incoming().codeUsed)
+                && getAfter(/databases/$(database)/documents/licenses/$(incoming().codeUsed)).data.activatedByUid == request.auth.uid
+                && getAfter(/databases/$(database)/documents/licenses/$(incoming().codeUsed)).data.stationId == incoming().stationId
+              ) ||
+              (
+                incoming().role == 'collector'
+                && isValidCode(incoming().codeUsed)
+                && getAfter(/databases/$(database)/documents/collectorInvites/$(incoming().codeUsed)).data.claimedByUid == request.auth.uid
+                && getAfter(/databases/$(database)/documents/collectorInvites/$(incoming().codeUsed)).data.stationId == incoming().stationId
+              )
+            )
+          )
+        );
+      allow delete: if isValidId(uid) && isAdmin();
+    }
+
+    // Isolated Station Tenant Documents
+    match /stations/{stationId} {
+      allow get: if isValidId(stationId) && (isAdmin() || (isSignedIn() && (existing().ownerUid == request.auth.uid || isStationCollector(stationId))));
+      allow list: if isAdmin() || (isSignedIn() && resource.data.ownerUid == request.auth.uid);
+      allow create: if isValidId(stationId) && isSignedIn() && isValidStation(incoming())
+        && (
+          isAdmin() ||
+          (
+            incoming().ownerUid == request.auth.uid
+            && incoming().licenseStatus == 'active'
+            && exists(/databases/$(database)/documents/licenses/$(incoming().licenseCode))
+            && get(/databases/$(database)/documents/licenses/$(incoming().licenseCode)).data.stationId == stationId
+            && get(/databases/$(database)/documents/licenses/$(incoming().licenseCode)).data.status == 'unused'
+          )
+        );
+      allow update: if isValidId(stationId) && isSignedIn() && isValidStation(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().licenseCode == existing().licenseCode
+        && (
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['stationName', 'licenseStatus', 'maxCollectors', 'maxSubscribers', 'updatedAt'])) ||
+          (existing().ownerUid == request.auth.uid && existing().licenseStatus == 'active' && incoming().diff(existing()).affectedKeys().hasOnly(['stationName', 'kwhPriceYer', 'minimumFeeYer', 'mainGeneratorKwh', 'updatedAt']))
+        );
+      allow delete: if isValidId(stationId) && isAdmin();
+
+      match /collectors/{collectorId} {
+        allow get: if isValidId(collectorId) && (isAdmin() || isStationOwner(stationId) || (isSignedIn() && request.auth.uid == collectorId));
+        allow list: if isAdmin() || isStationOwner(stationId);
+        allow create: if isValidId(collectorId) && isSignedIn() && isValidCollector(incoming())
+          && incoming().createdAt == request.time
+          && (
+            isAdmin() ||
+            (isStationOwner(stationId) && isStationActive(stationId)) ||
+            (
+              request.auth.uid == collectorId
+              && isStationActive(stationId)
+              && 'inviteCode' in incoming()
+              && isValidCode(incoming().inviteCode)
+              && exists(/databases/$(database)/documents/collectorInvites/$(incoming().inviteCode))
+              && get(/databases/$(database)/documents/collectorInvites/$(incoming().inviteCode)).data.stationId == stationId
+              && get(/databases/$(database)/documents/collectorInvites/$(incoming().inviteCode)).data.status == 'unused'
+            )
+          );
+        allow update: if isValidId(collectorId) && (isAdmin() || isStationOwner(stationId)) && isValidCollector(incoming())
+          && incoming().createdAt == existing().createdAt
+          && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'email', 'phone', 'assignedZones', 'permissions', 'active']);
+        allow delete: if isValidId(collectorId) && (isAdmin() || isStationOwner(stationId));
+      }
+
+      match /subscribers/{subscriberId} {
+        allow get: if isValidId(subscriberId) && isStationStaff(stationId);
+        allow list: if isStationStaff(stationId);
+        allow create: if isValidId(subscriberId) && isStationActive(stationId) && (isAdmin() || isStationOwner(stationId)) && isValidSubscriber(incoming());
+        allow update: if isValidId(subscriberId) && isStationActive(stationId) && isStationStaff(stationId) && isValidSubscriber(incoming())
+          && (
+            (isAdmin() || isStationOwner(stationId)) && incoming().diff(existing()).affectedKeys().hasOnly(['meterNumber', 'subscriberName', 'phone', 'previousReading', 'currentReading', 'previousDebtYer', 'zoneStreet', 'sequenceOrder', 'assignedCollectorId', 'updatedAt']) ||
+            (collectorHasPermission(stationId, 'canRecordReadings') && incoming().diff(existing()).affectedKeys().hasOnly(['previousReading', 'currentReading', 'previousDebtYer', 'updatedAt'])) ||
+            (collectorHasPermission(stationId, 'canCollectCash') && incoming().diff(existing()).affectedKeys().hasOnly(['previousDebtYer', 'updatedAt']))
+          );
+        allow delete: if isValidId(subscriberId) && isStationActive(stationId) && (isAdmin() || isStationOwner(stationId));
+      }
+
+      match /readings/{readingId} {
+        allow get: if isValidId(readingId) && isStationStaff(stationId);
+        allow list: if isStationStaff(stationId);
+        allow create: if isValidId(readingId) && isStationActive(stationId) && isValidReading(incoming())
+          && incoming().createdAt == request.time
+          && (
+            isAdmin() ||
+            isStationOwner(stationId) ||
+            (collectorHasPermission(stationId, 'canRecordReadings') && incoming().collectorUid == request.auth.uid)
+          )
+          && exists(/databases/$(database)/documents/stations/$(stationId)/subscribers/$(incoming().subscriberId));
+        allow update: if isValidId(readingId) && isStationActive(stationId) && (isAdmin() || isStationOwner(stationId)) && isValidReading(incoming())
+          && incoming().createdAt == existing().createdAt
+          && incoming().subscriberId == existing().subscriberId
+          && incoming().diff(existing()).affectedKeys().hasOnly(['currentReading', 'consumptionKwh', 'currentBillYer', 'totalDueYer', 'photoUrl', 'photoSizeKb']);
+        allow delete: if isValidId(readingId) && isStationActive(stationId) && (isAdmin() || isStationOwner(stationId));
+      }
+
+      match /receipts/{receiptId} {
+        allow get: if isValidId(receiptId) && isStationStaff(stationId);
+        allow list: if isStationStaff(stationId);
+        allow create: if isValidId(receiptId) && isStationActive(stationId) && isValidReceipt(incoming())
+          && incoming().createdAt == request.time
+          && (
+            isAdmin() ||
+            isStationOwner(stationId) ||
+            (collectorHasPermission(stationId, 'canCollectCash') && incoming().collectorUid == request.auth.uid)
+          )
+          && exists(/databases/$(database)/documents/stations/$(stationId)/subscribers/$(incoming().subscriberId));
+        allow update: if isValidId(receiptId) && isStationActive(stationId) && (isAdmin() || isStationOwner(stationId)) && isValidReceipt(incoming())
+          && incoming().createdAt == existing().createdAt
+          && incoming().subscriberId == existing().subscriberId
+          && incoming().diff(existing()).affectedKeys().hasOnly(['amountPaidYer', 'remainingBalanceYer']);
+        allow delete: if isValidId(receiptId) && isStationActive(stationId) && (isAdmin() || isStationOwner(stationId));
+      }
+    }
+
+    match /subscriberPortals/{lookupHash} {
+      allow get: if isValidId(lookupHash);
+      allow list: if false;
+      allow create, update: if isValidId(lookupHash) && isSignedIn() && isValidPortalRecord(incoming())
+        && isStationActive(incoming().stationId)
+        && (isAdmin() || isStationOwner(incoming().stationId) || collectorHasPermission(incoming().stationId, 'canRecordReadings') || collectorHasPermission(incoming().stationId, 'canCollectCash'));
+      allow delete: if isValidId(lookupHash) && isSignedIn() && (isAdmin() || isStationOwner(existing().stationId));
+    }
+  }
+}

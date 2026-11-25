@@ -1,0 +1,214 @@
+{
+  "entities": {
+    "LicenseRecord": {
+      "title": "LicenseRecord",
+      "description": "Station activation code and commercial license issued by the Super Admin.",
+      "type": "object",
+      "properties": {
+        "code": { "type": "string", "pattern": "^[A-Z0-9\\-]+$", "maxLength": 40 },
+        "stationId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "stationName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "maxCollectors": { "type": "number" },
+        "maxSubscribers": { "type": "number" },
+        "status": { "type": "string", "enum": ["unused", "active", "suspended", "expired"] },
+        "activatedByUid": { "type": "string", "maxLength": 128 },
+        "activatedByEmail": { "type": "string", "maxLength": 150 },
+        "expiresAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["code", "stationId", "stationName", "maxCollectors", "maxSubscribers", "status", "expiresAt", "createdAt", "updatedAt"]
+    },
+    "UserRoleBinding": {
+      "title": "UserRoleBinding",
+      "description": "Maps an authenticated user UID to their isolated station and role.",
+      "type": "object",
+      "properties": {
+        "role": { "type": "string", "enum": ["manager", "collector"] },
+        "stationId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "stationName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "codeUsed": { "type": "string", "maxLength": 60 },
+        "active": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["role", "stationId", "stationName", "codeUsed", "active", "updatedAt"]
+    },
+    "CollectorInvite": {
+      "title": "CollectorInvite",
+      "description": "Activation code issued by a Station Manager for a field collector with granular permissions.",
+      "type": "object",
+      "properties": {
+        "inviteCode": { "type": "string", "pattern": "^[A-Z0-9\\-]+$", "maxLength": 40 },
+        "stationId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "stationName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "ownerUid": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "collectorName": { "type": "string", "minLength": 2, "maxLength": 100 },
+        "phone": { "type": "string", "minLength": 7, "maxLength": 25 },
+        "assignedZones": { "type": "array" },
+        "permissions": { "type": "object" },
+        "status": { "type": "string", "enum": ["unused", "claimed", "revoked"] },
+        "claimedByUid": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["inviteCode", "stationId", "stationName", "ownerUid", "collectorName", "phone", "assignedZones", "permissions", "status", "createdAt"]
+    },
+    "StationConfig": {
+      "title": "StationConfig",
+      "description": "Isolated commercial neighborhood electricity station configuration.",
+      "type": "object",
+      "properties": {
+        "stationName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "kwhPriceYer": { "type": "number" },
+        "minimumFeeYer": { "type": "number" },
+        "mainGeneratorKwh": { "type": "number" },
+        "licenseCode": { "type": "string", "maxLength": 40 },
+        "licenseStatus": { "type": "string", "enum": ["active", "suspended"] },
+        "maxCollectors": { "type": "number" },
+        "maxSubscribers": { "type": "number" },
+        "ownerUid": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["stationName", "kwhPriceYer", "minimumFeeYer", "mainGeneratorKwh", "licenseCode", "licenseStatus", "maxCollectors", "maxSubscribers", "ownerUid", "updatedAt"]
+    },
+    "CollectorProfile": {
+      "title": "CollectorProfile",
+      "description": "Field collector account with assigned zones and manager-controlled permissions.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "minLength": 2, "maxLength": 100 },
+        "email": { "type": "string", "minLength": 5, "maxLength": 150 },
+        "phone": { "type": "string", "minLength": 7, "maxLength": 25 },
+        "assignedZones": { "type": "array" },
+        "permissions": { "type": "object" },
+        "active": { "type": "boolean" },
+        "inviteCode": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "email", "phone", "assignedZones", "permissions", "active", "createdAt"]
+    },
+    "Subscriber": {
+      "title": "Subscriber",
+      "description": "Electricity station subscriber meter record.",
+      "type": "object",
+      "properties": {
+        "meterNumber": { "type": "string", "minLength": 2, "maxLength": 40 },
+        "subscriberName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "phone": { "type": "string", "minLength": 7, "maxLength": 25 },
+        "previousReading": { "type": "number" },
+        "currentReading": { "type": "number" },
+        "previousDebtYer": { "type": "number" },
+        "zoneStreet": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "sequenceOrder": { "type": "number" },
+        "assignedCollectorId": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["meterNumber", "subscriberName", "phone", "previousReading", "currentReading", "previousDebtYer", "zoneStreet", "sequenceOrder", "updatedAt"]
+    },
+    "MeterReading": {
+      "title": "MeterReading",
+      "description": "Monthly field meter reading with compressed photo proof and calculated bill in YER.",
+      "type": "object",
+      "properties": {
+        "subscriberId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "meterNumber": { "type": "string", "minLength": 2, "maxLength": 40 },
+        "subscriberName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "previousReading": { "type": "number" },
+        "currentReading": { "type": "number" },
+        "consumptionKwh": { "type": "number" },
+        "kwhPriceYer": { "type": "number" },
+        "currentBillYer": { "type": "number" },
+        "previousDebtYer": { "type": "number" },
+        "totalDueYer": { "type": "number" },
+        "photoUrl": { "type": "string", "maxLength": 220000 },
+        "photoSizeKb": { "type": "number" },
+        "collectorUid": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "collectorName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "recordedAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["subscriberId", "meterNumber", "subscriberName", "previousReading", "currentReading", "consumptionKwh", "kwhPriceYer", "currentBillYer", "previousDebtYer", "totalDueYer", "photoUrl", "photoSizeKb", "collectorUid", "collectorName", "recordedAt", "createdAt"]
+    },
+    "PaymentReceipt": {
+      "title": "PaymentReceipt",
+      "description": "Immediate cash payment receipt collected in the field.",
+      "type": "object",
+      "properties": {
+        "subscriberId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "meterNumber": { "type": "string", "minLength": 2, "maxLength": 40 },
+        "subscriberName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "readingId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "amountPaidYer": { "type": "number" },
+        "remainingBalanceYer": { "type": "number" },
+        "collectorUid": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "collectorName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "paidAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["subscriberId", "meterNumber", "subscriberName", "readingId", "amountPaidYer", "remainingBalanceYer", "collectorUid", "collectorName", "paidAt", "createdAt"]
+    },
+    "SubscriberPortalRecord": {
+      "title": "SubscriberPortalRecord",
+      "description": "Hashed subscriber lookup record for passwordless subscriber portal.",
+      "type": "object",
+      "properties": {
+        "stationId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "stationName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "meterNumber": { "type": "string", "minLength": 2, "maxLength": 40 },
+        "subscriberName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "zoneStreet": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "previousReading": { "type": "number" },
+        "currentReading": { "type": "number" },
+        "consumptionKwh": { "type": "number" },
+        "currentBillYer": { "type": "number" },
+        "previousDebtYer": { "type": "number" },
+        "totalDueYer": { "type": "number" },
+        "lastReadingPhotoUrl": { "type": "string", "maxLength": 220000 },
+        "lastPaymentYer": { "type": "number" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["stationId", "stationName", "meterNumber", "subscriberName", "zoneStreet", "previousReading", "currentReading", "consumptionKwh", "currentBillYer", "previousDebtYer", "totalDueYer", "lastReadingPhotoUrl", "lastPaymentYer", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/admins/{uid}": {
+      "schema": { "$ref": "#/entities/StationConfig" },
+      "description": "Super Admin role lookup collection."
+    },
+    "/licenses/{licenseCode}": {
+      "schema": { "$ref": "#/entities/LicenseRecord" },
+      "description": "Activation codes and licenses for isolated commercial stations."
+    },
+    "/collectorInvites/{inviteCode}": {
+      "schema": { "$ref": "#/entities/CollectorInvite" },
+      "description": "Manager-issued activation codes for field collectors with granular permissions."
+    },
+    "/userRoles/{uid}": {
+      "schema": { "$ref": "#/entities/UserRoleBinding" },
+      "description": "Direct user-to-station role binding."
+    },
+    "/stations/{stationId}": {
+      "schema": { "$ref": "#/entities/StationConfig" },
+      "description": "Isolated station configuration and license status."
+    },
+    "/stations/{stationId}/collectors/{collectorId}": {
+      "schema": { "$ref": "#/entities/CollectorProfile" },
+      "description": "Collectors and their manager-defined permissions under an isolated station."
+    },
+    "/stations/{stationId}/subscribers/{subscriberId}": {
+      "schema": { "$ref": "#/entities/Subscriber" },
+      "description": "Subscribers belonging strictly to this station."
+    },
+    "/stations/{stationId}/readings/{readingId}": {
+      "schema": { "$ref": "#/entities/MeterReading" },
+      "description": "Field meter readings belonging strictly to this station."
+    },
+    "/stations/{stationId}/receipts/{receiptId}": {
+      "schema": { "$ref": "#/entities/PaymentReceipt" },
+      "description": "Payment receipts belonging strictly to this station."
+    },
+    "/subscriberPortals/{lookupHash}": {
+      "schema": { "$ref": "#/entities/SubscriberPortalRecord" },
+      "description": "Single-document hashed lookup for subscriber portal verification."
+    }
+  }
+}
