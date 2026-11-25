@@ -4,16 +4,19 @@ import {
   Copy,
   Download,
   FileSpreadsheet,
+  FileText,
   KeyRound,
   Lock,
   LogOut,
   PlusCircle,
   RefreshCw,
   ShieldCheck,
+  Trash2,
   Upload,
 } from 'lucide-react';
 import {
   claimAdminPasscode,
+  deleteAccessCodeAdmin,
   downloadExcelTemplate,
   fetchAdminOverview,
   generateAccessCodeAdmin,
@@ -24,6 +27,7 @@ import {
   toggleStationStatusAdmin,
   uploadSubscribersChunkedAdmin,
 } from '../lib/offlineDb';
+import { StationOwnerBrochureModal } from './StationOwnerBrochureModal';
 import type { AccessCodeRecord, StationConfig } from '../types/station';
 
 interface AdminLicensingPanelProps {
@@ -50,6 +54,9 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
   const [loading, setLoading] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
+  const [confirmDeleteCode, setConfirmDeleteCode] = useState<string | null>(null);
+  const [deletingCode, setDeletingCode] = useState<string | null>(null);
+  const [brochureOpen, setBrochureOpen] = useState(false);
 
   // Manual code generation state
   const [personName, setPersonName] = useState('');
@@ -255,6 +262,21 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     }
   };
 
+  const handleDeleteCode = async (rec: AccessCodeRecord) => {
+    if (!adminToken) return;
+    setDeletingCode(rec.code);
+    try {
+      await deleteAccessCodeAdmin(adminToken, rec.code);
+      setConfirmDeleteCode(null);
+      setFeedback(`تم مسح الكود ${rec.code} (${rec.name}) بنجاح.`);
+      await loadAdminData();
+    } catch (err) {
+      setFeedback(err instanceof Error ? err.message : 'تعذر مسح الكود.');
+    } finally {
+      setDeletingCode(null);
+    }
+  };
+
   const handleToggleStation = async (st: StationConfig) => {
     if (!adminToken) return;
     try {
@@ -349,7 +371,15 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
           </p>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={() => setBrochureOpen(true)}
+            className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-bold bg-teal-700 hover:bg-teal-800 text-white rounded-lg cursor-pointer"
+          >
+            <FileText className="w-4 h-4" />
+            دليل أصحاب المحطات (PDF بالصور)
+          </button>
           <button
             type="button"
             onClick={() => void loadAdminData()}
@@ -792,17 +822,50 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                     )}
                   </td>
                   <td className="py-3 px-4">
-                    <button
-                      type="button"
-                      onClick={() => void handleToggleCode(rec)}
-                      className={`px-3 py-1.5 text-xs font-medium rounded-lg border cursor-pointer ${
-                        rec.active
-                          ? 'border-rose-200 bg-rose-50 text-rose-800'
-                          : 'border-teal-200 bg-teal-50 text-teal-800'
-                      }`}
-                    >
-                      {rec.active ? 'إيقاف' : 'تفعيل'}
-                    </button>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void handleToggleCode(rec)}
+                        className={`px-3 py-1.5 text-xs font-medium rounded-lg border cursor-pointer ${
+                          rec.active
+                            ? 'border-amber-200 bg-amber-50 text-amber-900'
+                            : 'border-teal-200 bg-teal-50 text-teal-800'
+                        }`}
+                      >
+                        {rec.active ? 'إيقاف' : 'تفعيل'}
+                      </button>
+
+                      {confirmDeleteCode === rec.code ? (
+                        <>
+                          <button
+                            type="button"
+                            disabled={deletingCode === rec.code}
+                            onClick={() => void handleDeleteCode(rec)}
+                            className="px-3 py-1.5 text-xs font-bold rounded-lg bg-rose-700 hover:bg-rose-800 text-white cursor-pointer"
+                          >
+                            {deletingCode === rec.code
+                              ? 'جاري المسح...'
+                              : 'تأكيد المسح'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteCode(null)}
+                            className="px-2.5 py-1.5 text-xs font-medium rounded-lg border border-slate-300 bg-white text-slate-700 cursor-pointer"
+                          >
+                            إلغاء
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteCode(rec.code)}
+                          className="px-3 py-1.5 text-xs font-medium rounded-lg border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-800 inline-flex items-center gap-1 cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          مسح
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -817,6 +880,11 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
           </table>
         </div>
       </section>
+
+      <StationOwnerBrochureModal
+        open={brochureOpen}
+        onClose={() => setBrochureOpen(false)}
+      />
     </div>
   );
 };

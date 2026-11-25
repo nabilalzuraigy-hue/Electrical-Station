@@ -1,26 +1,41 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   Camera,
+  Check,
   CheckCircle2,
   CloudUpload,
   Copy,
   Download,
+  Edit3,
+  Eye,
   FileSpreadsheet,
+  Flashlight,
+  Lock,
   MessageCircle,
   MessageSquare,
+  RotateCcw,
   ScanLine,
   Search,
   ShieldAlert,
   Upload,
   Wifi,
   WifiOff,
+  X,
 } from 'lucide-react';
 import {
+  computeSubscriber3MonthAvgKwh,
   exportCollectorReadingsExcel,
   parseSubscribersExcelFile,
   sanitizeFirestoreId,
+  sendInstantManagerAlert,
   type StationLocalState,
 } from '../lib/offlineDb';
+import {
+  extractMeterReadingFromImage,
+  measureVideoLuminance,
+  type MeterOcrResult,
+} from '../lib/meterOcr';
 import {
   buildArabicInvoiceMessage,
   compressImageUnder150Kb,
@@ -33,6 +48,8 @@ import {
 import type {
   CollectorPermissions,
   CollectorProfile,
+  LowerReadingReason,
+  ManagerAlert,
   MeterReading,
   PaymentReceipt,
   Subscriber,
@@ -40,6 +57,7 @@ import type {
 
 interface CollectorAppProps {
   state: StationLocalState;
+  staffToken: string;
   onUpdateState: (next: StationLocalState) => void;
   onSyncNow: () => Promise<void>;
   isSyncing: boolean;
@@ -48,8 +66,15 @@ interface CollectorAppProps {
   isManagerPreview?: boolean;
 }
 
+const LOWER_REASON_LABELS: Record<LowerReadingReason, string> = {
+  meter_replaced: 'تم تغيير العداد بعداد جديد',
+  meter_reset: 'تم تصفير العداد',
+  previous_error: 'خطأ في القراءة السابقة',
+};
+
 export const CollectorApp: React.FC<CollectorAppProps> = ({
   state,
+  staffToken,
   onUpdateState,
   onSyncNow,
   isSyncing,
@@ -58,6 +83,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   isManagerPreview = false,
 }) => {
   const cameraInputRef = useRef<HTMLInputElement>(null);
+  const newMeterCameraInputRef = useRef<HTMLInputElement>(null);
   const localExcelInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
 
@@ -70,17 +96,43 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     state.subscribers[0]?.id ?? '',
   );
 
-  // Reading & meter photo workspace state
-  const [readingInput, setReadingInput] = useState('');
-  const [cashPaidInput, setCashPaidInput] = useState('');
+  // Ultra-sensitive OCR & Camera State
+  const [ocrResult, setOcrResult] = useState<MeterOcrResult | null>(null);
+  const [extractingReading, setExtractingReading] = useState(false);
+  const [reviewChoice, setReviewChoice] = useState<
+    'pending' | 'confirmed' | 'manual_edit'
+  >('pending');
+  const [manualEditInput, setManualEditInput] = useState('');
+  const [showEnhancedPreview, setShowEnhancedPreview] = useState(false);
+
+  // Auto-Flash & Low-Light Telemetry
+  const [cameraStreamActive, setCameraStreamActive] = useState(false);
+  const [torchActive, setTorchActive] = useState(false);
+  const [torchSupported, setTorchSupported] = useState(false);
+  const [liveLowLight, setLiveLowLight] = useState(false);
+
+  // Proof photo & Billing
   const [proofPhotoUrl, setProofPhotoUrl] = useState<string>('');
   const [proofSizeKb, setProofSizeKb] = useState<number>(0);
   const [photoStatus, setPhotoStatus] = useState<string | null>(null);
+  const [cashPaidInput, setCashPaidInput] = useState('');
   const [validationError, setValidationError] = useState<string | null>(null);
+  const [saveSuccessNotice, setSaveSuccessNotice] = useState<string | null>(
+    null,
+  );
   const [savedInvoiceText, setSavedInvoiceText] = useState<string | null>(null);
   const [copiedInvoice, setCopiedInvoice] = useState(false);
-  const [cameraStreamActive, setCameraStreamActive] = useState(false);
   const [localExcelNotice, setLocalExcelNotice] = useState<string | null>(null);
+
+  // Lower-than-previous modal state
+  const [lowerModalOpen, setLowerModalOpen] = useState(false);
+  const [lowerReason, setLowerReason] =
+    useState<LowerReadingReason>('meter_replaced');
+  const [newMeterNumberInput, setNewMeterNumberInput] = useState('');
+  const [openingReadingInput, setOpeningReadingInput] = useState('');
+  const [newMeterPhotoUrl, setNewMeterPhotoUrl] = useState('');
+  const [newMeterPhotoKb, setNewMeterPhotoKb] = useState(0);
+  const [lowerModalError, setLowerModalError] = useState<string | null>(null);
 
   useEffect(() => {
     const handleOnline = () => setIsOnline(true);
@@ -92,6 +144,37 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       window.removeEventListener('offline', handleOffline);
     };
   }, []);
+
+  // Monitor live video brightness and auto-enable torch in dim environments
+  useEffect(() => {
+    if (!cameraStreamActive) return;
+    const interval = window.setInterval(() => {
+      const video = videoRef.current;
+      if (!video) return;
+      const luma = measureVideoLuminance(video);
+      const isDim = luma < 80;
+      setLiveLowLight(isDim);
+
+      const stream = video.srcObject as MediaStream | null;
+      const track = stream?.getVideoTracks()?.[0];
+      if (!track) return;
+      const caps = track.getCapabilities?.() as
+        | (MediaTrackCapabilities & { torch?: boolean })
+        | undefined;
+      if (caps?.torch) {
+        setTorchSupported(true);
+        if (isDim && !torchActive) {
+          void track
+            .applyConstraints({
+              advanced: [{ torch: true } as MediaTrackConstraintSet],
+            })
+            .then(() => setTorchActive(true))
+            .catch(() => {});
+        }
+      }
+    }, 700);
+    return () => window.clearInterval(interval);
+  }, [cameraStreamActive, torchActive]);
 
   const permissions: CollectorPermissions = isManagerPreview
     ? {
@@ -107,7 +190,9 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         canViewDebts: false,
       });
 
-  const collectorActive = isManagerPreview ? true : Boolean(activeCollector?.active);
+  const collectorActive = isManagerPreview
+    ? true
+    : Boolean(activeCollector?.active);
   const assignedZones = isManagerPreview
     ? []
     : (activeCollector?.assignedZones ?? []);
@@ -161,7 +246,10 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     const r = state.readings.filter((x) => x.syncStatus === 'pending').length;
     const rc = state.receipts.filter((x) => x.syncStatus === 'pending').length;
     const s = state.subscribers.filter((x) => x.syncStatus === 'pending').length;
-    return r + rc + s;
+    const al = (state.alerts ?? []).filter(
+      (x) => x.syncStatus === 'pending',
+    ).length;
+    return r + rc + s + al;
   }, [state]);
 
   if (!collectorActive) {
@@ -172,39 +260,128 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
           تم إيقاف صلاحية حساب المحصّل مؤقتاً
         </h2>
         <p className="text-sm text-slate-600 max-w-md mx-auto">
-          قام مدير المحطة ({state.station.stationName}) بتعطيل حسابك. تواصل مع مدير المحطة لإعادة التفعيل.
+          قام مدير المحطة ({state.station.stationName}) بتعطيل حسابك. تواصل مع
+          مدير المحطة لإعادة التفعيل.
         </p>
       </div>
     );
   }
 
-  const selectSubscriber = (sub: Subscriber) => {
-    setSelectedSubscriberId(sub.id);
-    setReadingInput(String(sub.currentReading || sub.previousReading));
+  const resetReadingWorkspace = () => {
+    setOcrResult(null);
+    setExtractingReading(false);
+    setReviewChoice('pending');
+    setManualEditInput('');
+    setShowEnhancedPreview(false);
     setCashPaidInput('');
     setProofPhotoUrl('');
     setProofSizeKb(0);
     setPhotoStatus(null);
     setValidationError(null);
+    setSaveSuccessNotice(null);
     setSavedInvoiceText(null);
+    setLowerModalOpen(false);
+    setNewMeterNumberInput('');
+    setOpeningReadingInput('');
+    setNewMeterPhotoUrl('');
+    setNewMeterPhotoKb(0);
+    setLowerModalError(null);
+  };
+
+  const selectSubscriber = (sub: Subscriber) => {
+    setSelectedSubscriberId(sub.id);
+    resetReadingWorkspace();
+  };
+
+  const avg3MonthsKwh = selectedSubscriber
+    ? computeSubscriber3MonthAvgKwh(selectedSubscriber, state.readings)
+    : 0;
+
+  const runAutoMeterExtraction = async (
+    dataUrl: string,
+    sizeKb: number,
+    prevVal: number,
+  ) => {
+    setExtractingReading(true);
+    setOcrResult(null);
+    setReviewChoice('pending');
+    setManualEditInput('');
+    setValidationError(null);
+    setSaveSuccessNotice(null);
+    setPhotoStatus(
+      `تم ضغط الصورة (${sizeKb} KB) · جاري تحسين التباين وإزالة الظل وقراءة العداد 3 مرات...`,
+    );
+
+    const result = await extractMeterReadingFromImage({
+      imageDataUrl: dataUrl,
+      stationId: state.station.stationId,
+      staffToken,
+      previousReading: prevVal,
+      avg3MonthsKwh,
+    });
+
+    setExtractingReading(false);
+    setOcrResult(result);
+
+    if (!result.accepted || result.reading === null) {
+      setPhotoStatus(
+        `تم الفحص عبر ${result.totalPasses} قراءات · الثقة ${result.confidence}% (مطلوب ≥ 85% وتطابق مرتين على الأقل).`,
+      );
+      setValidationError(
+        result.message ||
+          'تعذر اعتماد القراءة من الصورة — يرجى إعادة تصوير شاشة العداد بوضوح.',
+      );
+      return;
+    }
+
+    setManualEditInput(String(result.reading));
+    setPhotoStatus(
+      `تمت قراءة العداد عبر OCR بنجاح (${result.reading}) · تطابق ${result.agreementCount}/${result.totalPasses} · نسبة الثقة ${result.confidence}%.`,
+    );
   };
 
   const startLiveCamera = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment' },
+        video: {
+          facingMode: 'environment',
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
       });
       setCameraStreamActive(true);
+      setTorchActive(false);
+      setLiveLowLight(false);
       setTimeout(() => {
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
           void videoRef.current.play();
         }
-      }, 60);
+        const track = stream.getVideoTracks()?.[0];
+        const caps = track?.getCapabilities?.() as
+          | (MediaTrackCapabilities & { torch?: boolean })
+          | undefined;
+        setTorchSupported(Boolean(caps?.torch));
+      }, 80);
     } catch {
       setPhotoStatus(
-        'تعذر فتح الكاميرا المباشرة في المتصفح — استخدم زر "التقاط / رفع صورة عداد" من الكاميرا.',
+        'تعذر فتح الكاميرا المباشرة في المتصفح — استخدم زر "التقاط / اختيار صورة عداد".',
       );
+    }
+  };
+
+  const toggleManualTorch = async () => {
+    const stream = videoRef.current?.srcObject as MediaStream | null;
+    const track = stream?.getVideoTracks()?.[0];
+    if (!track || !torchSupported) return;
+    const next = !torchActive;
+    try {
+      await track.applyConstraints({
+        advanced: [{ torch: next } as MediaTrackConstraintSet],
+      });
+      setTorchActive(next);
+    } catch {
+      // ignore unsupported constraint failures
     }
   };
 
@@ -212,19 +389,20 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     const stream = videoRef.current?.srcObject as MediaStream | null;
     stream?.getTracks().forEach((t) => t.stop());
     setCameraStreamActive(false);
+    setTorchActive(false);
   };
 
   const captureFromLiveCamera = async () => {
-    if (!videoRef.current) return;
+    if (!videoRef.current || !selectedSubscriber) return;
     const canvas = document.createElement('canvas');
-    canvas.width = videoRef.current.videoWidth || 960;
+    canvas.width = videoRef.current.videoWidth || 1280;
     canvas.height = videoRef.current.videoHeight || 720;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
 
     const blob = await new Promise<Blob | null>((resolve) =>
-      canvas.toBlob(resolve, 'image/jpeg', 0.8),
+      canvas.toBlob(resolve, 'image/jpeg', 0.85),
     );
     if (!blob) return;
 
@@ -232,8 +410,10 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     setProofPhotoUrl(compressed.dataUrl);
     setProofSizeKb(compressed.sizeKb);
     stopLiveCamera();
-    setPhotoStatus(
-      `تم التقاط وضغط صورة العداد (${compressed.sizeKb} KB) وحفظها محلياً في جهازك. أدخل أرقام القراءة الظاهرة في الصورة.`,
+    await runAutoMeterExtraction(
+      compressed.dataUrl,
+      compressed.sizeKb,
+      selectedSubscriber.previousReading,
     );
   };
 
@@ -241,17 +421,36 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     event: React.ChangeEvent<HTMLInputElement>,
   ) => {
     const file = event.target.files?.[0];
-    if (!file) return;
-    setPhotoStatus('جاري ضغط صورة العداد...');
+    if (!file || !selectedSubscriber) return;
+    setPhotoStatus('جاري تحسين جودة صورة العداد وقراءتها عبر OCR...');
     try {
       const compressed = await compressImageUnder150Kb(file);
       setProofPhotoUrl(compressed.dataUrl);
       setProofSizeKb(compressed.sizeKb);
-      setPhotoStatus(
-        `تم حفظ وضغط صورة إثبات العداد محلياً في جهازك بحجم ${compressed.sizeKb} كيلوبايت (ترتفع القراءة النصية فقط عند المزامنة).`,
+      await runAutoMeterExtraction(
+        compressed.dataUrl,
+        compressed.sizeKb,
+        selectedSubscriber.previousReading,
       );
     } catch {
       setPhotoStatus('تعذر معالجة الصورة المختارة.');
+    } finally {
+      event.target.value = '';
+    }
+  };
+
+  const handleNewMeterPhotoUpload = async (
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const compressed = await compressImageUnder150Kb(file);
+      setNewMeterPhotoUrl(compressed.dataUrl);
+      setNewMeterPhotoKb(compressed.sizeKb);
+      setLowerModalError(null);
+    } catch {
+      setLowerModalError('تعذر ضغط صورة العداد الجديد.');
     } finally {
       event.target.value = '';
     }
@@ -311,14 +510,39 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     }
   };
 
-  const parsedCurrent = Number(readingInput);
-  const validNumericReading =
-    readingInput.trim() !== '' && Number.isFinite(parsedCurrent);
   const prevReading = selectedSubscriber?.previousReading ?? 0;
-  const consumptionKwh = validNumericReading
-    ? Math.max(0, parsedCurrent - prevReading)
-    : 0;
-  const rawBillYer = consumptionKwh * state.station.kwhPriceYer;
+  const ocrOriginalReading = ocrResult?.accepted ? ocrResult.reading : null;
+  const parsedManualEdit = Number(manualEditInput);
+
+  const activeFinalReading: number | null =
+    reviewChoice === 'confirmed'
+      ? ocrOriginalReading
+      : reviewChoice === 'manual_edit' &&
+          manualEditInput.trim() !== '' &&
+          Number.isFinite(parsedManualEdit) &&
+          parsedManualEdit >= 0
+        ? Math.round(parsedManualEdit * 100) / 100
+        : null;
+
+  const isManuallyEdited =
+    reviewChoice === 'manual_edit' &&
+    ocrOriginalReading !== null &&
+    activeFinalReading !== null &&
+    activeFinalReading !== ocrOriginalReading;
+
+  const isClosedHouseZero =
+    activeFinalReading !== null && activeFinalReading === prevReading;
+  const isLowerThanPrev =
+    activeFinalReading !== null && activeFinalReading < prevReading;
+
+  const consumptionKwh =
+    activeFinalReading !== null && activeFinalReading >= prevReading
+      ? Math.max(0, Math.round((activeFinalReading - prevReading) * 100) / 100)
+      : 0;
+  const isHighConsumptionWarning =
+    avg3MonthsKwh > 0 && consumptionKwh > avg3MonthsKwh * 3;
+
+  const rawBillYer = Math.round(consumptionKwh * state.station.kwhPriceYer);
   const currentBillYer =
     consumptionKwh > 0
       ? Math.max(rawBillYer, state.station.minimumFeeYer)
@@ -330,28 +554,24 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     : 0;
   const remainingBalanceYer = Math.max(0, totalDueYer - cashPaidYer);
 
-  const handleSaveOffline = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!selectedSubscriber || !permissions.canRecordReadings) return;
-
-    if (!validNumericReading || parsedCurrent < prevReading) {
-      setValidationError(
-        `خطأ في التحقق: القراءة الحالية (${readingInput || 0}) يجب أن تكون أكبر من أو تساوي القراءة السابقة (${prevReading}).`,
-      );
-      return;
-    }
-    if (!proofPhotoUrl) {
-      setValidationError(
-        'يرجى تصوير العداد أو إرفاق صورة إثبات للقراءة قبل الحفظ.',
-      );
-      return;
-    }
-    setValidationError(null);
+  const persistAndDispatchReading = async (options?: {
+    lowerReason?: LowerReadingReason;
+    newMeterNumber?: string;
+    openingReading?: number;
+    overridePhotoUrl?: string;
+    overridePhotoKb?: number;
+  }) => {
+    if (!selectedSubscriber || activeFinalReading === null) return;
 
     const now = new Date().toISOString();
     const readingId = sanitizeFirestoreId(`rd_${Date.now()}`);
     const collectorName = activeCollector?.name ?? 'مدير المحطة';
     const collectorUid = activeCollector?.id ?? state.station.ownerUid;
+
+    const requiresManagerApproval =
+      isManuallyEdited || Boolean(options?.lowerReason);
+    const effectivePhoto = options?.overridePhotoUrl || proofPhotoUrl;
+    const effectiveKb = options?.overridePhotoKb || proofSizeKb;
 
     const newReading: MeterReading = {
       id: readingId,
@@ -359,23 +579,154 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       meterNumber: selectedSubscriber.meterNumber,
       subscriberName: selectedSubscriber.subscriberName,
       previousReading: prevReading,
-      currentReading: parsedCurrent,
+      currentReading: activeFinalReading,
       consumptionKwh,
       kwhPriceYer: state.station.kwhPriceYer,
       currentBillYer,
       previousDebtYer,
       totalDueYer,
-      photoUrl: proofPhotoUrl,
-      photoSizeKb: proofSizeKb,
+      photoUrl: effectivePhoto,
+      photoSizeKb: effectiveKb,
       hasLocalPhoto: true,
+      readingSource: isManuallyEdited ? 'manual_override' : 'camera_ocr',
+      ocrConfidence: ocrResult?.confidence ?? 0,
+      ...(ocrOriginalReading !== null ? { ocrOriginalReading } : {}),
+      wasManuallyEdited: isManuallyEdited,
+      ...(isManuallyEdited ? { editedAt: now } : {}),
+      approvalStatus: requiresManagerApproval ? 'pending_manager' : 'approved',
+      ...(options?.lowerReason ? { lowerReadingReason: options.lowerReason } : {}),
+      ...(options?.newMeterNumber
+        ? { newMeterNumber: options.newMeterNumber }
+        : {}),
+      ...(typeof options?.openingReading === 'number'
+        ? { openingReading: options.openingReading }
+        : {}),
+      isClosedHouseZero,
+      ...(isClosedHouseZero
+        ? { zeroConsumptionNote: 'استهلاك صفر - بيت مغلق' }
+        : {}),
+      highConsumptionWarning: isHighConsumptionWarning,
       collectorUid,
       collectorName,
       recordedAt: now,
       syncStatus: 'pending',
     };
 
+    const alertsToQueue: ManagerAlert[] = [];
+
+    // 1) Immediate alert when collector manually modified OCR reading
+    if (isManuallyEdited && ocrOriginalReading !== null) {
+      alertsToQueue.push({
+        id: sanitizeFirestoreId(`al_edit_${Date.now()}`),
+        stationId: state.station.stationId,
+        alertType: 'manual_edit',
+        severity: 'critical',
+        status: 'pending',
+        readingId,
+        subscriberId: selectedSubscriber.id,
+        subscriberName: selectedSubscriber.subscriberName,
+        meterNumber: selectedSubscriber.meterNumber,
+        collectorName,
+        collectorCode: activeCollector?.code,
+        ocrOriginalReading,
+        editedReading: activeFinalReading,
+        previousReading: prevReading,
+        difference:
+          Math.round((activeFinalReading - ocrOriginalReading) * 100) / 100,
+        ...(options?.lowerReason
+          ? { lowerReadingReason: options.lowerReason }
+          : {}),
+        ...(options?.newMeterNumber
+          ? { newMeterNumber: options.newMeterNumber }
+          : {}),
+        ...(typeof options?.openingReading === 'number'
+          ? { openingReading: options.openingReading }
+          : {}),
+        photoUrl: effectivePhoto,
+        createdAt: now,
+        syncStatus: 'pending',
+      });
+    } else if (options?.lowerReason) {
+      // 2) Immediate alert when reading is lower than previous (reason + photo)
+      alertsToQueue.push({
+        id: sanitizeFirestoreId(`al_low_${Date.now()}`),
+        stationId: state.station.stationId,
+        alertType: 'lower_reading',
+        severity: 'critical',
+        status: 'pending',
+        readingId,
+        subscriberId: selectedSubscriber.id,
+        subscriberName: selectedSubscriber.subscriberName,
+        meterNumber: selectedSubscriber.meterNumber,
+        collectorName,
+        collectorCode: activeCollector?.code,
+        ...(ocrOriginalReading !== null ? { ocrOriginalReading } : {}),
+        editedReading: activeFinalReading,
+        previousReading: prevReading,
+        difference: Math.round((activeFinalReading - prevReading) * 100) / 100,
+        lowerReadingReason: options.lowerReason,
+        ...(options.newMeterNumber
+          ? { newMeterNumber: options.newMeterNumber }
+          : {}),
+        ...(typeof options.openingReading === 'number'
+          ? { openingReading: options.openingReading }
+          : {}),
+        photoUrl: effectivePhoto,
+        createdAt: now,
+        syncStatus: 'pending',
+      });
+    }
+
+    // 3) Yellow alert if consumption > 3x last-3-months average
+    if (isHighConsumptionWarning) {
+      alertsToQueue.push({
+        id: sanitizeFirestoreId(`al_high_${Date.now() + 1}`),
+        stationId: state.station.stationId,
+        alertType: 'high_consumption',
+        severity: 'warning',
+        status: 'pending',
+        readingId,
+        subscriberId: selectedSubscriber.id,
+        subscriberName: selectedSubscriber.subscriberName,
+        meterNumber: selectedSubscriber.meterNumber,
+        collectorName,
+        collectorCode: activeCollector?.code,
+        editedReading: activeFinalReading,
+        previousReading: prevReading,
+        consumptionKwh,
+        avg3MonthsKwh,
+        photoUrl: effectivePhoto,
+        createdAt: now,
+        syncStatus: 'pending',
+      });
+    }
+
+    // Instant dispatch when online so manager gets notified right away
+    let syncedAlerts: ManagerAlert[] = alertsToQueue;
+    if (isOnline && staffToken && alertsToQueue.length > 0) {
+      const updatedAlerts: ManagerAlert[] = [];
+      for (const al of alertsToQueue) {
+        try {
+          await sendInstantManagerAlert({
+            staffToken,
+            stationId: state.station.stationId,
+            alert: al,
+            reading: newReading,
+          });
+          updatedAlerts.push({ ...al, syncStatus: 'synced' });
+        } catch {
+          updatedAlerts.push(al);
+        }
+      }
+      syncedAlerts = updatedAlerts;
+    }
+
     const nextReceipts = [...state.receipts];
-    if (cashPaidYer > 0 && permissions.canCollectCash) {
+    if (
+      !requiresManagerApproval &&
+      cashPaidYer > 0 &&
+      permissions.canCollectCash
+    ) {
       const newReceipt: PaymentReceipt = {
         id: sanitizeFirestoreId(`rc_${Date.now()}`),
         subscriberId: selectedSubscriber.id,
@@ -392,40 +743,143 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       nextReceipts.unshift(newReceipt);
     }
 
-    const updatedSubscribers = state.subscribers.map((s) =>
-      s.id === selectedSubscriber.id
-        ? {
-            ...s,
-            previousReading: parsedCurrent,
-            currentReading: parsedCurrent,
-            previousDebtYer: remainingBalanceYer,
-            syncStatus: 'pending' as const,
-            updatedAt: now,
-          }
-        : s,
-    );
+    // Only advance subscriber's official previousReading / balance immediately if NO manager approval is needed
+    const updatedSubscribers = requiresManagerApproval
+      ? state.subscribers
+      : state.subscribers.map((s) =>
+          s.id === selectedSubscriber.id
+            ? {
+                ...s,
+                previousReading: activeFinalReading,
+                currentReading: activeFinalReading,
+                previousDebtYer: remainingBalanceYer,
+                syncStatus: 'pending' as const,
+                updatedAt: now,
+              }
+            : s,
+        );
 
     onUpdateState({
       ...state,
       subscribers: updatedSubscribers,
       readings: [newReading, ...state.readings],
       receipts: nextReceipts,
+      alerts: [...syncedAlerts, ...(state.alerts ?? [])],
     });
+
+    if (requiresManagerApproval) {
+      setSaveSuccessNotice(
+        isOnline
+          ? 'تم إرسال القراءة والصورة وإشعار فوري إلى مدير المحطة — لن تُعتمد القراءة في حساب المشترك إلا بعد موافقة المدير.'
+          : 'تم حفظ القراءة المعلقة وإشعار المدير محلياً — سيُرفع الإشعار تلقائياً عند توفر الإنترنت ولن تُعتمد إلا بموافقة المدير.',
+      );
+      setSavedInvoiceText(null);
+      return;
+    }
+
+    setSaveSuccessNotice(
+      isClosedHouseZero
+        ? 'تم حفظ القراءة بنجاح بحالة: استهلاك صفر - بيت مغلق.'
+        : isHighConsumptionWarning
+          ? 'تم حفظ القراءة وإرسال تنبيه أصفر للمدير بسبب ارتفاع الاستهلاك عن 3 أضعاف المتوسط.'
+          : 'تم حفظ القراءة المعتمدة أوفلاين بنجاح.',
+    );
 
     if (permissions.canSendInvoices) {
       const invoiceMsg = buildArabicInvoiceMessage({
         subscriberName: selectedSubscriber.subscriberName,
         meterNumber: selectedSubscriber.meterNumber,
         previousReading: prevReading,
-        currentReading: parsedCurrent,
+        currentReading: activeFinalReading,
         consumptionKwh,
         currentBillYer,
         previousDebtYer,
         totalDueYer,
         stationName: state.station.stationName,
       });
-      setSavedInvoiceText(invoiceMsg);
+      setSavedInvoiceText(
+        isClosedHouseZero
+          ? `${invoiceMsg}\nملاحظة الحالة: استهلاك صفر - بيت مغلق.`
+          : invoiceMsg,
+      );
     }
+  };
+
+  const handleSaveFormSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedSubscriber || !permissions.canRecordReadings) return;
+
+    if (!proofPhotoUrl) {
+      setValidationError('يرجى تصوير العداد أو إرفاق صورة العداد أولاً.');
+      return;
+    }
+    if (extractingReading) {
+      setValidationError('يرجى الانتظار حتى يكتمل فحص القراءة من الصورة.');
+      return;
+    }
+    if (!ocrResult?.accepted || ocrOriginalReading === null) {
+      setValidationError(
+        ocrResult?.message ||
+          'لم تُعتمد قراءة صالحة من OCR (يجب ≥ 85% ثقة وتطابق مرتين) — يرجى إعادة تصوير العداد.',
+      );
+      return;
+    }
+    if (reviewChoice === 'pending') {
+      setValidationError(
+        'يرجى الضغط على زر "تأكيد القراءة" أو "تعديل يدوي" للمراجعة قبل الحفظ.',
+      );
+      return;
+    }
+    if (activeFinalReading === null) {
+      setValidationError('يرجى إدخال قيمة رقمية صحيحة في خانة التعديل اليدوي.');
+      return;
+    }
+    setValidationError(null);
+
+    // If new reading < previous reading: pause and ask reason instead of rejecting permanently
+    if (activeFinalReading < prevReading) {
+      setOpeningReadingInput(String(activeFinalReading));
+      setLowerModalError(null);
+      setLowerModalOpen(true);
+      return;
+    }
+
+    await persistAndDispatchReading();
+  };
+
+  const handleConfirmLowerReadingModal = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (lowerReason === 'meter_replaced') {
+      if (!newMeterNumberInput.trim()) {
+        setLowerModalError('يرجى إدخال رقم العداد الجديد.');
+        return;
+      }
+      const openVal = Number(openingReadingInput);
+      if (openingReadingInput.trim() === '' || !Number.isFinite(openVal) || openVal < 0) {
+        setLowerModalError('يرجى إدخال القراءة الافتتاحية للعداد الجديد.');
+        return;
+      }
+      if (!newMeterPhotoUrl) {
+        setLowerModalError('يرجى تصوير العداد الجديد وإرفاق صورته.');
+        return;
+      }
+      setLowerModalError(null);
+      setLowerModalOpen(false);
+      await persistAndDispatchReading({
+        lowerReason,
+        newMeterNumber: newMeterNumberInput.trim(),
+        openingReading: openVal,
+        overridePhotoUrl: newMeterPhotoUrl,
+        overridePhotoKb: newMeterPhotoKb,
+      });
+      return;
+    }
+
+    setLowerModalError(null);
+    setLowerModalOpen(false);
+    await persistAndDispatchReading({
+      lowerReason,
+    });
   };
 
   const copyInvoice = async () => {
@@ -515,7 +969,11 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
           <div className="p-4 border-b border-slate-200 space-y-3">
             <div className="flex items-center justify-between gap-2">
               <h2 className="text-base font-bold text-slate-900">
-                خط السير الميداني ({assignedZones.length > 0 ? assignedZones.join('، ') : 'جميع الحارات'})
+                خط السير الميداني (
+                {assignedZones.length > 0
+                  ? assignedZones.join('، ')
+                  : 'جميع الحارات'}
+                )
               </h2>
               <span className="text-xs text-slate-500 font-mono-nums shrink-0">
                 {routeSubscribers.length} عداد
@@ -633,7 +1091,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
           </div>
         </section>
 
-        {/* Camera Capture + Billing + Receipt */}
+        {/* Camera Capture + Ultra-Sensitive OCR Review + Billing */}
         <section className="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-6 space-y-6">
           {selectedSubscriber ? (
             <>
@@ -651,6 +1109,15 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                     <span className="font-mono-nums font-semibold">
                       {selectedSubscriber.previousReading}
                     </span>
+                    {avg3MonthsKwh > 0 && (
+                      <>
+                        {' '}
+                        · متوسط 3 أشهر{' '}
+                        <span className="font-mono-nums font-semibold">
+                          {avg3MonthsKwh} ك.و.س
+                        </span>
+                      </>
+                    )}
                   </p>
                 </div>
                 {permissions.canViewDebts && (
@@ -662,19 +1129,27 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
 
               {!permissions.canRecordReadings ? (
                 <div className="p-4 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900">
-                  صلاحية تسجيل القراءات وتصوير العداد غير مفعّلة لك حالياً من قِبل مدير المحطة.
+                  صلاحية تسجيل القراءات وتصوير العداد غير مفعّلة لك حالياً من
+                  قِبل مدير المحطة.
                 </div>
               ) : (
                 <>
-                  {/* Camera Viewfinder */}
+                  {/* Camera Viewfinder with Auto-Flash & Zoom ROI */}
                   <div className="space-y-3">
-                    <div className="relative h-56 rounded-xl bg-slate-900 overflow-hidden flex items-center justify-center border border-slate-800">
+                    <div className="relative h-60 rounded-xl bg-slate-900 overflow-hidden flex items-center justify-center border border-slate-800">
                       {cameraStreamActive ? (
                         <video
                           ref={videoRef}
                           playsInline
                           muted
                           className="w-full h-full object-cover"
+                        />
+                      ) : showEnhancedPreview && ocrResult?.zoomedBwPreviewUrl ? (
+                        <img
+                          src={ocrResult.zoomedBwPreviewUrl}
+                          alt="معالجة الصورة المكبّرة بالأبيض والأسود"
+                          referrerPolicy="no-referrer"
+                          className="w-full h-full object-contain bg-white"
                         />
                       ) : proofPhotoUrl ? (
                         <img
@@ -684,21 +1159,35 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                           className="w-full h-full object-cover"
                         />
                       ) : (
-                        <div className="text-center px-4 space-y-1">
+                        <div className="text-center px-4 space-y-1.5">
                           <ScanLine className="w-8 h-8 text-teal-400 mx-auto" />
-                          <p className="text-xs text-slate-300">
-                            صوّر شاشة العداد بوضوح؛ تُضغط الصورة وتُحفظ محلياً في جهازك وتُرفع القراءة النصية بسرعة فائقة
+                          <p className="text-xs text-slate-200 font-medium">
+                            محرك OCR فائق الحساسية: إزالة الظل والغبار + فلاش تلقائي للإضاءة الضعيفة
+                          </p>
+                          <p className="text-[11px] text-slate-400">
+                            ضع أرقام العداد داخل الإطار ليقرأها النظام 3 مرات بدقة ≥ 85%
                           </p>
                         </div>
                       )}
 
-                      <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-                        <div className="w-60 h-20 border-2 border-teal-400 rounded-lg shadow-[0_0_0_9999px_rgba(15,23,42,0.35)] flex items-end justify-center pb-1">
-                          <span className="text-[10px] font-medium text-teal-200 bg-slate-900/75 px-2 rounded">
-                            إطار تصوير أرقام العداد
-                          </span>
+                      {(cameraStreamActive || !proofPhotoUrl) && (
+                        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                          <div className="w-64 h-24 border-2 border-teal-400 rounded-lg shadow-[0_0_0_9999px_rgba(15,23,42,0.38)] flex items-end justify-center pb-1">
+                            <span className="text-[10px] font-medium text-teal-100 bg-slate-900/80 px-2 rounded">
+                              إطار تكبير أرقام العداد
+                            </span>
+                          </div>
                         </div>
-                      </div>
+                      )}
+
+                      {cameraStreamActive && liveLowLight && (
+                        <div className="absolute top-3 right-3 bg-amber-500/95 text-slate-950 text-[11px] font-bold px-2.5 py-1 rounded-md inline-flex items-center gap-1.5">
+                          <Flashlight className="w-3.5 h-3.5" />
+                          {torchActive
+                            ? 'إضاءة ضعيفة — الفلاش مُفعّل تلقائياً'
+                            : 'إضاءة ضعيفة — شغّل الفلاش'}
+                        </div>
+                      )}
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2.5">
@@ -712,14 +1201,30 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                           فتح الكاميرا المباشرة
                         </button>
                       ) : (
-                        <button
-                          type="button"
-                          onClick={captureFromLiveCamera}
-                          className="min-h-[44px] px-4 py-2 bg-teal-700 hover:bg-teal-800 text-white text-xs font-medium rounded-lg inline-flex items-center gap-2 cursor-pointer"
-                        >
-                          <Camera className="w-4 h-4" />
-                          التقاط وضغط الصورة (&lt;150KB)
-                        </button>
+                        <>
+                          <button
+                            type="button"
+                            onClick={captureFromLiveCamera}
+                            className="min-h-[44px] px-4 py-2 bg-teal-700 hover:bg-teal-800 text-white text-xs font-medium rounded-lg inline-flex items-center gap-2 cursor-pointer"
+                          >
+                            <Camera className="w-4 h-4" />
+                            التقاط وتحليل الصورة (OCR)
+                          </button>
+                          {torchSupported && (
+                            <button
+                              type="button"
+                              onClick={() => void toggleManualTorch()}
+                              className={`min-h-[44px] px-3.5 py-2 text-xs font-medium rounded-lg border inline-flex items-center gap-1.5 cursor-pointer ${
+                                torchActive
+                                  ? 'bg-amber-100 border-amber-400 text-amber-900'
+                                  : 'bg-white border-slate-300 text-slate-700'
+                              }`}
+                            >
+                              <Flashlight className="w-4 h-4" />
+                              {torchActive ? 'إطفاء الفلاش' : 'تشغيل الفلاش'}
+                            </button>
+                          )}
+                        </>
                       )}
 
                       <input
@@ -738,33 +1243,192 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                         <Upload className="w-4 h-4" />
                         التقاط / اختيار صورة عداد
                       </button>
+
+                      {ocrResult?.zoomedBwPreviewUrl && (
+                        <button
+                          type="button"
+                          onClick={() => setShowEnhancedPreview((v) => !v)}
+                          className="min-h-[44px] px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <Eye className="w-4 h-4 text-teal-700" />
+                          {showEnhancedPreview
+                            ? 'عرض الصورة الأصلية'
+                            : 'عرض المعالجة المكبّرة'}
+                        </button>
+                      )}
                     </div>
 
                     {photoStatus && (
-                      <p className="text-xs text-teal-800 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2">
+                      <p className="text-xs text-teal-900 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2">
                         {photoStatus}
                       </p>
                     )}
+
+                    {/* Multi-Engine 3-Pass Diagnostic Strip */}
+                    {ocrResult && (
+                      <div className="border border-slate-200 rounded-xl p-3.5 bg-slate-50 space-y-2.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                          <span className="font-bold text-slate-800">
+                            نتائج القراءة المتعددة ({ocrResult.totalPasses}{' '}
+                            قراءات بأكثر من محرك OCR)
+                          </span>
+                          <span
+                            className={`font-mono-nums font-bold ${
+                              ocrResult.accepted
+                                ? 'text-teal-700'
+                                : 'text-rose-700'
+                            }`}
+                          >
+                            الثقة: {ocrResult.confidence}% · التطابق:{' '}
+                            {ocrResult.agreementCount}/{ocrResult.totalPasses}
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                          {ocrResult.passes.map((p, idx) => (
+                            <div
+                              key={`${p.engine}_${idx}`}
+                              className="bg-white border border-slate-200 rounded-lg px-2.5 py-2 text-[11px]"
+                            >
+                              <div className="text-slate-500 truncate">
+                                {p.label}
+                              </div>
+                              <div className="flex items-center justify-between mt-1 font-mono-nums">
+                                <span className="font-bold text-slate-900">
+                                  {p.reading !== null ? p.reading : 'غير مقروء'}
+                                </span>
+                                <span className="text-slate-600">
+                                  {p.confidence}%
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                        {!ocrResult.accepted && (
+                          <div className="flex items-center justify-between gap-3 bg-rose-50 border border-rose-200 rounded-lg p-2.5">
+                            <span className="text-xs text-rose-800 font-medium">
+                              {ocrResult.message}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => cameraInputRef.current?.click()}
+                              className="px-3 py-1.5 text-xs font-bold bg-rose-700 hover:bg-rose-800 text-white rounded-md inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
+                            >
+                              <RotateCcw className="w-3.5 h-3.5" />
+                              إعادة التصوير
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
 
-                  {/* Reading & Receipt Form */}
-                  <form onSubmit={handleSaveOffline} className="space-y-4">
+                  {/* OCR Review, Confirm or Manual Edit + Cash Receipt Form */}
+                  <form onSubmit={handleSaveFormSubmit} className="space-y-4">
+                    {ocrResult?.accepted && ocrOriginalReading !== null && (
+                      <div className="border border-teal-200 bg-teal-50/50 rounded-xl p-4 space-y-3">
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                          <div>
+                            <div className="text-xs font-medium text-slate-600">
+                              الرقم المقروء والمعتمد من OCR (تطابق{' '}
+                              {ocrResult.agreementCount}/
+                              {ocrResult.totalPasses})
+                            </div>
+                            <div className="text-2xl font-bold font-mono-nums text-slate-900 mt-0.5">
+                              {ocrOriginalReading}
+                            </div>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setReviewChoice('confirmed');
+                                setValidationError(null);
+                              }}
+                              className={`min-h-[42px] px-4 py-2 text-xs font-bold rounded-lg inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
+                                reviewChoice === 'confirmed'
+                                  ? 'bg-teal-700 text-white'
+                                  : 'bg-white border border-teal-300 text-teal-900 hover:bg-teal-50'
+                              }`}
+                            >
+                              <Check className="w-4 h-4" />
+                              تأكيد القراءة
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setReviewChoice('manual_edit');
+                                setManualEditInput(String(ocrOriginalReading));
+                                setValidationError(null);
+                              }}
+                              className={`min-h-[42px] px-4 py-2 text-xs font-bold rounded-lg inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
+                                reviewChoice === 'manual_edit'
+                                  ? 'bg-amber-600 text-white'
+                                  : 'bg-white border border-amber-300 text-amber-900 hover:bg-amber-50'
+                              }`}
+                            >
+                              <Edit3 className="w-4 h-4" />
+                              تعديل يدوي
+                            </button>
+                          </div>
+                        </div>
+
+                        {reviewChoice === 'manual_edit' && (
+                          <div className="bg-white border border-amber-300 rounded-lg p-3 space-y-2">
+                            <label className="block text-xs font-bold text-amber-900">
+                              أدخل القراءة المعدلة يدوياً (سيُرسل إشعار فوري
+                              للمدير ولن تُعتمد إلا بموافقته):
+                            </label>
+                            <input
+                              type="number"
+                              step="0.01"
+                              min={0}
+                              value={manualEditInput}
+                              onChange={(e) =>
+                                setManualEditInput(e.target.value)
+                              }
+                              className="w-full min-h-[44px] px-3 py-2 text-base font-bold font-mono-nums border border-amber-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-500"
+                            />
+                            {isManuallyEdited && activeFinalReading !== null && (
+                              <p className="text-[11px] text-rose-700 font-medium">
+                                سجل التدقيق: الأصلي من OCR ({ocrOriginalReading})
+                                ← الجديد ({activeFinalReading}) · الفارق (
+                                {Math.round(
+                                  (activeFinalReading - ocrOriginalReading) *
+                                    100,
+                                ) / 100}
+                                ) · المحصّل:{' '}
+                                {activeCollector?.name ?? 'مدير المحطة'}
+                              </p>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                       <div>
-                        <label className="block text-xs font-medium text-slate-700 mb-1">
-                          القراءة الحالية للعداد (ك.و.س)
+                        <label className="flex items-center gap-1.5 text-xs font-medium text-slate-700 mb-1">
+                          <Lock className="w-3.5 h-3.5 text-teal-700" />
+                          القراءة النهائية للمراجعة
                         </label>
-                        <input
-                          type="number"
-                          step="0.1"
-                          value={readingInput}
-                          onChange={(e) => {
-                            setReadingInput(e.target.value);
-                            setValidationError(null);
-                          }}
-                          placeholder={`أكبر من أو يساوي ${prevReading}`}
-                          className="w-full min-h-[46px] px-3 py-2 text-base font-bold font-mono-nums border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
-                        />
+                        <div className="w-full min-h-[46px] px-3 py-2 text-base font-bold font-mono-nums border border-slate-300 bg-slate-100 text-slate-900 rounded-lg flex items-center justify-between">
+                          <span>
+                            {extractingReading
+                              ? 'جاري المسح 3 مرات...'
+                              : activeFinalReading !== null
+                                ? activeFinalReading
+                                : ocrResult?.accepted
+                                  ? 'اختر تأكيد أو تعديل أعلاه'
+                                  : 'بانتظار صورة واضحة ≥ 85%'}
+                          </span>
+                          <span className="text-[11px] font-sans font-medium text-teal-800">
+                            {isManuallyEdited
+                              ? 'معدّلة (بانتظار المدير)'
+                              : reviewChoice === 'confirmed'
+                                ? 'مؤكدة من OCR'
+                                : 'قراءة OCR'}
+                          </span>
+                        </div>
                       </div>
 
                       {permissions.canCollectCash && (
@@ -784,9 +1448,45 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                       )}
                     </div>
 
+                    {/* Zero Consumption Closed House Badge */}
+                    {isClosedHouseZero && (
+                      <div className="bg-sky-50 border border-sky-200 rounded-lg px-3.5 py-2.5 flex items-center justify-between text-xs text-sky-900">
+                        <span className="font-bold">
+                          حالة القراءة: استهلاك صفر - بيت مغلق
+                        </span>
+                        <span>القراءة الجديدة تساوي السابقة تماماً ({prevReading})</span>
+                      </div>
+                    )}
+
+                    {/* Lower Reading Info Notice */}
+                    {isLowerThanPrev && (
+                      <div className="bg-amber-50 border border-amber-300 rounded-lg px-3.5 py-2.5 text-xs text-amber-950 flex items-center gap-2">
+                        <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
+                        <span>
+                          القراءة ({activeFinalReading}) أقل من السابقة ({prevReading}) — عند الحفظ سيُطلب تحديد السبب وإرسال إشعار لموافقة المدير.
+                        </span>
+                      </div>
+                    )}
+
+                    {/* High Consumption Yellow Alert Preview */}
+                    {isHighConsumptionWarning && (
+                      <div className="bg-amber-50 border border-amber-300 rounded-lg px-3.5 py-2.5 text-xs text-amber-950 flex items-center gap-2">
+                        <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                        <span>
+                          تنبيه أصفر: الاستهلاك ({consumptionKwh} ك.و.س) أعلى من 3 أضعاف متوسط آخر 3 أشهر ({avg3MonthsKwh} ك.و.س) — سيُرسل تنبيه للمدير.
+                        </span>
+                      </div>
+                    )}
+
                     {validationError && (
                       <p className="text-xs font-medium text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
                         {validationError}
+                      </p>
+                    )}
+
+                    {saveSuccessNotice && (
+                      <p className="text-xs font-medium text-teal-900 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2">
+                        {saveSuccessNotice}
                       </p>
                     )}
 
@@ -794,12 +1494,15 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                       <div className="flex justify-between">
                         <span className="text-slate-600">الاستهلاك المحسوب</span>
                         <span className="font-mono-nums font-semibold text-slate-900">
-                          {formatKwh(consumptionKwh)}
+                          {isClosedHouseZero
+                            ? '0 ك.و.س (بيت مغلق)'
+                            : formatKwh(consumptionKwh)}
                         </span>
                       </div>
                       <div className="flex justify-between">
                         <span className="text-slate-600">
-                          مبلغ الاستهلاك ({formatCompactYer(state.station.kwhPriceYer)} / ك.و.س)
+                          مبلغ الاستهلاك (
+                          {formatCompactYer(state.station.kwhPriceYer)} / ك.و.س)
                         </span>
                         <span className="font-mono-nums font-semibold text-slate-900">
                           {formatYer(currentBillYer)}
@@ -808,13 +1511,17 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                       {permissions.canViewDebts && (
                         <>
                           <div className="flex justify-between">
-                            <span className="text-slate-600">المتأخرات السابقة</span>
+                            <span className="text-slate-600">
+                              المتأخرات السابقة
+                            </span>
                             <span className="font-mono-nums text-slate-800">
                               {formatYer(previousDebtYer)}
                             </span>
                           </div>
                           <div className="border-t border-slate-200 pt-2.5 flex justify-between text-base font-bold">
-                            <span className="text-slate-900">الإجمالي المستحق</span>
+                            <span className="text-slate-900">
+                              الإجمالي المستحق
+                            </span>
                             <span className="font-mono-nums text-teal-800">
                               {formatYer(totalDueYer)}
                             </span>
@@ -825,9 +1532,22 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
 
                     <button
                       type="submit"
-                      className="w-full min-h-[48px] py-3 px-4 bg-teal-700 hover:bg-teal-800 text-white text-sm font-bold rounded-lg transition-colors cursor-pointer"
+                      disabled={
+                        extractingReading ||
+                        !proofPhotoUrl ||
+                        !ocrResult?.accepted ||
+                        reviewChoice === 'pending' ||
+                        activeFinalReading === null
+                      }
+                      className="w-full min-h-[48px] py-3 px-4 bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 disabled:text-slate-600 text-white text-sm font-bold rounded-lg transition-colors cursor-pointer"
                     >
-                      حفظ القراءة {permissions.canCollectCash ? 'وسند القبض ' : ''}أوفلاين
+                      {extractingReading
+                        ? 'جاري قراءة العداد 3 مرات وتحسين الصورة...'
+                        : isLowerThanPrev
+                          ? 'متابعة وتحديد سبب نقص القراءة'
+                          : isManuallyEdited
+                            ? 'حفظ وإرسال إشعار التعديل لموافقة المدير'
+                            : `حفظ القراءة المؤكدة ${permissions.canCollectCash ? 'وسند القبض ' : ''}أوفلاين`}
                     </button>
                   </form>
 
@@ -836,7 +1556,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                       <div className="text-xs font-bold text-teal-900">
                         تم الحفظ — نص الفاتورة الجاهز للإرسال:
                       </div>
-                      <p className="text-xs text-slate-800 leading-relaxed bg-white border border-teal-100 rounded-lg p-3">
+                      <p className="text-xs text-slate-800 leading-relaxed bg-white border border-teal-100 rounded-lg p-3 whitespace-pre-line">
                         {savedInvoiceText}
                       </p>
                       <div className="flex flex-wrap items-center gap-2.5">
@@ -883,6 +1603,157 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
           )}
         </section>
       </div>
+
+      {/* Lower-Than-Previous Reading Modal */}
+      {lowerModalOpen && selectedSubscriber && (
+        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl border border-slate-200 max-w-lg w-full p-6 space-y-5 shadow-2xl">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-lg font-bold text-slate-900">
+                  القراءة أقل من السابقة، اختر السبب:
+                </h3>
+                <p className="text-xs text-slate-600 mt-1">
+                  السابقة:{' '}
+                  <span className="font-mono-nums font-bold">
+                    {prevReading}
+                  </span>{' '}
+                  ← الجديدة:{' '}
+                  <span className="font-mono-nums font-bold">
+                    {activeFinalReading}
+                  </span>{' '}
+                  · لن تُعتمد إلا بعد موافقة مدير المحطة
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setLowerModalOpen(false)}
+                className="p-1.5 text-slate-500 hover:text-slate-800 rounded-lg cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form
+              onSubmit={handleConfirmLowerReadingModal}
+              className="space-y-4"
+            >
+              <div className="space-y-2">
+                {(
+                  [
+                    'meter_replaced',
+                    'meter_reset',
+                    'previous_error',
+                  ] as LowerReadingReason[]
+                ).map((key) => (
+                  <label
+                    key={key}
+                    className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition-colors ${
+                      lowerReason === key
+                        ? 'border-teal-600 bg-teal-50/70'
+                        : 'border-slate-200 hover:bg-slate-50'
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="lowerReason"
+                      checked={lowerReason === key}
+                      onChange={() => setLowerReason(key)}
+                      className="accent-teal-700"
+                    />
+                    <span className="text-sm font-medium text-slate-900">
+                      {LOWER_REASON_LABELS[key]}
+                    </span>
+                  </label>
+                ))}
+              </div>
+
+              {lowerReason === 'meter_replaced' && (
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-medium text-slate-700 mb-1">
+                        رقم العداد الجديد
+                      </label>
+                      <input
+                        type="text"
+                        value={newMeterNumberInput}
+                        onChange={(e) => setNewMeterNumberInput(e.target.value)}
+                        placeholder="أدخل رقم العداد الجديد"
+                        className="w-full px-3 py-2 text-sm font-mono-nums border border-slate-300 rounded-lg bg-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-700 mb-1">
+                        القراءة الافتتاحية للعداد الجديد
+                      </label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        min={0}
+                        value={openingReadingInput}
+                        onChange={(e) => setOpeningReadingInput(e.target.value)}
+                        className="w-full px-3 py-2 text-sm font-mono-nums border border-slate-300 rounded-lg bg-white"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <input
+                      ref={newMeterCameraInputRef}
+                      type="file"
+                      accept="image/*"
+                      capture="environment"
+                      onChange={handleNewMeterPhotoUpload}
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => newMeterCameraInputRef.current?.click()}
+                      className="w-full min-h-[42px] px-3 py-2 text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white rounded-lg inline-flex items-center justify-center gap-2 cursor-pointer"
+                    >
+                      <Camera className="w-4 h-4" />
+                      {newMeterPhotoUrl
+                        ? `تم تصوير العداد الجديد (${newMeterPhotoKb} KB) — تغيير`
+                        : 'تصوير العداد الجديد (إلزامي)'}
+                    </button>
+                    {newMeterPhotoUrl && (
+                      <img
+                        src={newMeterPhotoUrl}
+                        alt="صورة العداد الجديد"
+                        referrerPolicy="no-referrer"
+                        className="mt-2 h-28 w-full object-cover rounded-lg border border-slate-300"
+                      />
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {lowerModalError && (
+                <p className="text-xs font-medium text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
+                  {lowerModalError}
+                </p>
+              )}
+
+              <div className="flex items-center justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setLowerModalOpen(false)}
+                  className="px-4 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 cursor-pointer"
+                >
+                  إلغاء
+                </button>
+                <button
+                  type="submit"
+                  className="px-5 py-2 text-xs font-bold text-white bg-teal-700 hover:bg-teal-800 rounded-lg cursor-pointer"
+                >
+                  إرسال للمدير وانتظار الموافقة
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

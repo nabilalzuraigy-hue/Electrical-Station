@@ -72,13 +72,31 @@ class _MeterOcrReadingScreenState extends State<MeterOcrReadingScreen> {
       // 1. Offline Google ML Kit OCR digit extraction
       final inputImage = InputImage.fromFilePath(photo.path);
       final recognized = await _textRecognizer.processImage(inputImage);
-      final digitMatch = RegExp(r'\d{3,7}(\.\d{1,2})?')
+      final digitMatches = RegExp(r'\d{2,7}(\.\d{1,2})?')
           .allMatches(recognized.text.replaceAll(' ', ''))
-          .map((m) => m.group(0)!)
+          .map((m) => double.tryParse(m.group(0)!))
+          .whereType<double>()
           .toList();
 
-      if (digitMatch.isNotEmpty) {
-        _readingController.text = digitMatch.first;
+      final plausible = digitMatches
+          .where((v) =>
+              v >= widget.subscriber.previousReading &&
+              (widget.subscriber.previousReading == 0 ||
+                  v <= widget.subscriber.previousReading + 50000))
+          .toList();
+
+      if (plausible.isNotEmpty) {
+        _readingController.text = plausible.first.toString();
+        _validationError = null;
+      } else if (digitMatches.isNotEmpty) {
+        digitMatches.sort((a, b) => b.compareTo(a));
+        _readingController.text = digitMatches.first.toString();
+        _validationError =
+            'القراءة المستخرجة أقل من القراءة السابقة؛ يرجى إعادة تصوير العداد بوضوح.';
+      } else {
+        _readingController.clear();
+        _validationError =
+            'لم تتضح أرقام العداد في الصورة — يرجى تقريب الكاميرا وإعادة التصوير؛ لا يُسمح بالإدخال اليدوي.';
       }
 
       // 2. Compress proof image to < 150KB
@@ -112,6 +130,13 @@ class _MeterOcrReadingScreenState extends State<MeterOcrReadingScreen> {
   double get _totalDue => _currentBill + widget.subscriber.previousDebtYer;
 
   Future<void> _saveReadingAndReceipt() async {
+    if (_compressedPhotoPath == null || _readingController.text.isEmpty) {
+      setState(() {
+        _validationError =
+            'يجب تصوير شاشة العداد لاستخراج القراءة تلقائياً؛ الإدخال اليدوي غير مسموح لمنع التلاعب.';
+      });
+      return;
+    }
     if (_currentVal < widget.subscriber.previousReading) {
       setState(() {
         _validationError =
@@ -293,10 +318,13 @@ class _MeterOcrReadingScreenState extends State<MeterOcrReadingScreen> {
           const SizedBox(height: 16),
           TextField(
             controller: _readingController,
-            keyboardType: const TextInputType.numberWithOptions(decimal: true),
-            onChanged: (_) => setState(() {}),
+            readOnly: true,
+            enableInteractiveSelection: false,
             decoration: InputDecoration(
-              labelText: 'القراءة الحالية (ك.و.س)',
+              labelText: 'القراءة المستخرجة تلقائياً من الصورة (مقفلة ضد التعديل)',
+              prefixIcon: const Icon(Icons.lock_outline_rounded),
+              filled: true,
+              fillColor: const Color(0xFFF1F5F9),
               errorText: _validationError,
               border: const OutlineInputBorder(),
             ),

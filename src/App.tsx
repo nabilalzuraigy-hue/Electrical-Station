@@ -102,10 +102,7 @@ function StationWorkspace() {
     ? [
         ...(adminToken ? [{ id: 'admin' as const, label: 'لوحة الإدارة' }] : []),
         ...(accessRecord?.role === 'manager' && stationState
-          ? [
-              { id: 'manager' as const, label: 'لوحة المدير' },
-              { id: 'collector' as const, label: 'تطبيق المحصّل' },
-            ]
+          ? [{ id: 'manager' as const, label: 'لوحة المدير' }]
           : []),
         ...(accessRecord?.role === 'collector' && stationState
           ? [{ id: 'collector' as const, label: 'تطبيق المحصّل' }]
@@ -113,7 +110,7 @@ function StationWorkspace() {
         ...(subscriberResult
           ? [{ id: 'subscriber' as const, label: 'تفاصيل الفاتورة' }]
           : []),
-        ...(adminToken || accessRecord?.role === 'manager'
+        ...(adminToken
           ? [{ id: 'flutter' as const, label: 'الكود والتحميل' }]
           : []),
       ]
@@ -124,15 +121,15 @@ function StationWorkspace() {
       ? stationState.collectors.find((c) => c.id === accessRecord.code)
       : undefined;
 
+  if (!isLoggedIn) {
+    return <ActivationGate onAuthenticated={handleUnifiedAuth} />;
+  }
+
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
       {/* Top Bar */}
       <header className="sticky top-0 z-30 bg-white border-b border-slate-200">
-        <div
-          className={`max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center ${
-            isLoggedIn ? 'justify-between gap-6' : 'justify-center'
-          }`}
-        >
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-6">
           <a
             href="#top"
             onClick={(e) => {
@@ -224,8 +221,7 @@ function StationWorkspace() {
             onAdminAuthenticated={(tok) => setAdminToken(tok)}
             onLogoutAdmin={handleLogout}
           />
-        ) : activeTab === 'flutter' &&
-          (adminToken || accessRecord?.role === 'manager') ? (
+        ) : activeTab === 'flutter' && adminToken ? (
           <FlutterCodeExplorer />
         ) : activeTab === 'manager' &&
           accessRecord?.role === 'manager' &&
@@ -240,17 +236,17 @@ function StationWorkspace() {
             syncProgress={syncProgress}
           />
         ) : activeTab === 'collector' &&
-          accessRecord &&
+          accessRecord?.role === 'collector' &&
           stationState &&
           staffToken ? (
           <CollectorApp
             state={stationState}
+            staffToken={staffToken}
             onUpdateState={handleUpdateState}
             onSyncNow={handleSyncNow}
             isSyncing={isSyncing}
             syncProgress={syncProgress}
             activeCollector={activeCollector}
-            isManagerPreview={accessRecord.role === 'manager'}
           />
         ) : (
           <ActivationGate onAuthenticated={handleUnifiedAuth} />

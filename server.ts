@@ -2,6 +2,7 @@ import 'dotenv/config';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { GoogleGenAI, Type } from '@google/genai';
 import express, { type NextFunction, type Request, type Response } from 'express';
 
 interface CollectorPermissions {
@@ -66,9 +67,49 @@ interface MeterReadingRecord {
   photoUrl: string;
   photoSizeKb: number;
   hasLocalPhoto?: boolean;
+  readingSource?: 'camera_ocr' | 'manual_override';
+  ocrConfidence?: number;
+  ocrOriginalReading?: number;
+  wasManuallyEdited?: boolean;
+  editedAt?: string;
+  approvalStatus?: 'approved' | 'pending_manager' | 'rejected';
+  lowerReadingReason?: 'meter_replaced' | 'meter_reset' | 'previous_error';
+  newMeterNumber?: string;
+  openingReading?: number;
+  isClosedHouseZero?: boolean;
+  zeroConsumptionNote?: string;
+  highConsumptionWarning?: boolean;
   collectorCode: string;
   collectorName: string;
   recordedAt: string;
+}
+
+interface ManagerAlertRecord {
+  id: string;
+  stationId: string;
+  alertType: 'manual_edit' | 'high_consumption' | 'lower_reading';
+  severity: 'critical' | 'warning';
+  status: 'pending' | 'approved' | 'rejected';
+  readingId: string;
+  subscriberId: string;
+  subscriberName: string;
+  meterNumber: string;
+  collectorName: string;
+  collectorCode?: string;
+  ocrOriginalReading?: number;
+  editedReading: number;
+  previousReading: number;
+  difference?: number;
+  consumptionKwh?: number;
+  avg3MonthsKwh?: number;
+  lowerReadingReason?: 'meter_replaced' | 'meter_reset' | 'previous_error';
+  newMeterNumber?: string;
+  openingReading?: number;
+  photoUrl: string;
+  createdAt: string;
+  resolvedAt?: string;
+  resolvedBy?: string;
+  managerNote?: string;
 }
 
 interface PaymentReceiptRecord {
@@ -88,6 +129,7 @@ interface StationDataBucket {
   subscribers: Record<string, SubscriberRecord>;
   readings: Record<string, MeterReadingRecord>;
   receipts: Record<string, PaymentReceiptRecord>;
+  alerts: Record<string, ManagerAlertRecord>;
 }
 
 interface PersistentStore {
@@ -110,6 +152,17 @@ const DATA_DIR = path.resolve(process.cwd(), 'data');
 const STORE_FILE = path.join(DATA_DIR, 'station_store.json');
 const SESSION_SECRET =
   process.env.SESSION_SECRET?.trim() || crypto.randomBytes(32).toString('hex');
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim();
+const geminiAi = GEMINI_API_KEY
+  ? new GoogleGenAI({
+      apiKey: GEMINI_API_KEY,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    })
+  : null;
 
 function ensureDataDir(): void {
   if (!fs.existsSync(DATA_DIR)) {
@@ -161,7 +214,10 @@ function getBucket(stationId: string): StationDataBucket {
       subscribers: {},
       readings: {},
       receipts: {},
+      alerts: {},
     };
+  } else if (!store.stationData[stationId].alerts) {
+    store.stationData[stationId].alerts = {};
   }
   return store.stationData[stationId];
 }
@@ -323,6 +379,9 @@ function buildStationStatePayload(
   const allReceipts = Object.values(bucket.receipts).sort((a, b) =>
     b.paidAt.localeCompare(a.paidAt),
   );
+  const allAlerts = Object.values(bucket.alerts ?? {}).sort((a, b) =>
+    b.createdAt.localeCompare(a.createdAt),
+  );
 
   const stationCodes = Object.values(store.codes).filter(
     (c) => c.stationId === stationId,
@@ -342,6 +401,7 @@ function buildStationStatePayload(
       subscribers: filteredSubscribers,
       readings: allReadings.filter((r) => subIds.has(r.subscriberId)),
       receipts: allReceipts.filter((rc) => subIds.has(rc.subscriberId)),
+      alerts: [],
     };
   }
 
@@ -352,6 +412,7 @@ function buildStationStatePayload(
     subscribers: allSubscribers,
     readings: allReadings,
     receipts: allReceipts,
+    alerts: allAlerts,
   };
 }
 
@@ -618,6 +679,17 @@ async function startServer() {
     res.json({ codeRecord: rec });
   });
 
+  app.delete('/api/admin/codes/:code', requireAdmin, (req, res) => {
+    const codeKey = normalizeCode(req.params.code);
+    if (!store.codes[codeKey]) {
+      res.status(404).json({ error: 'الكود غير موجود.' });
+      return;
+    }
+    delete store.codes[codeKey];
+    saveStore(store);
+    res.json({ deleted: true, code: codeKey });
+  });
+
   app.post(
     '/api/admin/stations/:stationId/subscribers/upload-chunk',
     requireAdmin,
@@ -674,19 +746,30 @@ async function startServer() {
   // ============================================================
 
   app.post('/api/auth/unified', (req, res) => {
-    const rawCredential = String(req.body?.credential ?? '').trim();
-    if (!rawCredential) {
+    const rawUsername = String(req.body?.username ?? '').trim();
+    const rawPassword = String(req.body?.password ?? '').trim();
+    const rawCredential = String(
+      req.body?.credential ?? (rawPassword || rawUsername),
+    ).trim();
+
+    if (!rawCredential && !rawUsername && !rawPassword) {
       res.status(400).json({ error: 'يرجى إدخال بيانات الدخول.' });
       return;
     }
 
+    const candidates = Array.from(
+      new Set([rawPassword, rawCredential, rawUsername].filter(Boolean)),
+    );
+
     // 1. Check Admin Passcode
     const envPasscode = process.env.ADMIN_PASSCODE?.trim();
-    const isAdminPass = envPasscode
-      ? verifyEnvPasscode(rawCredential, envPasscode)
-      : store.adminPasscodeHash
-        ? verifyScryptHash(rawCredential, store.adminPasscodeHash)
-        : false;
+    const isAdminPass = candidates.some((cand) =>
+      envPasscode
+        ? verifyEnvPasscode(cand, envPasscode)
+        : store.adminPasscodeHash
+          ? verifyScryptHash(cand, store.adminPasscodeHash)
+          : false,
+    );
 
     if (isAdminPass) {
       const token = signSessionToken({
@@ -699,96 +782,117 @@ async function startServer() {
     }
 
     // 2. Check Manager / Collector Code
-    const normalizedCode = normalizeCode(rawCredential);
-    if (normalizedCode.length >= 4 && store.codes[normalizedCode]) {
-      const rec = store.codes[normalizedCode];
-      if (!rec.active) {
-        res.status(403).json({ error: 'هذا الكود موقوف حالياً من الإدارة.' });
-        return;
-      }
-      const station = store.stations[rec.stationId];
-      if (!station) {
-        res.status(404).json({ error: 'بيانات المحطة المرتبطة غير موجودة.' });
-        return;
-      }
-      if (station.licenseStatus !== 'active') {
-        res.status(403).json({
-          error: 'تم إيقاف ترخيص هذه المحطة من قِبل الإدارة.',
+    for (const cand of candidates) {
+      const normalizedCode = normalizeCode(cand);
+      if (normalizedCode.length >= 4 && store.codes[normalizedCode]) {
+        const rec = store.codes[normalizedCode];
+        if (!rec.active) {
+          res.status(403).json({ error: 'هذا الكود موقوف حالياً من الإدارة.' });
+          return;
+        }
+        const station = store.stations[rec.stationId];
+        if (!station) {
+          res.status(404).json({ error: 'بيانات المحطة المرتبطة غير موجودة.' });
+          return;
+        }
+        if (station.licenseStatus !== 'active') {
+          res.status(403).json({
+            error: 'تم إيقاف ترخيص هذه المحطة من قِبل الإدارة.',
+          });
+          return;
+        }
+
+        const token = signSessionToken({
+          role: rec.role,
+          name: rec.name,
+          code: rec.code,
+          stationId: rec.stationId,
+          exp: Date.now() + 7 * 24 * 60 * 60 * 1000,
+        });
+
+        res.json({
+          kind: 'staff',
+          token,
+          access: rec,
+          state: buildStationStatePayload(rec.stationId, rec.role, rec.code),
         });
         return;
       }
-
-      const token = signSessionToken({
-        role: rec.role,
-        name: rec.name,
-        code: rec.code,
-        stationId: rec.stationId,
-        exp: Date.now() + 7 * 24 * 60 * 60 * 1000,
-      });
-
-      res.json({
-        kind: 'staff',
-        token,
-        access: rec,
-        state: buildStationStatePayload(rec.stationId, rec.role, rec.code),
-      });
-      return;
     }
 
-    // 3. Check Subscriber Name + Phone (e.g. "الاسم 77xxxxxxx" or "الاسم - 77xxxxxxx")
-    const normalizedDigitsCredential = rawCredential.replace(/[٠-٩]/g, (d) =>
-      String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)),
-    );
-    const phoneMatch = normalizedDigitsCredential.match(
-      /(?:\+?967|00967)?\s*\d[\d\s-]{6,14}\d/,
-    );
-    if (phoneMatch) {
-      const targetPhone = normalizePhone(phoneMatch[0]);
-      const namePart = normalizedDigitsCredential
-        .replace(phoneMatch[0], ' ')
-        .replace(/[-/|،,]+/g, ' ')
-        .trim();
-      const targetName = normalizeArabicName(namePart);
+    // 3. Check Subscriber Name + Phone (either separate username+password or combined credential)
+    let subTargetName = '';
+    let subTargetPhone = '';
+    let subRawNamePart = '';
 
-      if (targetPhone.length >= 7 && targetName.length >= 2) {
-        for (const station of Object.values(store.stations)) {
-          const bucket = getBucket(station.stationId);
-          const matchedSub = Object.values(bucket.subscribers).find((sub) => {
-            if (normalizePhone(sub.phone) !== targetPhone) return false;
-            return (
-              normalizeArabicName(sub.subscriberName) === targetName ||
-              sub.meterNumber.trim().toLowerCase() === namePart.toLowerCase()
-            );
+    if (rawUsername && rawPassword) {
+      const normalizedPass = rawPassword.replace(/[٠-٩]/g, (d) =>
+        String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)),
+      );
+      const pDigits = normalizePhone(normalizedPass);
+      if (pDigits.length >= 7) {
+        subTargetPhone = pDigits;
+        subRawNamePart = rawUsername;
+        subTargetName = normalizeArabicName(rawUsername);
+      }
+    }
+
+    if (!subTargetPhone) {
+      const normalizedDigitsCredential = rawCredential.replace(/[٠-٩]/g, (d) =>
+        String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)),
+      );
+      const phoneMatch = normalizedDigitsCredential.match(
+        /(?:\+?967|00967)?\s*\d[\d\s-]{6,14}\d/,
+      );
+      if (phoneMatch) {
+        subTargetPhone = normalizePhone(phoneMatch[0]);
+        subRawNamePart = normalizedDigitsCredential
+          .replace(phoneMatch[0], ' ')
+          .replace(/[-/|،,]+/g, ' ')
+          .trim();
+        subTargetName = normalizeArabicName(subRawNamePart);
+      }
+    }
+
+    if (subTargetPhone.length >= 7 && subTargetName.length >= 2) {
+      for (const station of Object.values(store.stations)) {
+        const bucket = getBucket(station.stationId);
+        const matchedSub = Object.values(bucket.subscribers).find((sub) => {
+          if (normalizePhone(sub.phone) !== subTargetPhone) return false;
+          return (
+            normalizeArabicName(sub.subscriberName) === subTargetName ||
+            sub.meterNumber.trim().toLowerCase() ===
+              subRawNamePart.toLowerCase()
+          );
+        });
+
+        if (matchedSub) {
+          const readings = Object.values(bucket.readings)
+            .filter(
+              (r) =>
+                r.subscriberId === matchedSub.id ||
+                r.meterNumber === matchedSub.meterNumber,
+            )
+            .sort((a, b) => b.recordedAt.localeCompare(a.recordedAt));
+
+          const receipts = Object.values(bucket.receipts)
+            .filter(
+              (rc) =>
+                rc.subscriberId === matchedSub.id ||
+                rc.meterNumber === matchedSub.meterNumber,
+            )
+            .sort((a, b) => b.paidAt.localeCompare(a.paidAt));
+
+          res.json({
+            kind: 'subscriber',
+            result: {
+              stationName: station.stationName,
+              subscriber: matchedSub,
+              readings,
+              receipts,
+            },
           });
-
-          if (matchedSub) {
-            const readings = Object.values(bucket.readings)
-              .filter(
-                (r) =>
-                  r.subscriberId === matchedSub.id ||
-                  r.meterNumber === matchedSub.meterNumber,
-              )
-              .sort((a, b) => b.recordedAt.localeCompare(a.recordedAt));
-
-            const receipts = Object.values(bucket.receipts)
-              .filter(
-                (rc) =>
-                  rc.subscriberId === matchedSub.id ||
-                  rc.meterNumber === matchedSub.meterNumber,
-              )
-              .sort((a, b) => b.paidAt.localeCompare(a.paidAt));
-
-            res.json({
-              kind: 'subscriber',
-              result: {
-                stationName: station.stationName,
-                subscriber: matchedSub,
-                readings,
-                receipts,
-              },
-            });
-            return;
-          }
+          return;
         }
       }
     }
@@ -927,6 +1031,368 @@ async function startServer() {
     },
   );
 
+  app.post(
+    '/api/stations/:stationId/ocr-meter',
+    requireStaff,
+    async (req, res) => {
+      const session = (req as Request & { session: SessionPayload }).session;
+      const codeRec = session.code ? store.codes[session.code] : undefined;
+      if (
+        session.role === 'collector' &&
+        codeRec &&
+        !codeRec.permissions.canRecordReadings
+      ) {
+        res.status(403).json({ error: 'ليست لديك صلاحية قراءة العدادات.' });
+        return;
+      }
+
+      if (!geminiAi) {
+        res.status(503).json({
+          error: 'محرك القراءة السحابي غير مفعّل؛ استخدم القراءة المحلية من الجهاز.',
+        });
+        return;
+      }
+
+      const rawImage = String(req.body?.imageBase64 ?? '').trim();
+      const rawZoomedBw = String(req.body?.zoomedBwBase64 ?? '').trim();
+      const previousReading = Number(req.body?.previousReading) || 0;
+      if (!rawImage || rawImage.length > 450000 || rawZoomedBw.length > 450000) {
+        res.status(400).json({ error: 'صورة العداد غير صالحة أو حجمها كبير.' });
+        return;
+      }
+
+      const parseDataUrl = (input: string) => {
+        const m = input.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+        return {
+          mimeType: m?.[1] || String(req.body?.mimeType || 'image/jpeg'),
+          data: m?.[2] || input,
+        };
+      };
+
+      const runVisionPass = async (
+        imageInput: string,
+        engineLabel: string,
+        focusHint: string,
+      ) => {
+        const { mimeType, data } = parseDataUrl(imageInput);
+        const response = await geminiAi.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  mimeType,
+                  data,
+                },
+              },
+              {
+                text: `You are reading an electric kilowatt-hour (kWh) meter display under difficult field conditions (shadows, dust, glare, low contrast).
+${focusHint}
+Previous recorded reading for context: ${previousReading}.
+Extract the exact cumulative kWh meter reading shown on the main digital LCD or mechanical digit drums.
+Preserve the decimal fraction only if a clear decimal separator or distinct red tenths drum is part of the kWh register; do not guess or invent digits. Ignore meter serial numbers, barcodes, voltage/ampere ratings (e.g. 220V, 50Hz, 10(40)A), or timestamps.
+Be conservative with confidence: only report confidence >= 85 when every single digit is crisp and unambiguous.
+If no clear electric meter kWh reading is visible in the image, set isClearMeter to false, detectedReading to -1, and confidence to 0.`,
+              },
+            ],
+          },
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                isClearMeter: {
+                  type: Type.BOOLEAN,
+                  description:
+                    'True only if an electric meter kWh register is clearly visible and readable.',
+                },
+                detectedReading: {
+                  type: Type.NUMBER,
+                  description:
+                    'The exact kWh numeric reading shown on the meter display, or -1 if unreadable.',
+                },
+                rawDigits: {
+                  type: Type.STRING,
+                  description:
+                    'The exact characters/digits read from the main kWh display.',
+                },
+                confidence: {
+                  type: Type.NUMBER,
+                  description: 'Confidence score between 0 and 100.',
+                },
+              },
+              required: [
+                'isClearMeter',
+                'detectedReading',
+                'rawDigits',
+                'confidence',
+              ],
+            },
+          },
+        });
+
+        const rawJson = (response.text ?? '{}').trim();
+        const parsed = JSON.parse(rawJson) as {
+          isClearMeter?: boolean;
+          detectedReading?: number;
+          rawDigits?: string;
+          confidence?: number;
+        };
+        const reading =
+          typeof parsed.detectedReading === 'number' &&
+          Number.isFinite(parsed.detectedReading) &&
+          parsed.detectedReading >= 0
+            ? Math.round(parsed.detectedReading * 100) / 100
+            : null;
+        return {
+          engine: engineLabel,
+          isClearMeter: Boolean(parsed.isClearMeter) && reading !== null,
+          reading,
+          rawDigits: String(parsed.rawDigits ?? ''),
+          confidence: Math.max(0, Math.min(100, Math.round(Number(parsed.confidence) || 0))),
+        };
+      };
+
+      try {
+        const tasks = [
+          runVisionPass(
+            rawImage,
+            'gemini-enhanced-full',
+            'Image 1 is contrast-enhanced with shadow removal.',
+          ),
+        ];
+        if (rawZoomedBw) {
+          tasks.push(
+            runVisionPass(
+              rawZoomedBw,
+              'gemini-zoomed-bw',
+              'Image 2 is a zoomed, despeckled black-and-white crop focused tightly on the digit window.',
+            ),
+          );
+        }
+        const passes = await Promise.all(tasks);
+        const primary = passes[0];
+        res.json({
+          passes,
+          isClearMeter: passes.some((p) => p.isClearMeter),
+          reading: primary.reading,
+          rawDigits: primary.rawDigits,
+          confidence: primary.confidence,
+        });
+      } catch (err) {
+        res.status(502).json({
+          error:
+            err instanceof Error
+              ? err.message
+              : 'تعذر تحليل صورة العداد عبر الخادم.',
+        });
+      }
+    },
+  );
+
+  // Instant Manager Alert Endpoint (Manual OCR Edit / High Consumption >3x / Lower Reading)
+  app.post('/api/stations/:stationId/alerts', requireStaff, (req, res) => {
+    const session = (req as Request & { session: SessionPayload }).session;
+    const station = store.stations[req.params.stationId];
+    if (!station) {
+      res.status(404).json({ error: 'المحطة غير موجودة.' });
+      return;
+    }
+
+    const codeRec = session.code ? store.codes[session.code] : undefined;
+    if (
+      session.role === 'collector' &&
+      codeRec &&
+      !codeRec.permissions.canRecordReadings
+    ) {
+      res.status(403).json({ error: 'ليست لديك صلاحية إرسال تنبيهات القراءات.' });
+      return;
+    }
+
+    const bucket = getBucket(station.stationId);
+    const alertInput = req.body?.alert ?? req.body;
+    const alertId = normalizeId(alertInput?.id || `al_${Date.now()}`);
+    const subscriberId = normalizeId(alertInput?.subscriberId);
+    const sub = bucket.subscribers[subscriberId];
+
+    const alertType: ManagerAlertRecord['alertType'] =
+      alertInput?.alertType === 'high_consumption'
+        ? 'high_consumption'
+        : alertInput?.alertType === 'lower_reading'
+          ? 'lower_reading'
+          : 'manual_edit';
+
+    const severity: ManagerAlertRecord['severity'] =
+      alertInput?.severity === 'warning' ? 'warning' : 'critical';
+
+    const lowerReason =
+      alertInput?.lowerReadingReason === 'meter_replaced' ||
+      alertInput?.lowerReadingReason === 'meter_reset' ||
+      alertInput?.lowerReadingReason === 'previous_error'
+        ? alertInput.lowerReadingReason
+        : undefined;
+
+    const record: ManagerAlertRecord = {
+      id: alertId,
+      stationId: station.stationId,
+      alertType,
+      severity,
+      status: 'pending',
+      readingId: normalizeId(alertInput?.readingId),
+      subscriberId,
+      subscriberName: String(
+        alertInput?.subscriberName ?? sub?.subscriberName ?? 'مشترك',
+      ).slice(0, 120),
+      meterNumber: String(
+        alertInput?.meterNumber ?? sub?.meterNumber ?? '',
+      ).slice(0, 60),
+      collectorName: String(alertInput?.collectorName ?? session.name).slice(0, 100),
+      collectorCode: session.code || session.role,
+      ...(typeof alertInput?.ocrOriginalReading === 'number'
+        ? { ocrOriginalReading: Number(alertInput.ocrOriginalReading) }
+        : {}),
+      editedReading: Math.max(0, Number(alertInput?.editedReading) || 0),
+      previousReading: Math.max(0, Number(alertInput?.previousReading) || 0),
+      ...(typeof alertInput?.difference === 'number'
+        ? { difference: Number(alertInput.difference) }
+        : {}),
+      ...(typeof alertInput?.consumptionKwh === 'number'
+        ? { consumptionKwh: Math.max(0, Number(alertInput.consumptionKwh)) }
+        : {}),
+      ...(typeof alertInput?.avg3MonthsKwh === 'number'
+        ? { avg3MonthsKwh: Math.max(0, Number(alertInput.avg3MonthsKwh)) }
+        : {}),
+      ...(lowerReason ? { lowerReadingReason: lowerReason } : {}),
+      ...(alertInput?.newMeterNumber
+        ? { newMeterNumber: String(alertInput.newMeterNumber).trim().slice(0, 60) }
+        : {}),
+      ...(typeof alertInput?.openingReading === 'number'
+        ? { openingReading: Math.max(0, Number(alertInput.openingReading)) }
+        : {}),
+      photoUrl: String(alertInput?.photoUrl ?? '').slice(0, 260000),
+      createdAt: String(alertInput?.createdAt ?? new Date().toISOString()),
+    };
+
+    bucket.alerts[alertId] = record;
+
+    // Optionally store the linked pending reading immediately so the manager can approve/reject it right away
+    const linkedReading = req.body?.reading;
+    if (linkedReading && sub) {
+      const rdId = normalizeId(linkedReading.id || record.readingId);
+      const prev = Math.max(0, Number(linkedReading.previousReading) || 0);
+      const cur = Math.max(0, Number(linkedReading.currentReading) || 0);
+      bucket.readings[rdId] = {
+        id: rdId,
+        subscriberId,
+        meterNumber: String(linkedReading.meterNumber ?? sub.meterNumber),
+        subscriberName: String(linkedReading.subscriberName ?? sub.subscriberName),
+        previousReading: prev,
+        currentReading: cur,
+        consumptionKwh: Math.max(0, Number(linkedReading.consumptionKwh) || 0),
+        kwhPriceYer: Math.max(0, Number(linkedReading.kwhPriceYer) || station.kwhPriceYer),
+        currentBillYer: Math.max(0, Number(linkedReading.currentBillYer) || 0),
+        previousDebtYer: Math.max(0, Number(linkedReading.previousDebtYer) || 0),
+        totalDueYer: Math.max(0, Number(linkedReading.totalDueYer) || 0),
+        photoUrl: String(linkedReading.photoUrl ?? record.photoUrl).slice(0, 260000),
+        photoSizeKb: Math.min(250, Math.max(0, Number(linkedReading.photoSizeKb) || 0)),
+        hasLocalPhoto: true,
+        readingSource: linkedReading.wasManuallyEdited ? 'manual_override' : 'camera_ocr',
+        ocrConfidence: Math.max(0, Math.min(100, Number(linkedReading.ocrConfidence) || 0)),
+        ...(typeof linkedReading.ocrOriginalReading === 'number'
+          ? { ocrOriginalReading: Number(linkedReading.ocrOriginalReading) }
+          : {}),
+        wasManuallyEdited: Boolean(linkedReading.wasManuallyEdited),
+        ...(linkedReading.editedAt ? { editedAt: String(linkedReading.editedAt) } : {}),
+        approvalStatus:
+          alertType === 'high_consumption' ? 'approved' : 'pending_manager',
+        ...(lowerReason ? { lowerReadingReason: lowerReason } : {}),
+        ...(record.newMeterNumber ? { newMeterNumber: record.newMeterNumber } : {}),
+        ...(typeof record.openingReading === 'number'
+          ? { openingReading: record.openingReading }
+          : {}),
+        isClosedHouseZero: Boolean(linkedReading.isClosedHouseZero),
+        ...(linkedReading.zeroConsumptionNote
+          ? { zeroConsumptionNote: String(linkedReading.zeroConsumptionNote) }
+          : {}),
+        highConsumptionWarning: alertType === 'high_consumption',
+        collectorCode: session.code || session.role,
+        collectorName: String(linkedReading.collectorName ?? session.name),
+        recordedAt: String(linkedReading.recordedAt ?? record.createdAt),
+      };
+    }
+
+    saveStore(store);
+    res.json({ ok: true, alert: record });
+  });
+
+  // Manager Decision: Approve or Reject Suspicious / Edited / Lower Reading
+  app.post(
+    '/api/stations/:stationId/alerts/:alertId/resolve',
+    requireStaff,
+    (req, res) => {
+      const session = (req as Request & { session: SessionPayload }).session;
+      if (session.role === 'collector') {
+        res.status(403).json({
+          error: 'اعتماد أو رفض التعديلات مخصص لمدير المحطة أو الأدمن فقط.',
+        });
+        return;
+      }
+
+      const station = store.stations[req.params.stationId];
+      if (!station) {
+        res.status(404).json({ error: 'المحطة غير موجودة.' });
+        return;
+      }
+
+      const bucket = getBucket(station.stationId);
+      const alertId = normalizeId(req.params.alertId);
+      const alert = bucket.alerts[alertId];
+      if (!alert) {
+        res.status(404).json({ error: 'الإشعار غير موجود.' });
+        return;
+      }
+
+      const decision: 'approved' | 'rejected' =
+        req.body?.decision === 'rejected' ? 'rejected' : 'approved';
+      const now = new Date().toISOString();
+
+      alert.status = decision;
+      alert.resolvedAt = now;
+      alert.resolvedBy = session.name;
+      if (typeof req.body?.managerNote === 'string' && req.body.managerNote.trim()) {
+        alert.managerNote = req.body.managerNote.trim().slice(0, 300);
+      }
+
+      const reading = bucket.readings[alert.readingId];
+      if (reading) {
+        reading.approvalStatus = decision;
+      }
+
+      const sub = bucket.subscribers[alert.subscriberId];
+      if (sub && alert.alertType !== 'high_consumption' && decision === 'approved') {
+        if (alert.lowerReadingReason === 'meter_replaced' && alert.newMeterNumber) {
+          sub.meterNumber = alert.newMeterNumber;
+          const nextVal = alert.openingReading ?? alert.editedReading;
+          sub.previousReading = nextVal;
+          sub.currentReading = nextVal;
+        } else {
+          sub.previousReading = alert.editedReading;
+          sub.currentReading = alert.editedReading;
+        }
+        if (reading) {
+          const paidForReading = Object.values(bucket.receipts)
+            .filter((rc) => rc.readingId === reading.id)
+            .reduce((sum, rc) => sum + rc.amountPaidYer, 0);
+          sub.previousDebtYer = Math.max(0, reading.totalDueYer - paidForReading);
+        }
+        sub.updatedAt = now;
+      }
+
+      saveStore(store);
+      res.json({ ok: true, alert, reading: reading ?? null, subscriber: sub ?? null });
+    },
+  );
+
   // Chunked Offline Sync Batch (recommended 20-25 readings+photos per request)
   app.post('/api/stations/:stationId/sync-batch', requireStaff, (req, res) => {
     const session = (req as Request & { session: SessionPayload }).session;
@@ -957,10 +1423,11 @@ async function startServer() {
       : [];
     const readings = Array.isArray(req.body?.readings) ? req.body.readings : [];
     const receipts = Array.isArray(req.body?.receipts) ? req.body.receipts : [];
+    const alerts = Array.isArray(req.body?.alerts) ? req.body.alerts : [];
 
-    if (readings.length > 50 || receipts.length > 50) {
+    if (readings.length > 50 || receipts.length > 50 || alerts.length > 50) {
       res.status(400).json({
-        error: 'حجم الدفعة كبير جداً؛ الحد الأقصى 50 قراءة في الدفعة الواحدة.',
+        error: 'حجم الدفعة كبير جداً؛ الحد الأقصى 50 سجلاً في الدفعة الواحدة.',
       });
       return;
     }
@@ -994,7 +1461,25 @@ async function startServer() {
         if (!sub) continue;
 
         const prev = Math.max(0, Number(rd?.previousReading) || 0);
-        const cur = Math.max(prev, Number(rd?.currentReading) || prev);
+        const lowerReason =
+          rd?.lowerReadingReason === 'meter_replaced' ||
+          rd?.lowerReadingReason === 'meter_reset' ||
+          rd?.lowerReadingReason === 'previous_error'
+            ? rd.lowerReadingReason
+            : undefined;
+        const rawCur = Math.max(0, Number(rd?.currentReading) || 0);
+        const cur = lowerReason ? rawCur : Math.max(prev, rawCur);
+        const wasManuallyEdited = Boolean(rd?.wasManuallyEdited);
+        const requiresManagerApproval = wasManuallyEdited || Boolean(lowerReason);
+        const existingRd = bucket.readings[rdId];
+        const approvalStatus: MeterReadingRecord['approvalStatus'] =
+          existingRd?.approvalStatus === 'approved' ||
+          existingRd?.approvalStatus === 'rejected'
+            ? existingRd.approvalStatus
+            : requiresManagerApproval
+              ? 'pending_manager'
+              : 'approved';
+
         const photoUrl = String(rd?.photoUrl ?? '').slice(0, 220000);
 
         bucket.readings[rdId] = {
@@ -1004,7 +1489,7 @@ async function startServer() {
           subscriberName: String(rd?.subscriberName ?? sub.subscriberName),
           previousReading: prev,
           currentReading: cur,
-          consumptionKwh: Math.max(0, Number(rd?.consumptionKwh) || cur - prev),
+          consumptionKwh: Math.max(0, Number(rd?.consumptionKwh) || Math.max(0, cur - prev)),
           kwhPriceYer: Math.max(0, Number(rd?.kwhPriceYer) || station.kwhPriceYer),
           currentBillYer: Math.max(0, Number(rd?.currentBillYer) || 0),
           previousDebtYer: Math.max(0, Number(rd?.previousDebtYer) || 0),
@@ -1012,9 +1497,80 @@ async function startServer() {
           photoUrl,
           photoSizeKb: Math.min(200, Math.max(0, Number(rd?.photoSizeKb) || 0)),
           hasLocalPhoto: Boolean(rd?.hasLocalPhoto || photoUrl),
+          readingSource: wasManuallyEdited ? 'manual_override' : 'camera_ocr',
+          ocrConfidence: Math.max(0, Math.min(100, Number(rd?.ocrConfidence) || 0)),
+          ...(typeof rd?.ocrOriginalReading === 'number'
+            ? { ocrOriginalReading: Number(rd.ocrOriginalReading) }
+            : {}),
+          wasManuallyEdited,
+          ...(rd?.editedAt ? { editedAt: String(rd.editedAt) } : {}),
+          approvalStatus,
+          ...(lowerReason ? { lowerReadingReason: lowerReason } : {}),
+          ...(rd?.newMeterNumber ? { newMeterNumber: String(rd.newMeterNumber).slice(0, 60) } : {}),
+          ...(typeof rd?.openingReading === 'number'
+            ? { openingReading: Math.max(0, Number(rd.openingReading)) }
+            : {}),
+          isClosedHouseZero: Boolean(rd?.isClosedHouseZero),
+          ...(rd?.zeroConsumptionNote
+            ? { zeroConsumptionNote: String(rd.zeroConsumptionNote).slice(0, 120) }
+            : {}),
+          highConsumptionWarning: Boolean(rd?.highConsumptionWarning),
           collectorCode: session.code || session.role,
           collectorName: String(rd?.collectorName ?? session.name),
           recordedAt: String(rd?.recordedAt ?? new Date().toISOString()),
+        };
+        syncedCount++;
+      }
+    }
+
+    if (alerts.length > 0) {
+      if (!perms.canRecordReadings) {
+        res.status(403).json({ error: 'ليست لديك صلاحية رفع التنبيهات.' });
+        return;
+      }
+      for (const al of alerts) {
+        const alId = normalizeId(al?.id);
+        const subId = normalizeId(al?.subscriberId);
+        const existingAl = bucket.alerts[alId];
+        if (existingAl && existingAl.status !== 'pending') continue;
+        bucket.alerts[alId] = {
+          id: alId,
+          stationId: station.stationId,
+          alertType:
+            al?.alertType === 'high_consumption'
+              ? 'high_consumption'
+              : al?.alertType === 'lower_reading'
+                ? 'lower_reading'
+                : 'manual_edit',
+          severity: al?.severity === 'warning' ? 'warning' : 'critical',
+          status: 'pending',
+          readingId: normalizeId(al?.readingId),
+          subscriberId: subId,
+          subscriberName: String(al?.subscriberName ?? ''),
+          meterNumber: String(al?.meterNumber ?? ''),
+          collectorName: String(al?.collectorName ?? session.name),
+          collectorCode: session.code || session.role,
+          ...(typeof al?.ocrOriginalReading === 'number'
+            ? { ocrOriginalReading: Number(al.ocrOriginalReading) }
+            : {}),
+          editedReading: Math.max(0, Number(al?.editedReading) || 0),
+          previousReading: Math.max(0, Number(al?.previousReading) || 0),
+          ...(typeof al?.difference === 'number'
+            ? { difference: Number(al.difference) }
+            : {}),
+          ...(typeof al?.consumptionKwh === 'number'
+            ? { consumptionKwh: Math.max(0, Number(al.consumptionKwh)) }
+            : {}),
+          ...(typeof al?.avg3MonthsKwh === 'number'
+            ? { avg3MonthsKwh: Math.max(0, Number(al.avg3MonthsKwh)) }
+            : {}),
+          ...(al?.lowerReadingReason ? { lowerReadingReason: al.lowerReadingReason } : {}),
+          ...(al?.newMeterNumber ? { newMeterNumber: String(al.newMeterNumber).slice(0, 60) } : {}),
+          ...(typeof al?.openingReading === 'number'
+            ? { openingReading: Math.max(0, Number(al.openingReading)) }
+            : {}),
+          photoUrl: String(al?.photoUrl ?? '').slice(0, 260000),
+          createdAt: String(al?.createdAt ?? new Date().toISOString()),
         };
         syncedCount++;
       }

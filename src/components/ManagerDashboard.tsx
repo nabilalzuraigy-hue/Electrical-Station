@@ -1,15 +1,22 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
+  AlertTriangle,
+  BellRing,
+  Check,
   Download,
   RefreshCw,
   Search,
+  ShieldAlert,
   Upload,
   Users,
+  X,
   Zap,
 } from 'lucide-react';
 import {
   exportStationReportExcel,
   refreshStationState,
+  resolveManagerAlert,
+  saveStationLocalState,
   updateCollectorInCloud,
   type StationLocalState,
 } from '../lib/offlineDb';
@@ -17,8 +24,16 @@ import { formatCompactYer, formatKwh, formatYer } from '../lib/formatters';
 import type {
   CollectorPermissions,
   CollectorProfile,
+  LowerReadingReason,
+  ManagerAlert,
   SyncProgress,
 } from '../types/station';
+
+const LOWER_REASON_AR: Record<LowerReadingReason, string> = {
+  meter_replaced: 'تم تغيير العداد بعداد جديد',
+  meter_reset: 'تم تصفير العداد',
+  previous_error: 'خطأ في القراءة السابقة',
+};
 
 interface ManagerDashboardProps {
   state: StationLocalState;
@@ -39,9 +54,16 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [zoneFilter, setZoneFilter] = useState<string>('all');
+  const [alertFilter, setAlertFilter] = useState<'pending' | 'all'>('pending');
   const [tariffSaved, setTariffSaved] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [collectorError, setCollectorError] = useState<string | null>(null);
+  const [alertError, setAlertError] = useState<string | null>(null);
+  const [resolvingId, setResolvingId] = useState<string | null>(null);
+  const [previewAlertPhoto, setPreviewAlertPhoto] = useState<{
+    title: string;
+    url: string;
+  } | null>(null);
 
   const [stationName, setStationName] = useState(state.station.stationName);
   const [kwhPrice, setKwhPrice] = useState(String(state.station.kwhPriceYer));
@@ -104,6 +126,95 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
         );
       });
   }, [state.subscribers, searchQuery, zoneFilter]);
+
+  // Auto-poll server every 15s for real-time instant manager notifications
+  useEffect(() => {
+    if (!staffToken || typeof navigator !== 'undefined' && !navigator.onLine) return;
+    const timer = window.setInterval(async () => {
+      if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+      try {
+        const updated = await refreshStationState(
+          state.station.stationId,
+          staffToken,
+        );
+        onUpdateState(updated);
+      } catch {
+        // silent background poll
+      }
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, [state.station.stationId, staffToken, onUpdateState]);
+
+  const sortedAlerts = useMemo(() => {
+    const all = [...(state.alerts ?? [])].sort((a, b) =>
+      b.createdAt.localeCompare(a.createdAt),
+    );
+    if (alertFilter === 'pending') {
+      return all.filter((al) => al.status === 'pending');
+    }
+    return all;
+  }, [state.alerts, alertFilter]);
+
+  const pendingAlertsCount = useMemo(
+    () => (state.alerts ?? []).filter((al) => al.status === 'pending').length,
+    [state.alerts],
+  );
+
+  const latestReadingBySubscriber = useMemo(() => {
+    const map = new Map<string, (typeof state.readings)[number]>();
+    for (const r of state.readings) {
+      if (!map.has(r.subscriberId)) {
+        map.set(r.subscriberId, r);
+      }
+    }
+    return map;
+  }, [state.readings]);
+
+  const handleResolveAlert = async (
+    alert: ManagerAlert,
+    decision: 'approved' | 'rejected',
+  ) => {
+    setAlertError(null);
+    setResolvingId(alert.id);
+    try {
+      const res = await resolveManagerAlert({
+        staffToken,
+        stationId: state.station.stationId,
+        alertId: alert.id,
+        decision,
+      });
+      const nextState: StationLocalState = {
+        ...state,
+        alerts: (state.alerts ?? []).map((a) =>
+          a.id === alert.id ? { ...res.alert, syncStatus: 'synced' } : a,
+        ),
+        readings: res.reading
+          ? state.readings.map((r) =>
+              r.id === res.reading!.id
+                ? { ...res.reading!, syncStatus: 'synced' }
+                : r,
+            )
+          : state.readings,
+        subscribers: res.subscriber
+          ? state.subscribers.map((s) =>
+              s.id === res.subscriber!.id
+                ? { ...res.subscriber!, syncStatus: 'synced' }
+                : s,
+            )
+          : state.subscribers,
+      };
+      await saveStationLocalState(nextState);
+      onUpdateState(nextState);
+    } catch (err) {
+      setAlertError(
+        err instanceof Error
+          ? err.message
+          : 'تعذر معالجة القرار في الخادم؛ تأكد من توفر الاتصال.',
+      );
+    } finally {
+      setResolvingId(null);
+    }
+  };
 
   const handleRefreshFromServer = async () => {
     setRefreshing(true);
@@ -199,8 +310,14 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
       {/* Header & Actions */}
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-slate-200 pb-6">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900">
-            لوحة مدير المحطة · {state.station.stationName}
+          <h1 className="text-2xl font-bold text-slate-900 flex flex-wrap items-center gap-3">
+            <span>لوحة مدير المحطة · {state.station.stationName}</span>
+            {pendingAlertsCount > 0 && (
+              <span className="inline-flex items-center gap-1.5 text-xs font-bold text-rose-800 bg-rose-50 border border-rose-200 px-2.5 py-1 rounded-lg">
+                <BellRing className="w-3.5 h-3.5" />
+                {pendingAlertsCount} إشعار بانتظار المراجعة
+              </span>
+            )}
           </h1>
           <p className="text-xs text-slate-600 mt-1">
             {state.station.licenseStatus === 'active'
@@ -299,6 +416,236 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Suspicious Edits & Instant Notifications Queue */}
+      <section className="bg-white border border-slate-200 rounded-xl p-6 space-y-5">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200 pb-4">
+          <div>
+            <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+              <ShieldAlert className="w-5 h-5 text-rose-700" />
+              التعديلات المشبوهة والتنبيهات الفورية ({sortedAlerts.length})
+            </h2>
+            <p className="text-xs text-slate-600 mt-1">
+              مرتبة حسب الوقت — لا تُعتمد أي قراءة معدلة يدوياً أو أقل من السابقة إلا بعد موافقتك
+            </p>
+          </div>
+
+          <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg self-start sm:self-auto">
+            <button
+              type="button"
+              onClick={() => setAlertFilter('pending')}
+              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                alertFilter === 'pending'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              بانتظار القرار ({pendingAlertsCount})
+            </button>
+            <button
+              type="button"
+              onClick={() => setAlertFilter('all')}
+              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                alertFilter === 'all'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              كل السجل ({(state.alerts ?? []).length})
+            </button>
+          </div>
+        </div>
+
+        {alertError && (
+          <p className="text-xs text-rose-800 bg-rose-50 border border-rose-200 rounded-lg p-3">
+            {alertError}
+          </p>
+        )}
+
+        {sortedAlerts.length === 0 ? (
+          <div className="py-8 text-center text-xs text-slate-500">
+            {alertFilter === 'pending'
+              ? 'لا توجد تعديلات مشبوهة أو تنبيهات معلقة حالياً.'
+              : 'لا توجد تنبيهات مسجلة حتى الآن.'}
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {sortedAlerts.map((al) => {
+              const isYellow = al.severity === 'warning' || al.alertType === 'high_consumption';
+              const isResolved = al.status !== 'pending';
+              return (
+                <div
+                  key={al.id}
+                  className={`rounded-xl border p-4 flex flex-col lg:flex-row gap-4 justify-between ${
+                    isYellow
+                      ? 'bg-amber-50/90 border-amber-300'
+                      : 'bg-rose-50/50 border-rose-200'
+                  }`}
+                >
+                  <div className="flex flex-col sm:flex-row gap-4 min-w-0">
+                    {al.photoUrl ? (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setPreviewAlertPhoto({
+                            title: `${al.subscriberName} — عداد ${al.meterNumber}`,
+                            url: al.photoUrl,
+                          })
+                        }
+                        className="w-full sm:w-32 h-24 rounded-lg overflow-hidden border border-slate-300 bg-slate-900 shrink-0 cursor-pointer relative group"
+                      >
+                        <img
+                          src={al.photoUrl}
+                          alt={`صورة العداد ${al.meterNumber}`}
+                          referrerPolicy="no-referrer"
+                          className="w-full h-full object-cover"
+                        />
+                        <span className="absolute bottom-1 right-1 bg-slate-900/80 text-white text-[10px] px-1.5 py-0.5 rounded">
+                          تكبير الصورة
+                        </span>
+                      </button>
+                    ) : (
+                      <div className="w-full sm:w-32 h-24 rounded-lg border border-slate-200 bg-white flex items-center justify-center text-[11px] text-slate-400 shrink-0">
+                        بدون صورة
+                      </div>
+                    )}
+
+                    <div className="space-y-1.5 min-w-0">
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        {isYellow ? (
+                          <span className="inline-flex items-center gap-1 font-bold text-amber-900">
+                            <AlertTriangle className="w-4 h-4 text-amber-600" />
+                            تنبيه أصفر: استهلاك يتجاوز 3 أضعاف المتوسط
+                          </span>
+                        ) : al.alertType === 'lower_reading' ? (
+                          <span className="inline-flex items-center gap-1 font-bold text-rose-900">
+                            <ShieldAlert className="w-4 h-4 text-rose-700" />
+                            قراءة أقل من السابقة —{' '}
+                            {al.lowerReadingReason
+                              ? LOWER_REASON_AR[al.lowerReadingReason]
+                              : 'بحاجة مراجعة'}
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 font-bold text-rose-900">
+                            <ShieldAlert className="w-4 h-4 text-rose-700" />
+                            تعديل يدوي مشبوه لقراءة OCR
+                          </span>
+                        )}
+                        <span className="text-slate-400">·</span>
+                        <span className="text-slate-600 font-mono-nums">
+                          {new Date(al.createdAt).toLocaleString('ar-YE')}
+                        </span>
+                      </div>
+
+                      <div className="text-sm font-bold text-slate-900">
+                        المشترك: {al.subscriberName} (عداد{' '}
+                        <span className="font-mono-nums">{al.meterNumber}</span>
+                        ) · المحصّل: {al.collectorName}
+                      </div>
+
+                      {isYellow ? (
+                        <div className="text-xs text-amber-950 font-mono-nums flex flex-wrap gap-3">
+                          <span>
+                            الاستهلاك الحالي:{' '}
+                            <strong>{al.consumptionKwh ?? 0} ك.و.س</strong>
+                          </span>
+                          <span>·</span>
+                          <span>
+                            متوسط آخر 3 أشهر:{' '}
+                            <strong>{al.avg3MonthsKwh ?? 0} ك.و.س</strong>
+                          </span>
+                          <span>·</span>
+                          <span>
+                            القراءة: {al.previousReading} ← {al.editedReading}
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="text-xs text-slate-800 font-mono-nums flex flex-wrap gap-3">
+                          {typeof al.ocrOriginalReading === 'number' && (
+                            <span>
+                              الأصلي من OCR:{' '}
+                              <strong className="text-slate-900">
+                                {al.ocrOriginalReading}
+                              </strong>
+                            </span>
+                          )}
+                          <span>
+                            السابقة:{' '}
+                            <strong>{al.previousReading}</strong>
+                          </span>
+                          <span>
+                            الجديد:{' '}
+                            <strong className="text-rose-800">
+                              {al.editedReading}
+                            </strong>
+                          </span>
+                          {typeof al.difference === 'number' && (
+                            <span>
+                              الفرق:{' '}
+                              <strong dir="ltr">
+                                {al.difference >= 0
+                                  ? `+${al.difference}`
+                                  : al.difference}
+                              </strong>
+                            </span>
+                          )}
+                          {al.newMeterNumber && (
+                            <span>
+                              العداد الجديد: <strong>{al.newMeterNumber}</strong>{' '}
+                              (افتتاحية {al.openingReading ?? 0})
+                            </span>
+                          )}
+                        </div>
+                      )}
+
+                      {isResolved && (
+                        <div
+                          className={`text-xs font-bold ${
+                            al.status === 'approved'
+                              ? 'text-teal-800'
+                              : 'text-rose-800'
+                          }`}
+                        >
+                          {al.status === 'approved'
+                            ? `تم قبول واعتماد القراءة بواسطة ${al.resolvedBy || 'المدير'}`
+                            : `تم رفض التعديل بواسطة ${al.resolvedBy || 'المدير'}`}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {!isResolved && (
+                    <div className="flex sm:flex-row lg:flex-col items-stretch sm:items-center lg:items-end justify-end gap-2 shrink-0">
+                      <button
+                        type="button"
+                        disabled={resolvingId === al.id}
+                        onClick={() => void handleResolveAlert(al, 'approved')}
+                        className="min-h-[40px] px-4 py-2 text-xs font-bold bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 text-white rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                      >
+                        <Check className="w-4 h-4" />
+                        {isYellow ? 'إقرار المراجعة' : 'قبول التعديل'}
+                      </button>
+                      {!isYellow && (
+                        <button
+                          type="button"
+                          disabled={resolvingId === al.id}
+                          onClick={() =>
+                            void handleResolveAlert(al, 'rejected')
+                          }
+                          className="min-h-[40px] px-4 py-2 text-xs font-bold bg-white border border-rose-300 text-rose-800 hover:bg-rose-100 disabled:opacity-50 rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                        >
+                          <X className="w-4 h-4" />
+                          رفض التعديل
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
 
       {/* Main Grid: Tariff Settings + Collectors Supervision */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
@@ -511,45 +858,63 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {filteredSubscribers.slice(0, 200).map((sub) => (
-                <tr key={sub.id} className="hover:bg-slate-50/70 transition-colors">
-                  <td className="py-3 px-4 font-mono-nums text-slate-500">
-                    {sub.sequenceOrder}
-                  </td>
-                  <td className="py-3 px-4 font-mono-nums font-semibold text-slate-900">
-                    {sub.meterNumber}
-                  </td>
-                  <td className="py-3 px-4">
-                    <div className="font-medium text-slate-900">
-                      {sub.subscriberName}
-                    </div>
-                    <div className="text-xs text-slate-500 font-mono-nums">
-                      {sub.phone}
-                    </div>
-                  </td>
-                  <td className="py-3 px-4 text-slate-700">{sub.zoneStreet}</td>
-                  <td className="py-3 px-4 font-mono-nums text-slate-700">
-                    {sub.previousReading}
-                  </td>
-                  <td className="py-3 px-4 font-mono-nums text-slate-900 font-medium">
-                    {sub.currentReading}
-                  </td>
-                  <td className="py-3 px-4 font-mono-nums font-medium text-slate-900">
-                    {formatYer(sub.previousDebtYer)}
-                  </td>
-                  <td className="py-3 px-4 text-xs">
-                    <span
-                      className={
-                        sub.syncStatus === 'synced'
-                          ? 'text-teal-700 font-medium'
-                          : 'text-amber-700 font-medium'
-                      }
-                    >
-                      {sub.syncStatus === 'synced' ? 'متزامن' : 'معلق'}
-                    </span>
-                  </td>
-                </tr>
-              ))}
+              {filteredSubscribers.slice(0, 200).map((sub) => {
+                const latestRd = latestReadingBySubscriber.get(sub.id);
+                return (
+                  <tr
+                    key={sub.id}
+                    className="hover:bg-slate-50/70 transition-colors"
+                  >
+                    <td className="py-3 px-4 font-mono-nums text-slate-500">
+                      {sub.sequenceOrder}
+                    </td>
+                    <td className="py-3 px-4 font-mono-nums font-semibold text-slate-900">
+                      {sub.meterNumber}
+                    </td>
+                    <td className="py-3 px-4">
+                      <div className="font-medium text-slate-900">
+                        {sub.subscriberName}
+                      </div>
+                      <div className="text-xs text-slate-500 font-mono-nums">
+                        {sub.phone}
+                      </div>
+                    </td>
+                    <td className="py-3 px-4 text-slate-700">
+                      {sub.zoneStreet}
+                    </td>
+                    <td className="py-3 px-4 font-mono-nums text-slate-700">
+                      {sub.previousReading}
+                    </td>
+                    <td className="py-3 px-4 font-mono-nums text-slate-900 font-medium">
+                      <div>{sub.currentReading}</div>
+                      {latestRd?.isClosedHouseZero && (
+                        <div className="text-[11px] font-sans text-sky-800 font-medium">
+                          استهلاك صفر - بيت مغلق
+                        </div>
+                      )}
+                      {latestRd?.approvalStatus === 'pending_manager' && (
+                        <div className="text-[11px] font-sans text-rose-700 font-medium">
+                          بانتظار موافقة المدير ({latestRd.currentReading})
+                        </div>
+                      )}
+                    </td>
+                    <td className="py-3 px-4 font-mono-nums font-medium text-slate-900">
+                      {formatYer(sub.previousDebtYer)}
+                    </td>
+                    <td className="py-3 px-4 text-xs">
+                      <span
+                        className={
+                          sub.syncStatus === 'synced'
+                            ? 'text-teal-700 font-medium'
+                            : 'text-amber-700 font-medium'
+                        }
+                      >
+                        {sub.syncStatus === 'synced' ? 'متزامن' : 'معلق'}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
               {filteredSubscribers.length === 0 && (
                 <tr>
                   <td colSpan={8} className="py-10 text-center text-slate-500">
@@ -561,6 +926,40 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
           </table>
         </div>
       </section>
+
+      {/* Alert Proof Photo Zoom Modal */}
+      {previewAlertPhoto && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-950/80 flex items-center justify-center p-4"
+          onClick={() => setPreviewAlertPhoto(null)}
+        >
+          <div
+            className="bg-white rounded-2xl max-w-2xl w-full overflow-hidden shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+              <span className="text-sm font-bold text-slate-900">
+                صورة العداد · {previewAlertPhoto.title}
+              </span>
+              <button
+                type="button"
+                onClick={() => setPreviewAlertPhoto(null)}
+                className="p-1.5 text-slate-500 hover:text-slate-900 rounded-lg cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="bg-slate-900 max-h-[75vh] flex items-center justify-center">
+              <img
+                src={previewAlertPhoto.url}
+                alt={previewAlertPhoto.title}
+                referrerPolicy="no-referrer"
+                className="max-h-[75vh] w-auto object-contain"
+              />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

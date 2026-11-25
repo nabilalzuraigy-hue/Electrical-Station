@@ -4,6 +4,7 @@ import type {
   AccessCodeRecord,
   CollectorPermissions,
   CollectorProfile,
+  ManagerAlert,
   MeterReading,
   PaymentReceipt,
   StationConfig,
@@ -20,6 +21,7 @@ export interface StationLocalState {
   subscribers: Subscriber[];
   readings: MeterReading[];
   receipts: PaymentReceipt[];
+  alerts?: ManagerAlert[];
 }
 
 export function sanitizeFirestoreId(raw: string): string {
@@ -175,6 +177,19 @@ export async function toggleAccessCodeAdmin(
   );
 }
 
+export async function deleteAccessCodeAdmin(
+  adminToken: string,
+  code: string,
+): Promise<{ deleted: boolean; code: string }> {
+  return apiRequest<{ deleted: boolean; code: string }>(
+    `/api/admin/codes/${encodeURIComponent(code)}`,
+    {
+      method: 'DELETE',
+    },
+    adminToken,
+  );
+}
+
 export async function uploadSubscribersChunkedAdmin(
   adminToken: string,
   params: {
@@ -222,6 +237,7 @@ function mapServerState(raw: {
   subscribers?: Subscriber[];
   readings?: MeterReading[];
   receipts?: PaymentReceipt[];
+  alerts?: ManagerAlert[];
 }): StationLocalState {
   const collectors: CollectorProfile[] = (raw.collectors ?? []).map((c) => ({
     id: c.code,
@@ -249,6 +265,10 @@ function mapServerState(raw: {
     })),
     receipts: (raw.receipts ?? []).map((rc) => ({
       ...rc,
+      syncStatus: 'synced',
+    })),
+    alerts: (raw.alerts ?? []).map((al) => ({
+      ...al,
       syncStatus: 'synced',
     })),
   };
@@ -280,11 +300,21 @@ function mergeLocalPendingWithCloud(
     ...cloud.receipts,
   ];
 
+  const pendingAlerts = (local.alerts ?? []).filter(
+    (al) => al.syncStatus === 'pending',
+  );
+  const alIds = new Set((cloud.alerts ?? []).map((al) => al.id));
+  const mergedAlerts = [
+    ...pendingAlerts.filter((al) => !alIds.has(al.id)),
+    ...(cloud.alerts ?? []),
+  ].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
   return {
     ...cloud,
     subscribers: Array.from(subMap.values()),
     readings: mergedReadings,
     receipts: mergedReceipts,
+    alerts: mergedAlerts,
   };
 }
 
@@ -299,11 +329,19 @@ export type UnifiedLoginResult =
   | { kind: 'subscriber'; result: SubscriberLookupResult };
 
 export async function loginUnified(
-  credential: string,
+  input: string | { username: string; password: string },
 ): Promise<UnifiedLoginResult> {
-  const clean = credential.trim();
-  if (!clean) {
-    throw new Error('يرجى إدخال بيانات الدخول.');
+  const payload =
+    typeof input === 'string'
+      ? { credential: input.trim() }
+      : {
+          username: input.username.trim(),
+          password: input.password.trim(),
+          credential: input.password.trim() || input.username.trim(),
+        };
+
+  if (!payload.credential && !('username' in payload && payload.username)) {
+    throw new Error('يرجى إدخال اسم المستخدم أو كلمة المرور.');
   }
 
   const res = await apiRequest<
@@ -318,12 +356,13 @@ export async function loginUnified(
           subscribers?: Subscriber[];
           readings?: MeterReading[];
           receipts?: PaymentReceipt[];
+          alerts?: ManagerAlert[];
         };
       }
     | { kind: 'subscriber'; result: SubscriberLookupResult }
   >('/api/auth/unified', {
     method: 'POST',
-    body: JSON.stringify({ credential: clean }),
+    body: JSON.stringify(payload),
   });
 
   if (res.kind === 'staff') {
@@ -361,6 +400,7 @@ export async function loginWithAccessCode(codeInput: string): Promise<{
       subscribers?: Subscriber[];
       readings?: MeterReading[];
       receipts?: PaymentReceipt[];
+      alerts?: ManagerAlert[];
     };
   }>('/api/auth/code', {
     method: 'POST',
@@ -389,6 +429,7 @@ export async function refreshStationState(
     subscribers?: Subscriber[];
     readings?: MeterReading[];
     receipts?: PaymentReceipt[];
+    alerts?: ManagerAlert[];
   }>(`/api/stations/${encodeURIComponent(stationId)}/state`, {}, staffToken);
 
   const cloudState = mapServerState(res);
@@ -436,8 +477,76 @@ export async function updateCollectorInCloud(params: {
   );
 }
 
+export function computeSubscriber3MonthAvgKwh(
+  subscriber: Subscriber,
+  readings: MeterReading[],
+): number {
+  const recent = readings
+    .filter(
+      (r) =>
+        r.subscriberId === subscriber.id &&
+        r.approvalStatus !== 'rejected' &&
+        r.consumptionKwh > 0,
+    )
+    .sort((a, b) => b.recordedAt.localeCompare(a.recordedAt))
+    .slice(0, 3);
+
+  if (recent.length > 0) {
+    const sum = recent.reduce((acc, r) => acc + r.consumptionKwh, 0);
+    return Math.round((sum / recent.length) * 100) / 100;
+  }
+  return subscriber.last3MonthsAvgKwh ?? 0;
+}
+
+export async function sendInstantManagerAlert(params: {
+  staffToken: string;
+  stationId: string;
+  alert: ManagerAlert;
+  reading?: MeterReading;
+}): Promise<{ alert: ManagerAlert }> {
+  return apiRequest<{ alert: ManagerAlert }>(
+    `/api/stations/${encodeURIComponent(params.stationId)}/alerts`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        alert: params.alert,
+        ...(params.reading ? { reading: params.reading } : {}),
+      }),
+    },
+    params.staffToken,
+  );
+}
+
+export async function resolveManagerAlert(params: {
+  staffToken: string;
+  stationId: string;
+  alertId: string;
+  decision: 'approved' | 'rejected';
+  managerNote?: string;
+}): Promise<{
+  alert: ManagerAlert;
+  reading: MeterReading | null;
+  subscriber: Subscriber | null;
+}> {
+  return apiRequest<{
+    alert: ManagerAlert;
+    reading: MeterReading | null;
+    subscriber: Subscriber | null;
+  }>(
+    `/api/stations/${encodeURIComponent(params.stationId)}/alerts/${encodeURIComponent(params.alertId)}/resolve`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        decision: params.decision,
+        ...(params.managerNote ? { managerNote: params.managerNote } : {}),
+      }),
+    },
+    params.staffToken,
+  );
+}
+
 // ============================================================
-// Chunked Batch Offline Sync (20 readings+photos per batch)
+// Chunked Batch Offline Sync (20 readings per batch)
 // ============================================================
 
 export async function syncStationPendingBatches(params: {
@@ -459,6 +568,9 @@ export async function syncStationPendingBatches(params: {
   const pendingSubs = working.subscribers.filter((s) => s.syncStatus === 'pending');
   const pendingReadings = working.readings.filter((r) => r.syncStatus === 'pending');
   const pendingReceipts = working.receipts.filter((rc) => rc.syncStatus === 'pending');
+  const pendingAlerts = (working.alerts ?? []).filter(
+    (al) => al.syncStatus === 'pending',
+  );
 
   const subChunkSize = 300;
   const readingChunkSize = 20;
@@ -478,10 +590,21 @@ export async function syncStationPendingBatches(params: {
     receiptBatches.push(pendingReceipts.slice(i, i + readingChunkSize));
   }
 
+  const alertBatches: ManagerAlert[][] = [];
+  for (let i = 0; i < pendingAlerts.length; i += 10) {
+    alertBatches.push(pendingAlerts.slice(i, i + 10));
+  }
+
   const totalItems =
-    pendingSubs.length + pendingReadings.length + pendingReceipts.length;
+    pendingSubs.length +
+    pendingReadings.length +
+    pendingReceipts.length +
+    pendingAlerts.length;
   const totalBatches =
-    subBatches.length + readingBatches.length + receiptBatches.length;
+    subBatches.length +
+    readingBatches.length +
+    receiptBatches.length +
+    alertBatches.length;
 
   let completed = 0;
   let currentBatch = 0;
@@ -491,6 +614,7 @@ export async function syncStationPendingBatches(params: {
     syncedSubIds: Set<string>,
     syncedRdIds: Set<string>,
     syncedRcIds: Set<string>,
+    syncedAlIds: Set<string>,
   ) => {
     working = {
       ...working,
@@ -502,6 +626,9 @@ export async function syncStationPendingBatches(params: {
       ),
       receipts: working.receipts.map((rc) =>
         syncedRcIds.has(rc.id) ? { ...rc, syncStatus: 'synced' } : rc,
+      ),
+      alerts: (working.alerts ?? []).map((al) =>
+        syncedAlIds.has(al.id) ? { ...al, syncStatus: 'synced' } : al,
       ),
     };
     await saveStationLocalState(working);
@@ -518,7 +645,7 @@ export async function syncStationPendingBatches(params: {
       params.staffToken,
     );
     const ids = new Set(batch.map((b) => b.id));
-    await commitLocalProgress(ids, new Set(), new Set());
+    await commitLocalProgress(ids, new Set(), new Set(), new Set());
     completed += batch.length;
     syncedCount += batch.length;
     params.onProgress?.({ completed, total: totalItems, currentBatch, totalBatches });
@@ -526,9 +653,10 @@ export async function syncStationPendingBatches(params: {
 
   for (const batch of readingBatches) {
     currentBatch++;
-    const textOnlyReadings = batch.map((r) => ({
+    const payloadReadings = batch.map((r) => ({
       ...r,
-      photoUrl: '',
+      // Keep proof photo for manager review when flagged/edited/lower; otherwise store locally for ultra-fast sync
+      photoUrl: r.approvalStatus === 'pending_manager' ? r.photoUrl : '',
       hasLocalPhoto: Boolean(r.photoUrl || r.hasLocalPhoto),
     }));
     await apiRequest(
@@ -537,14 +665,14 @@ export async function syncStationPendingBatches(params: {
         method: 'POST',
         body: JSON.stringify({
           subscribers: [],
-          readings: textOnlyReadings,
+          readings: payloadReadings,
           receipts: [],
         }),
       },
       params.staffToken,
     );
     const ids = new Set(batch.map((b) => b.id));
-    await commitLocalProgress(new Set(), ids, new Set());
+    await commitLocalProgress(new Set(), ids, new Set(), new Set());
     completed += batch.length;
     syncedCount += batch.length;
     params.onProgress?.({ completed, total: totalItems, currentBatch, totalBatches });
@@ -561,7 +689,29 @@ export async function syncStationPendingBatches(params: {
       params.staffToken,
     );
     const ids = new Set(batch.map((b) => b.id));
-    await commitLocalProgress(new Set(), new Set(), ids);
+    await commitLocalProgress(new Set(), new Set(), ids, new Set());
+    completed += batch.length;
+    syncedCount += batch.length;
+    params.onProgress?.({ completed, total: totalItems, currentBatch, totalBatches });
+  }
+
+  for (const batch of alertBatches) {
+    currentBatch++;
+    await apiRequest(
+      `/api/stations/${encodeURIComponent(stationId)}/sync-batch`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          subscribers: [],
+          readings: [],
+          receipts: [],
+          alerts: batch,
+        }),
+      },
+      params.staffToken,
+    );
+    const ids = new Set(batch.map((b) => b.id));
+    await commitLocalProgress(new Set(), new Set(), new Set(), ids);
     completed += batch.length;
     syncedCount += batch.length;
     params.onProgress?.({ completed, total: totalItems, currentBatch, totalBatches });

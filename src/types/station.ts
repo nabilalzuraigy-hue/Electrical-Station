@@ -61,6 +61,54 @@ export interface CollectorProfile {
   createdAt: string;
 }
 
+export type LowerReadingReason =
+  | 'meter_replaced'
+  | 'meter_reset'
+  | 'previous_error';
+
+export type ReadingApprovalStatus =
+  | 'approved'
+  | 'pending_manager'
+  | 'rejected';
+
+export type ManagerAlertType =
+  | 'manual_edit'
+  | 'high_consumption'
+  | 'lower_reading';
+
+export type ManagerAlertSeverity = 'critical' | 'warning';
+
+export type ManagerAlertStatus = 'pending' | 'approved' | 'rejected';
+
+export interface ManagerAlert {
+  id: string;
+  stationId: string;
+  alertType: ManagerAlertType;
+  severity: ManagerAlertSeverity;
+  status: ManagerAlertStatus;
+  readingId: string;
+  subscriberId: string;
+  subscriberName: string;
+  meterNumber: string;
+  collectorName: string;
+  collectorCode?: string;
+  ocrOriginalReading?: number;
+  editedReading: number;
+  previousReading: number;
+  difference?: number;
+  consumptionKwh?: number;
+  avg3MonthsKwh?: number;
+  lowerReadingReason?: LowerReadingReason;
+  newMeterNumber?: string;
+  openingReading?: number;
+  photoUrl: string;
+  createdAt: string;
+  resolvedAt?: string;
+  resolvedBy?: string;
+  managerNote?: string;
+  syncStatus: SyncStatus;
+}
+
 export interface Subscriber {
   id: string;
   meterNumber: string;
@@ -69,6 +117,7 @@ export interface Subscriber {
   previousReading: number;
   currentReading: number;
   previousDebtYer: number;
+  last3MonthsAvgKwh?: number;
   zoneStreet: string;
   sequenceOrder: number;
   assignedCollectorId?: string;
@@ -92,6 +141,18 @@ export interface MeterReading {
   photoUrl: string;
   photoSizeKb: number;
   hasLocalPhoto?: boolean;
+  readingSource?: 'camera_ocr' | 'manual_override';
+  ocrConfidence?: number;
+  ocrOriginalReading?: number;
+  wasManuallyEdited?: boolean;
+  editedAt?: string;
+  approvalStatus?: ReadingApprovalStatus;
+  lowerReadingReason?: LowerReadingReason;
+  newMeterNumber?: string;
+  openingReading?: number;
+  isClosedHouseZero?: boolean;
+  zeroConsumptionNote?: string;
+  highConsumptionWarning?: boolean;
   collectorUid: string;
   collectorName: string;
   recordedAt: string;

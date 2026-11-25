@@ -124,7 +124,9 @@ export const SubscriberPortal: React.FC<SubscriberPortalProps> = ({
     }
   };
 
-  const latestReading = matchedResult?.readings[0];
+  const latestReading =
+    matchedResult?.readings.find((r) => r.approvalStatus !== 'rejected' && r.approvalStatus !== 'pending_manager') ??
+    matchedResult?.readings[0];
   const latestPhoto = latestReading?.photoUrl || '';
 
   return (
@@ -244,7 +246,9 @@ export const SubscriberPortal: React.FC<SubscriberPortalProps> = ({
                   <div className="flex justify-between text-sm">
                     <span className="text-slate-600">الاستهلاك</span>
                     <span className="font-mono-nums font-semibold">
-                      {formatKwh(latestReading?.consumptionKwh ?? 0)}
+                      {latestReading?.isClosedHouseZero
+                        ? 'استهلاك صفر - بيت مغلق'
+                        : formatKwh(latestReading?.consumptionKwh ?? 0)}
                     </span>
                   </div>
                   <div className="flex justify-between text-sm">

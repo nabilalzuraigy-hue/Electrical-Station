@@ -1,9 +1,6 @@
 import React, { useState } from 'react';
-import { ShieldAlert } from 'lucide-react';
-import {
-  loginUnified,
-  type UnifiedLoginResult,
-} from '../lib/offlineDb';
+import { Eye, EyeOff, Lock, ShieldAlert, User } from 'lucide-react';
+import { loginUnified, type UnifiedLoginResult } from '../lib/offlineDb';
 
 interface ActivationGateProps {
   onAuthenticated: (result: UnifiedLoginResult) => void;
@@ -12,20 +9,23 @@ interface ActivationGateProps {
 export const ActivationGate: React.FC<ActivationGateProps> = ({
   onAuthenticated,
 }) => {
-  const [credential, setCredential] = useState('');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!credential.trim()) {
-      setError('يرجى إدخال بيانات الدخول.');
+    if (!username.trim() && !password.trim()) {
+      setError('يرجى إدخال اسم المستخدم وكلمة المرور.');
       return;
     }
+
     setSubmitting(true);
     setError(null);
     try {
-      const result = await loginUnified(credential);
+      const result = await loginUnified({ username, password });
       onAuthenticated(result);
     } catch (err) {
       setError(
@@ -37,42 +37,130 @@ export const ActivationGate: React.FC<ActivationGateProps> = ({
   };
 
   return (
-    <div className="min-h-[60vh] flex items-center justify-center py-8">
-      <div className="w-full max-w-md bg-white border border-slate-200 rounded-2xl shadow-sm p-7 sm:p-9 space-y-6">
-        <h1 className="text-xl sm:text-2xl font-bold text-slate-900 text-center">
-          محطات الكهرباء التجارية
-        </h1>
+    <div
+      dir="rtl"
+      className="relative min-h-[100dvh] w-full overflow-hidden bg-gradient-to-br from-[#041224] via-[#062738] to-[#053328] flex flex-col items-center justify-center px-4 py-10 sm:px-6"
+    >
+      {/* Ambient Electric Green & Blue Light Glow */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute -top-32 -right-28 h-[440px] w-[440px] rounded-full bg-emerald-400/20 blur-[120px]"
+      />
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute -bottom-36 -left-24 h-[460px] w-[460px] rounded-full bg-sky-500/20 blur-[130px]"
+      />
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-[320px] w-[520px] rounded-full bg-teal-400/10 blur-[110px]"
+      />
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <input
-            type="text"
-            dir="auto"
-            autoComplete="off"
-            spellCheck={false}
-            value={credential}
-            onChange={(e) => {
-              setCredential(e.target.value);
-              if (error) setError(null);
-            }}
-            aria-label="محطات الكهرباء التجارية"
-            className="w-full min-h-[48px] px-4 py-2.5 text-base text-center border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-teal-600 focus:border-teal-600"
-          />
+      <div className="relative z-10 w-full max-w-md space-y-8">
+        {/* Top Large Brand Logo & Subtitle */}
+        <header className="animate-login-header text-center space-y-3">
+          <div className="inline-flex items-center justify-center gap-3">
+            <span
+              aria-hidden="true"
+              className="w-12 h-12 sm:w-14 sm:h-14 rounded-2xl bg-gradient-to-br from-emerald-400 via-teal-400 to-sky-500 text-slate-950 inline-flex items-center justify-center shadow-lg shadow-emerald-500/30 text-2xl sm:text-3xl shrink-0"
+            >
+              ⚡
+            </span>
+            <h1 className="font-display text-2xl sm:text-4xl font-bold text-white tracking-tight leading-snug">
+              محطات الكهرباء التجارية
+            </h1>
+          </div>
+          <p className="text-base sm:text-lg font-medium text-emerald-100/90">
+            نظام اتمتة موحدة للكهرباء
+          </p>
+        </header>
 
-          {error && (
-            <div className="flex items-start gap-2 text-xs text-rose-800 bg-rose-50 border border-rose-200 rounded-lg p-3">
-              <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" />
-              <span>{error}</span>
+        {/* Centered Elevated White Card */}
+        <main className="animate-login-card bg-white rounded-3xl shadow-[0_30px_75px_-15px_rgba(0,0,0,0.65)] p-7 sm:p-10">
+          <form onSubmit={handleSubmit} className="space-y-5">
+            <div className="space-y-2">
+              <label
+                htmlFor="login-username"
+                className="block text-base sm:text-lg font-bold text-slate-800"
+              >
+                اسم المستخدم
+              </label>
+              <div className="relative">
+                <User className="w-5 h-5 text-slate-400 absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  id="login-username"
+                  type="text"
+                  dir="auto"
+                  autoComplete="username"
+                  spellCheck={false}
+                  value={username}
+                  onChange={(e) => {
+                    setUsername(e.target.value);
+                    if (error) setError(null);
+                  }}
+                  className="w-full min-h-[54px] pr-12 pl-4 py-3 text-base sm:text-lg text-slate-900 bg-slate-50/70 border border-slate-300 rounded-2xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-colors"
+                />
+              </div>
             </div>
-          )}
 
-          <button
-            type="submit"
-            disabled={submitting}
-            className="w-full min-h-[48px] py-3 px-4 bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 text-white text-base font-bold rounded-xl transition-colors cursor-pointer"
-          >
-            {submitting ? 'جاري التحقق...' : 'دخول'}
-          </button>
-        </form>
+            <div className="space-y-2">
+              <label
+                htmlFor="login-password"
+                className="block text-base sm:text-lg font-bold text-slate-800"
+              >
+                كلمة المرور
+              </label>
+              <div className="relative">
+                <Lock className="w-5 h-5 text-slate-400 absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  id="login-password"
+                  type={showPassword ? 'text' : 'password'}
+                  dir="auto"
+                  autoComplete="current-password"
+                  spellCheck={false}
+                  value={password}
+                  onChange={(e) => {
+                    setPassword(e.target.value);
+                    if (error) setError(null);
+                  }}
+                  className="w-full min-h-[54px] pr-12 pl-14 py-3 text-base sm:text-lg text-slate-900 bg-slate-50/70 border border-slate-300 rounded-2xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-colors"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword((prev) => !prev)}
+                  aria-label={
+                    showPassword ? 'إخفاء كلمة المرور' : 'إظهار كلمة المرور'
+                  }
+                  className="absolute left-1.5 top-1/2 -translate-y-1/2 w-11 h-11 rounded-xl flex items-center justify-center text-slate-500 hover:text-emerald-700 hover:bg-emerald-50 transition-colors cursor-pointer"
+                >
+                  {showPassword ? (
+                    <EyeOff className="w-5 h-5" />
+                  ) : (
+                    <Eye className="w-5 h-5" />
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {error && (
+              <div className="flex items-start gap-2.5 text-sm font-medium text-rose-800 bg-rose-50 border border-rose-200 rounded-2xl p-3.5">
+                <ShieldAlert className="w-5 h-5 shrink-0 mt-0.5" />
+                <span>{error}</span>
+              </div>
+            )}
+
+            <button
+              type="submit"
+              disabled={submitting}
+              className="btn-shine w-full min-h-[56px] py-3.5 px-6 rounded-2xl bg-gradient-to-l from-emerald-600 via-emerald-500 to-teal-600 hover:from-emerald-500 hover:via-emerald-500 hover:to-teal-500 active:scale-[0.985] disabled:opacity-60 text-white text-lg sm:text-xl font-bold shadow-lg shadow-emerald-600/30 transition-all duration-150 cursor-pointer"
+            >
+              {submitting ? 'جاري التحقق...' : 'دخول'}
+            </button>
+
+            <p className="text-xs sm:text-sm text-slate-500 text-center pt-1">
+              الدخول مخصص للموظفين والمحصلين فقط
+            </p>
+          </form>
+        </main>
       </div>
     </div>
   );
