@@ -1856,14 +1856,16 @@ If no clear electric meter kWh reading is visible in the image, set isClearMeter
           name: 'ai-studio-disable-hmr-ws',
           enforce: 'post',
           transform(code, id) {
-            if (
-              id.includes('vite/dist/client/client.mjs') &&
-              code.includes('transport.connect(createHMRHandler(handleMessage));')
-            ) {
-              return code.replace(
-                'transport.connect(createHMRHandler(handleMessage));',
-                '/* HMR disabled */',
-              );
+            if (id.includes('vite/dist/client/client.mjs')) {
+              return code
+                .replace(
+                  'transport.connect(createHMRHandler(handleMessage));',
+                  '/* HMR disabled */',
+                )
+                .replace(
+                  'else throw new SendBeforeConnectError("send was called before connect");',
+                  'else return;',
+                );
             }
           },
         },
