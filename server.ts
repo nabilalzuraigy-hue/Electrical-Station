@@ -35,6 +35,7 @@ interface StationRecord {
   licenseStatus: 'active' | 'suspended';
   maxCollectors: number;
   maxSubscribers: number;
+  zoneGeneratorKwh?: Record<string, number>;
   createdAt: string;
   updatedAt: string;
 }
@@ -80,6 +81,9 @@ interface MeterReadingRecord {
   isClosedHouseZero?: boolean;
   zeroConsumptionNote?: string;
   highConsumptionWarning?: boolean;
+  gpsLat?: number;
+  gpsLng?: number;
+  gpsAccuracy?: number;
   collectorCode: string;
   collectorName: string;
   recordedAt: string;
@@ -126,11 +130,38 @@ interface PaymentReceiptRecord {
   paidAt: string;
 }
 
+interface DieselExpenseRecord {
+  id: string;
+  stationId: string;
+  date: string;
+  category: 'diesel' | 'oil_maintenance' | 'salaries' | 'other';
+  liters?: number;
+  pricePerLiterYer?: number;
+  amountYer: number;
+  note: string;
+  createdBy?: string;
+  createdAt: string;
+}
+
+interface CollectorLocationRecord {
+  collectorCode: string;
+  collectorName: string;
+  lat: number;
+  lng: number;
+  accuracy?: number;
+  lastSubscriberName?: string;
+  lastMeterNumber?: string;
+  zoneStreet?: string;
+  updatedAt: string;
+}
+
 interface StationDataBucket {
   subscribers: Record<string, SubscriberRecord>;
   readings: Record<string, MeterReadingRecord>;
   receipts: Record<string, PaymentReceiptRecord>;
   alerts: Record<string, ManagerAlertRecord>;
+  expenses?: Record<string, DieselExpenseRecord>;
+  collectorLocations?: Record<string, CollectorLocationRecord>;
 }
 
 interface PersistentStore {
@@ -216,9 +247,19 @@ function getBucket(stationId: string): StationDataBucket {
       readings: {},
       receipts: {},
       alerts: {},
+      expenses: {},
+      collectorLocations: {},
     };
-  } else if (!store.stationData[stationId].alerts) {
-    store.stationData[stationId].alerts = {};
+  } else {
+    if (!store.stationData[stationId].alerts) {
+      store.stationData[stationId].alerts = {};
+    }
+    if (!store.stationData[stationId].expenses) {
+      store.stationData[stationId].expenses = {};
+    }
+    if (!store.stationData[stationId].collectorLocations) {
+      store.stationData[stationId].collectorLocations = {};
+    }
   }
   return store.stationData[stationId];
 }
@@ -439,8 +480,17 @@ function buildStationStatePayload(
       readings: allReadings.filter((r) => subIds.has(r.subscriberId)),
       receipts: allReceipts.filter((rc) => subIds.has(rc.subscriberId)),
       alerts: [],
+      expenses: [],
+      collectorLocations: [],
     };
   }
+
+  const allExpenses = Object.values(bucket.expenses ?? {}).sort((a, b) =>
+    (b.date || b.createdAt).localeCompare(a.date || a.createdAt),
+  );
+  const allLocations = Object.values(bucket.collectorLocations ?? {}).sort((a, b) =>
+    b.updatedAt.localeCompare(a.updatedAt),
+  );
 
   return {
     station,
@@ -450,6 +500,8 @@ function buildStationStatePayload(
     readings: allReadings,
     receipts: allReceipts,
     alerts: allAlerts,
+    expenses: allExpenses,
+    collectorLocations: allLocations,
   };
 }
 
@@ -465,6 +517,14 @@ async function startServer() {
     const envConfigured = Boolean(process.env.ADMIN_PASSCODE?.trim());
     const configured = envConfigured || Boolean(store.adminPasscodeHash);
     res.json({ configured });
+  });
+
+  app.get('/api/maps/config', (_req, res) => {
+    const apiKey =
+      process.env.VITE_GOOGLE_MAPS_API_KEY?.trim() ||
+      process.env.GOOGLE_MAPS_API_KEY?.trim() ||
+      '';
+    res.json({ apiKey });
   });
 
   app.post('/api/admin/claim', (req, res) => {
@@ -1162,10 +1222,170 @@ async function startServer() {
     if (typeof req.body?.mainGeneratorKwh === 'number') {
       station.mainGeneratorKwh = Math.max(0, req.body.mainGeneratorKwh);
     }
+    if (
+      req.body?.zoneGeneratorKwh &&
+      typeof req.body.zoneGeneratorKwh === 'object' &&
+      !Array.isArray(req.body.zoneGeneratorKwh)
+    ) {
+      const sanitized: Record<string, number> = {};
+      for (const [k, v] of Object.entries(req.body.zoneGeneratorKwh)) {
+        const zoneName = String(k ?? '').trim().slice(0, 120);
+        const val = Number(v);
+        if (zoneName && Number.isFinite(val) && val >= 0) {
+          sanitized[zoneName] = val;
+        }
+      }
+      station.zoneGeneratorKwh = sanitized;
+    }
     station.updatedAt = new Date().toISOString();
     saveStore(store);
     res.json({ station });
   });
+
+  // Diesel & Operating Expenses (Profit & Loss Ledger)
+  app.post('/api/stations/:stationId/expenses', requireStaff, (req, res) => {
+    const session = (req as Request & { session: SessionPayload }).session;
+    if (session.role === 'collector') {
+      res.status(403).json({
+        error: 'تسجيل مصاريف الديزل والربح والخسارة مخصص لمدير المحطة فقط.',
+      });
+      return;
+    }
+    const station = store.stations[req.params.stationId];
+    if (!station) {
+      res.status(404).json({ error: 'المحطة غير موجودة.' });
+      return;
+    }
+    const bucket = getBucket(station.stationId);
+    const categoryRaw = String(req.body?.category ?? 'diesel');
+    const category: DieselExpenseRecord['category'] =
+      categoryRaw === 'oil_maintenance' ||
+      categoryRaw === 'salaries' ||
+      categoryRaw === 'other'
+        ? categoryRaw
+        : 'diesel';
+
+    const liters =
+      typeof req.body?.liters === 'number' && Number.isFinite(req.body.liters)
+        ? Math.max(0, req.body.liters)
+        : undefined;
+    const pricePerLiterYer =
+      typeof req.body?.pricePerLiterYer === 'number' &&
+      Number.isFinite(req.body.pricePerLiterYer)
+        ? Math.max(0, req.body.pricePerLiterYer)
+        : undefined;
+    const amountYer = Math.max(0, Number(req.body?.amountYer) || 0);
+    if (amountYer <= 0) {
+      res.status(400).json({ error: 'يرجى إدخال مبلغ صحيح أكبر من الصفر.' });
+      return;
+    }
+
+    const id = normalizeId(req.body?.id || `exp_${Date.now()}_${crypto.randomBytes(2).toString('hex')}`);
+    const now = new Date().toISOString();
+    const date =
+      typeof req.body?.date === 'string' && req.body.date.trim()
+        ? req.body.date.trim().slice(0, 20)
+        : now.slice(0, 10);
+
+    const record: DieselExpenseRecord = {
+      id,
+      stationId: station.stationId,
+      date,
+      category,
+      ...(typeof liters === 'number' && liters > 0 ? { liters } : {}),
+      ...(typeof pricePerLiterYer === 'number' && pricePerLiterYer > 0
+        ? { pricePerLiterYer }
+        : {}),
+      amountYer,
+      note: String(req.body?.note ?? '').trim().slice(0, 240),
+      createdBy: session.name,
+      createdAt: now,
+    };
+
+    if (!bucket.expenses) bucket.expenses = {};
+    bucket.expenses[id] = record;
+    saveStore(store);
+    res.json({ expense: record });
+  });
+
+  app.delete(
+    '/api/stations/:stationId/expenses/:expenseId',
+    requireStaff,
+    (req, res) => {
+      const session = (req as Request & { session: SessionPayload }).session;
+      if (session.role === 'collector') {
+        res.status(403).json({ error: 'غير مصرح بحذف المصاريف.' });
+        return;
+      }
+      const station = store.stations[req.params.stationId];
+      if (!station) {
+        res.status(404).json({ error: 'المحطة غير موجودة.' });
+        return;
+      }
+      const bucket = getBucket(station.stationId);
+      const expenseId = normalizeId(req.params.expenseId);
+      if (bucket.expenses && bucket.expenses[expenseId]) {
+        delete bucket.expenses[expenseId];
+        saveStore(store);
+      }
+      res.json({ deleted: true, id: expenseId });
+    },
+  );
+
+  // Live Collector GPS Tracking Heartbeat
+  app.post(
+    '/api/stations/:stationId/collector-location',
+    requireStaff,
+    (req, res) => {
+      const session = (req as Request & { session: SessionPayload }).session;
+      const station = store.stations[req.params.stationId];
+      if (!station) {
+        res.status(404).json({ error: 'المحطة غير موجودة.' });
+        return;
+      }
+      const lat = Number(req.body?.lat);
+      const lng = Number(req.body?.lng);
+      if (
+        !Number.isFinite(lat) ||
+        !Number.isFinite(lng) ||
+        lat < -90 ||
+        lat > 90 ||
+        lng < -180 ||
+        lng > 180
+      ) {
+        res.status(400).json({ error: 'إحداثيات الموقع غير صالحة.' });
+        return;
+      }
+      const bucket = getBucket(station.stationId);
+      if (!bucket.collectorLocations) bucket.collectorLocations = {};
+      const collectorCode = normalizeCode(
+        String(req.body?.collectorCode ?? session.code ?? session.name),
+      );
+      const loc: CollectorLocationRecord = {
+        collectorCode,
+        collectorName: String(req.body?.collectorName ?? session.name).slice(0, 100),
+        lat,
+        lng,
+        ...(typeof req.body?.accuracy === 'number' &&
+        Number.isFinite(req.body.accuracy)
+          ? { accuracy: Math.round(req.body.accuracy) }
+          : {}),
+        ...(req.body?.lastSubscriberName
+          ? { lastSubscriberName: String(req.body.lastSubscriberName).slice(0, 120) }
+          : {}),
+        ...(req.body?.lastMeterNumber
+          ? { lastMeterNumber: String(req.body.lastMeterNumber).slice(0, 60) }
+          : {}),
+        ...(req.body?.zoneStreet
+          ? { zoneStreet: String(req.body.zoneStreet).slice(0, 120) }
+          : {}),
+        updatedAt: new Date().toISOString(),
+      };
+      bucket.collectorLocations[collectorCode] = loc;
+      saveStore(store);
+      res.json({ ok: true, location: loc });
+    },
+  );
 
   app.patch(
     '/api/stations/:stationId/collectors/:code',
@@ -1683,10 +1903,42 @@ If no clear electric meter kWh reading is visible in the image, set isClearMeter
             ? { zeroConsumptionNote: String(rd.zeroConsumptionNote).slice(0, 120) }
             : {}),
           highConsumptionWarning: Boolean(rd?.highConsumptionWarning),
+          ...(typeof rd?.gpsLat === 'number' && Number.isFinite(rd.gpsLat)
+            ? { gpsLat: rd.gpsLat }
+            : {}),
+          ...(typeof rd?.gpsLng === 'number' && Number.isFinite(rd.gpsLng)
+            ? { gpsLng: rd.gpsLng }
+            : {}),
+          ...(typeof rd?.gpsAccuracy === 'number' && Number.isFinite(rd.gpsAccuracy)
+            ? { gpsAccuracy: Math.round(rd.gpsAccuracy) }
+            : {}),
           collectorCode: session.code || session.role,
           collectorName: String(rd?.collectorName ?? session.name),
           recordedAt: String(rd?.recordedAt ?? new Date().toISOString()),
         };
+
+        if (
+          typeof rd?.gpsLat === 'number' &&
+          Number.isFinite(rd.gpsLat) &&
+          typeof rd?.gpsLng === 'number' &&
+          Number.isFinite(rd.gpsLng)
+        ) {
+          if (!bucket.collectorLocations) bucket.collectorLocations = {};
+          const colKey = normalizeCode(session.code || session.name);
+          bucket.collectorLocations[colKey] = {
+            collectorCode: colKey,
+            collectorName: String(rd?.collectorName ?? session.name),
+            lat: rd.gpsLat,
+            lng: rd.gpsLng,
+            ...(typeof rd?.gpsAccuracy === 'number'
+              ? { accuracy: Math.round(rd.gpsAccuracy) }
+              : {}),
+            lastSubscriberName: sub.subscriberName,
+            lastMeterNumber: sub.meterNumber,
+            zoneStreet: sub.zoneStreet,
+            updatedAt: String(rd?.recordedAt ?? new Date().toISOString()),
+          };
+        }
         syncedCount++;
       }
     }

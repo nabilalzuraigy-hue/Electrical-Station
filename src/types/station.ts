@@ -43,9 +43,37 @@ export interface StationConfig {
   maxSubscribers: number;
   ownerUid: string;
   updatedAt: string;
+  zoneGeneratorKwh?: Record<string, number>;
   subscriberCount?: number;
   readingCount?: number;
   receiptCount?: number;
+}
+
+export type ExpenseCategory = 'diesel' | 'oil_maintenance' | 'salaries' | 'other';
+
+export interface DieselExpenseEntry {
+  id: string;
+  stationId: string;
+  date: string;
+  category: ExpenseCategory;
+  liters?: number;
+  pricePerLiterYer?: number;
+  amountYer: number;
+  note: string;
+  createdBy?: string;
+  createdAt: string;
+}
+
+export interface CollectorLocationRecord {
+  collectorCode: string;
+  collectorName: string;
+  lat: number;
+  lng: number;
+  accuracy?: number;
+  lastSubscriberName?: string;
+  lastMeterNumber?: string;
+  zoneStreet?: string;
+  updatedAt: string;
 }
 
 export interface CollectorProfile {
@@ -153,6 +181,9 @@ export interface MeterReading {
   isClosedHouseZero?: boolean;
   zeroConsumptionNote?: string;
   highConsumptionWarning?: boolean;
+  gpsLat?: number;
+  gpsLng?: number;
+  gpsAccuracy?: number;
   collectorUid: string;
   collectorName: string;
   recordedAt: string;

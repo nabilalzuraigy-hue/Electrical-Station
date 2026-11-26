@@ -2,8 +2,11 @@ import * as XLSX from 'xlsx';
 import { idbGet, idbSet } from './indexedDbCache';
 import type {
   AccessCodeRecord,
+  CollectorLocationRecord,
   CollectorPermissions,
   CollectorProfile,
+  DieselExpenseEntry,
+  ExpenseCategory,
   ManagerAlert,
   MeterReading,
   PaymentReceipt,
@@ -22,6 +25,8 @@ export interface StationLocalState {
   readings: MeterReading[];
   receipts: PaymentReceipt[];
   alerts?: ManagerAlert[];
+  expenses?: DieselExpenseEntry[];
+  collectorLocations?: CollectorLocationRecord[];
 }
 
 export function sanitizeFirestoreId(raw: string): string {
@@ -298,6 +303,8 @@ function mapServerState(raw: {
   readings?: MeterReading[];
   receipts?: PaymentReceipt[];
   alerts?: ManagerAlert[];
+  expenses?: DieselExpenseEntry[];
+  collectorLocations?: CollectorLocationRecord[];
 }): StationLocalState {
   const collectors: CollectorProfile[] = (raw.collectors ?? []).map((c) => ({
     id: c.code,
@@ -331,6 +338,8 @@ function mapServerState(raw: {
       ...al,
       syncStatus: 'synced',
     })),
+    expenses: raw.expenses ?? [],
+    collectorLocations: raw.collectorLocations ?? [],
   };
 }
 
@@ -417,6 +426,8 @@ export async function loginUnified(
           readings?: MeterReading[];
           receipts?: PaymentReceipt[];
           alerts?: ManagerAlert[];
+          expenses?: DieselExpenseEntry[];
+          collectorLocations?: CollectorLocationRecord[];
         };
       }
     | { kind: 'subscriber'; result: SubscriberLookupResult }
@@ -461,6 +472,8 @@ export async function loginWithAccessCode(codeInput: string): Promise<{
       readings?: MeterReading[];
       receipts?: PaymentReceipt[];
       alerts?: ManagerAlert[];
+      expenses?: DieselExpenseEntry[];
+      collectorLocations?: CollectorLocationRecord[];
     };
   }>('/api/auth/code', {
     method: 'POST',
@@ -490,6 +503,8 @@ export async function refreshStationState(
     readings?: MeterReading[];
     receipts?: PaymentReceipt[];
     alerts?: ManagerAlert[];
+    expenses?: DieselExpenseEntry[];
+    collectorLocations?: CollectorLocationRecord[];
   }>(`/api/stations/${encodeURIComponent(stationId)}/state`, {}, staffToken);
 
   const cloudState = mapServerState(res);
@@ -512,10 +527,87 @@ export async function saveStationTariffInCloud(
         kwhPriceYer: station.kwhPriceYer,
         minimumFeeYer: station.minimumFeeYer,
         mainGeneratorKwh: station.mainGeneratorKwh,
+        ...(station.zoneGeneratorKwh
+          ? { zoneGeneratorKwh: station.zoneGeneratorKwh }
+          : {}),
       }),
     },
     staffToken,
   );
+}
+
+export async function addDieselExpenseInCloud(params: {
+  staffToken: string;
+  stationId: string;
+  date: string;
+  category: ExpenseCategory;
+  liters?: number;
+  pricePerLiterYer?: number;
+  amountYer: number;
+  note: string;
+}): Promise<DieselExpenseEntry> {
+  const res = await apiRequest<{ expense: DieselExpenseEntry }>(
+    `/api/stations/${encodeURIComponent(params.stationId)}/expenses`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        date: params.date,
+        category: params.category,
+        ...(typeof params.liters === 'number' ? { liters: params.liters } : {}),
+        ...(typeof params.pricePerLiterYer === 'number'
+          ? { pricePerLiterYer: params.pricePerLiterYer }
+          : {}),
+        amountYer: params.amountYer,
+        note: params.note,
+      }),
+    },
+    params.staffToken,
+  );
+  return res.expense;
+}
+
+export async function deleteDieselExpenseInCloud(params: {
+  staffToken: string;
+  stationId: string;
+  expenseId: string;
+}): Promise<void> {
+  await apiRequest(
+    `/api/stations/${encodeURIComponent(params.stationId)}/expenses/${encodeURIComponent(params.expenseId)}`,
+    { method: 'DELETE' },
+    params.staffToken,
+  );
+}
+
+export async function sendCollectorLocationInCloud(params: {
+  staffToken: string;
+  stationId: string;
+  collectorCode?: string;
+  collectorName: string;
+  lat: number;
+  lng: number;
+  accuracy?: number;
+  lastSubscriberName?: string;
+  lastMeterNumber?: string;
+  zoneStreet?: string;
+}): Promise<CollectorLocationRecord> {
+  const res = await apiRequest<{ location: CollectorLocationRecord }>(
+    `/api/stations/${encodeURIComponent(params.stationId)}/collector-location`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        collectorCode: params.collectorCode,
+        collectorName: params.collectorName,
+        lat: params.lat,
+        lng: params.lng,
+        accuracy: params.accuracy,
+        lastSubscriberName: params.lastSubscriberName,
+        lastMeterNumber: params.lastMeterNumber,
+        zoneStreet: params.zoneStreet,
+      }),
+    },
+    params.staffToken,
+  );
+  return res.location;
 }
 
 export async function updateCollectorInCloud(params: {

@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
+  BarChart3,
   BellRing,
   Check,
   Download,
@@ -17,9 +18,12 @@ import {
   refreshStationState,
   resolveManagerAlert,
   saveStationLocalState,
+  saveStationTariffInCloud,
   updateCollectorInCloud,
   type StationLocalState,
 } from '../lib/offlineDb';
+import { CollectorTrackingMap } from './CollectorTrackingMap';
+import { DieselProfitLossSection } from './DieselProfitLossSection';
 import { formatCompactYer, formatKwh, formatYer } from '../lib/formatters';
 import type {
   CollectorPermissions,
@@ -54,6 +58,20 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [zoneFilter, setZoneFilter] = useState<string>('all');
+  const [lossZoneFilter, setLossZoneFilter] = useState<string>('all');
+  const [zoneShareDrafts, setZoneShareDrafts] = useState<Record<string, string>>(
+    () => {
+      const init: Record<string, string> = {};
+      Object.entries(state.station.zoneGeneratorKwh ?? {}).forEach(([k, v]) => {
+        init[k] = String(v);
+      });
+      return init;
+    },
+  );
+  const [savingZoneShares, setSavingZoneShares] = useState(false);
+  const [zoneShareSavedNotice, setZoneShareSavedNotice] = useState<string | null>(
+    null,
+  );
   const [alertFilter, setAlertFilter] = useState<'pending' | 'all'>('pending');
   const [tariffSaved, setTariffSaved] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -108,9 +126,122 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
 
   const zones = useMemo(() => {
     const set = new Set<string>();
-    state.subscribers.forEach((s) => set.add(s.zoneStreet));
+    state.subscribers.forEach((s) => set.add(s.zoneStreet || 'عام'));
     return Array.from(set);
   }, [state.subscribers]);
+
+  const zoneLossRows = useMemo(() => {
+    const subsByZone = new Map<string, number>();
+    const subToZone = new Map<string, string>();
+
+    state.subscribers.forEach((sub) => {
+      const z = sub.zoneStreet?.trim() || 'عام';
+      subToZone.set(sub.id, z);
+      subsByZone.set(z, (subsByZone.get(z) ?? 0) + 1);
+    });
+
+    const soldByZone = new Map<string, number>();
+    state.readings.forEach((rd) => {
+      if (rd.approvalStatus === 'rejected') return;
+      const z = subToZone.get(rd.subscriberId) || 'عام';
+      soldByZone.set(z, (soldByZone.get(z) ?? 0) + rd.consumptionKwh);
+    });
+
+    const customShares = state.station.zoneGeneratorKwh ?? {};
+    const allZoneNames = Array.from(
+      new Set([...subsByZone.keys(), ...Object.keys(customShares)]),
+    );
+
+    let customTotalKwh = 0;
+    let autoSubscribersTotal = 0;
+
+    allZoneNames.forEach((z) => {
+      const draftStr = zoneShareDrafts[z];
+      const hasDraft = draftStr !== undefined && draftStr.trim() !== '';
+      const val = hasDraft
+        ? Number(draftStr)
+        : customShares[z];
+      if (typeof val === 'number' && Number.isFinite(val) && val >= 0) {
+        customTotalKwh += val;
+      } else {
+        autoSubscribersTotal += subsByZone.get(z) ?? 0;
+      }
+    });
+
+    const remainingPool = Math.max(
+      0,
+      state.station.mainGeneratorKwh - customTotalKwh,
+    );
+
+    const rows = allZoneNames.map((zoneName) => {
+      const subscribersCount = subsByZone.get(zoneName) ?? 0;
+      const soldKwh =
+        Math.round((soldByZone.get(zoneName) ?? 0) * 100) / 100;
+
+      const draftStr = zoneShareDrafts[zoneName];
+      const hasDraft = draftStr !== undefined && draftStr.trim() !== '';
+      const rawCustom = hasDraft ? Number(draftStr) : customShares[zoneName];
+      const isCustomShare =
+        typeof rawCustom === 'number' &&
+        Number.isFinite(rawCustom) &&
+        rawCustom >= 0;
+
+      const generatorShareKwh = isCustomShare
+        ? Math.round(rawCustom * 100) / 100
+        : autoSubscribersTotal > 0
+          ? Math.round(
+              (remainingPool * (subscribersCount / autoSubscribersTotal)) * 100,
+            ) / 100
+          : 0;
+
+      const lossKwh = Math.max(
+        0,
+        Math.round((generatorShareKwh - soldKwh) * 100) / 100,
+      );
+      const lossPercent =
+        generatorShareKwh > 0
+          ? Math.round(((lossKwh / generatorShareKwh) * 100) * 10) / 10
+          : 0;
+
+      const severity: 'ok' | 'warn' | 'critical' =
+        lossPercent > 20 ? 'critical' : lossPercent >= 10 ? 'warn' : 'ok';
+
+      return {
+        zoneName,
+        subscribersCount,
+        soldKwh,
+        generatorShareKwh,
+        isCustomShare,
+        lossKwh,
+        lossPercent,
+        severity,
+      };
+    });
+
+    // Always put critical (>20% theft alert) zones at the top, ordered by highest loss %
+    return rows.sort((a, b) => {
+      const aCrit = a.lossPercent > 20 ? 1 : 0;
+      const bCrit = b.lossPercent > 20 ? 1 : 0;
+      if (aCrit !== bCrit) return bCrit - aCrit;
+      return b.lossPercent - a.lossPercent;
+    });
+  }, [
+    state.subscribers,
+    state.readings,
+    state.station.mainGeneratorKwh,
+    state.station.zoneGeneratorKwh,
+    zoneShareDrafts,
+  ]);
+
+  const filteredZoneLossRows = useMemo(() => {
+    if (lossZoneFilter === 'all') return zoneLossRows;
+    return zoneLossRows.filter((r) => r.zoneName === lossZoneFilter);
+  }, [zoneLossRows, lossZoneFilter]);
+
+  const criticalLossZonesCount = useMemo(
+    () => zoneLossRows.filter((r) => r.lossPercent > 20).length,
+    [zoneLossRows],
+  );
 
   const filteredSubscribers = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -247,6 +378,41 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
     });
     setTariffSaved(true);
     setTimeout(() => setTariffSaved(false), 2500);
+  };
+
+  const handleSaveZoneShares = async () => {
+    setSavingZoneShares(true);
+    setZoneShareSavedNotice(null);
+    const nextMap: Record<string, number> = {};
+    Object.entries(zoneShareDrafts).forEach(([zoneName, rawVal]) => {
+      if (rawVal.trim() !== '') {
+        const parsed = Number(rawVal);
+        if (Number.isFinite(parsed) && parsed >= 0) {
+          nextMap[zoneName] = parsed;
+        }
+      }
+    });
+    const nextStation = {
+      ...state.station,
+      zoneGeneratorKwh: nextMap,
+      updatedAt: new Date().toISOString(),
+    };
+    const nextState: StationLocalState = {
+      ...state,
+      station: nextStation,
+    };
+    onUpdateState(nextState);
+    try {
+      await saveStationTariffInCloud(staffToken, nextStation);
+      setZoneShareSavedNotice('تم حفظ حصص المولد لكل حارة ومزامنتها بنجاح.');
+    } catch {
+      setZoneShareSavedNotice(
+        'تم حفظ حصص المولد محلياً — اضغط مزامنة عند توفر الاتصال.',
+      );
+    } finally {
+      setSavingZoneShares(false);
+      setTimeout(() => setZoneShareSavedNotice(null), 3500);
+    }
   };
 
   const handleToggleCollectorActive = async (collector: CollectorProfile) => {
@@ -389,11 +555,17 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
             </div>
             <div
               className={`text-xs mt-1 font-medium ${
-                metrics.lossPercent > 15 ? 'text-amber-700' : 'text-teal-700'
+                metrics.lossPercent > 20
+                  ? 'text-rose-700'
+                  : metrics.lossPercent >= 10
+                    ? 'text-amber-700'
+                    : 'text-teal-700'
               }`}
             >
-              عداد المولد: {formatKwh(metrics.mainGen)} · الفاقد{' '}
-              {metrics.lossPercent.toFixed(1)}%
+              عداد المولد: {formatKwh(metrics.mainGen)} · الإجمالي {metrics.lossPercent.toFixed(1)}%
+              {criticalLossZonesCount > 0
+                ? ` · ${criticalLossZonesCount} حارة فوق 20%!`
+                : ` · موزّع على ${zoneLossRows.length} حارة أدناه`}
             </div>
           </div>
         </div>
@@ -416,6 +588,155 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Zone-by-Zone Power Loss Breakdown Table */}
+      <section className="bg-white border border-slate-200 rounded-xl p-6 space-y-5">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-slate-200 pb-4">
+          <div>
+            <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+              <BarChart3 className="w-5 h-5 text-teal-700" />
+              الفاقد حسب الحارة / الشارع
+            </h2>
+            <p className="text-xs text-slate-600 mt-1">
+              تفصيل المباع مقابل حصة المولد لكل حارة لتحديد مناطق الفاقد أو السرقة بدقة (يمكنك تعديل حصة المولد يدوياً لكل حارة أو تركها موزعة نسبياً)
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <select
+              value={lossZoneFilter}
+              onChange={(e) => setLossZoneFilter(e.target.value)}
+              className="min-h-[44px] px-3 py-2 text-sm font-bold border border-slate-300 rounded-lg bg-white"
+            >
+              <option value="all">كل الحارات ({zoneLossRows.length})</option>
+              {zoneLossRows.map((row) => (
+                <option key={row.zoneName} value={row.zoneName}>
+                  {row.zoneName}
+                </option>
+              ))}
+            </select>
+
+            <button
+              type="button"
+              disabled={savingZoneShares}
+              onClick={() => void handleSaveZoneShares()}
+              className="min-h-[44px] px-4 py-2 text-xs font-bold bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 text-white rounded-lg whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              {savingZoneShares ? 'جاري الحفظ...' : 'حفظ حصص الحارات'}
+            </button>
+          </div>
+        </div>
+
+        {zoneShareSavedNotice && (
+          <div className="text-xs font-bold text-teal-800 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2">
+            {zoneShareSavedNotice}
+          </div>
+        )}
+
+        <div className="overflow-x-auto border border-slate-200 rounded-xl">
+          <table className="w-full text-sm text-right">
+            <thead className="bg-slate-50 text-slate-700 text-xs border-b border-slate-200">
+              <tr>
+                <th className="py-3 px-4 font-bold">اسم الحارة</th>
+                <th className="py-3 px-4 font-bold">عدد المشتركين</th>
+                <th className="py-3 px-4 font-bold">المباع بالكيلو</th>
+                <th className="py-3 px-4 font-bold">حصة المولد لها (ك.و.س)</th>
+                <th className="py-3 px-4 font-bold">كمية الفاقد بالكيلو</th>
+                <th className="py-3 px-4 font-bold">نسبة الفاقد %</th>
+                <th className="py-3 px-4 font-bold">التقييم / الحالة</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {filteredZoneLossRows.map((row) => {
+                const rowHighlight =
+                  row.severity === 'critical'
+                    ? 'bg-rose-50/70'
+                    : row.severity === 'warn'
+                      ? 'bg-amber-50/50'
+                      : 'hover:bg-slate-50/70';
+                const badgeClass =
+                  row.severity === 'critical'
+                    ? 'bg-rose-100 text-rose-900 border-rose-300'
+                    : row.severity === 'warn'
+                      ? 'bg-amber-100 text-amber-900 border-amber-300'
+                      : 'bg-emerald-100 text-emerald-900 border-emerald-300';
+                const statusLabel =
+                  row.severity === 'critical'
+                    ? 'يوجد سرقة محتملة - راجع الحارة'
+                    : row.severity === 'warn'
+                      ? 'انتبه'
+                      : 'سليم';
+
+                return (
+                  <tr key={row.zoneName} className={rowHighlight}>
+                    <td className="py-3 px-4 font-bold text-slate-900">
+                      {row.zoneName}
+                    </td>
+                    <td className="py-3 px-4 font-mono-nums font-semibold text-slate-800">
+                      {row.subscribersCount}
+                    </td>
+                    <td className="py-3 px-4 font-mono-nums font-bold text-slate-900">
+                      {formatKwh(row.soldKwh)}
+                    </td>
+                    <td className="py-3 px-4">
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="number"
+                          min={0}
+                          step="any"
+                          value={zoneShareDrafts[row.zoneName] ?? ''}
+                          onChange={(e) =>
+                            setZoneShareDrafts((prev) => ({
+                              ...prev,
+                              [row.zoneName]: e.target.value,
+                            }))
+                          }
+                          placeholder={String(row.generatorShareKwh)}
+                          className="w-28 min-h-[38px] px-2.5 py-1 text-sm font-bold font-mono-nums border border-slate-300 rounded-lg bg-white"
+                        />
+                        <span className="text-[11px] text-slate-500 whitespace-nowrap">
+                          {row.isCustomShare ? 'مخصص' : 'نسبي'}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="py-3 px-4 font-mono-nums font-bold text-slate-900">
+                      {formatKwh(row.lossKwh)}
+                    </td>
+                    <td
+                      className={`py-3 px-4 font-mono-nums font-extrabold ${
+                        row.severity === 'critical'
+                          ? 'text-rose-800'
+                          : row.severity === 'warn'
+                            ? 'text-amber-800'
+                            : 'text-emerald-800'
+                      }`}
+                    >
+                      {row.lossPercent.toFixed(1)}%
+                    </td>
+                    <td className="py-3 px-4">
+                      <span
+                        className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-lg border text-xs font-extrabold whitespace-nowrap ${badgeClass}`}
+                      >
+                        {statusLabel}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+              {filteredZoneLossRows.length === 0 && (
+                <tr>
+                  <td
+                    colSpan={7}
+                    className="py-8 text-center text-xs text-slate-500"
+                  >
+                    لا توجد بيانات حارات مسجلة لعرض الفاقد بعد.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
 
       {/* Suspicious Edits & Instant Notifications Queue */}
       <section className="bg-white border border-slate-200 rounded-xl p-6 space-y-5">
@@ -805,6 +1126,22 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
           </div>
         </section>
       </div>
+
+      {/* Diesel & Profit/Loss Section */}
+      <DieselProfitLossSection
+        state={state}
+        staffToken={staffToken}
+        onUpdateState={onUpdateState}
+      />
+
+      {/* Live Collector GPS Tracking Map */}
+      <CollectorTrackingMap
+        collectors={state.collectors}
+        collectorLocations={state.collectorLocations ?? []}
+        readings={state.readings}
+        onRefresh={handleRefreshFromServer}
+        refreshing={refreshing}
+      />
 
       {/* Subscribers Ledger Table */}
       <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">

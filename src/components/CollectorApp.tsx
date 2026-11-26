@@ -12,6 +12,7 @@ import {
   FileSpreadsheet,
   Flashlight,
   Lock,
+  MapPin,
   MessageCircle,
   MessageSquare,
   RefreshCw,
@@ -31,6 +32,7 @@ import {
   parseSubscribersExcelFile,
   refreshStationState,
   sanitizeFirestoreId,
+  sendCollectorLocationInCloud,
   sendInstantManagerAlert,
   type StationLocalState,
 } from '../lib/offlineDb';
@@ -174,6 +176,13 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   const [localExcelNotice, setLocalExcelNotice] = useState<string | null>(null);
   const [refreshingState, setRefreshingState] = useState(false);
   const [refreshNotice, setRefreshNotice] = useState<string | null>(null);
+  const [gpsEnabled, setGpsEnabled] = useState(false);
+  const [gpsPosition, setGpsPosition] = useState<{
+    lat: number;
+    lng: number;
+    accuracy?: number;
+  } | null>(null);
+  const [gpsStatusText, setGpsStatusText] = useState<string | null>(null);
 
   const onUpdateStateRef = useRef(onUpdateState);
   onUpdateStateRef.current = onUpdateState;
@@ -291,6 +300,58 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     (isManagerPreview ? 'مدير المحطة' : 'المحصّل الميداني');
   const resolvedCollectorCode =
     activeCollector?.code || activeCollector?.id || collectorAccess?.code || '';
+
+  useEffect(() => {
+    if (!gpsEnabled || isManagerPreview) {
+      if (!gpsEnabled) setGpsStatusText(null);
+      return;
+    }
+    if (typeof navigator === 'undefined' || !navigator.geolocation) {
+      setGpsStatusText('المتصفح أو الجهاز لا يدعم تحديد الموقع GPS.');
+      return;
+    }
+    setGpsStatusText('جاري تحديد موقعك الحالي عبر GPS...');
+    let lastSentAt = 0;
+    const watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        const coords = {
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+          accuracy: Math.round(pos.coords.accuracy || 0),
+        };
+        setGpsPosition(coords);
+        setGpsStatusText(
+          `مشاركة الموقع نشطة (${coords.lat.toFixed(5)}, ${coords.lng.toFixed(5)} · دقة ±${coords.accuracy} م)`,
+        );
+        const nowMs = Date.now();
+        if (isOnline && staffToken && nowMs - lastSentAt > 20000) {
+          lastSentAt = nowMs;
+          void sendCollectorLocationInCloud({
+            staffToken,
+            stationId: state.station.stationId,
+            collectorCode: resolvedCollectorCode || undefined,
+            collectorName: resolvedCollectorName,
+            lat: coords.lat,
+            lng: coords.lng,
+            accuracy: coords.accuracy,
+          }).catch(() => {});
+        }
+      },
+      () => {
+        setGpsStatusText('تعذر الوصول إلى GPS — تأكد من تفعيل الموقع ومنح الإذن للمتصفح.');
+      },
+      { enableHighAccuracy: true, maximumAge: 15000, timeout: 15000 },
+    );
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, [
+    gpsEnabled,
+    isManagerPreview,
+    isOnline,
+    staffToken,
+    state.station.stationId,
+    resolvedCollectorCode,
+    resolvedCollectorName,
+  ]);
 
   const permissions: CollectorPermissions = isManagerPreview
     ? {
@@ -730,11 +791,35 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         ? { zeroConsumptionNote: 'استهلاك صفر - بيت مغلق' }
         : {}),
       highConsumptionWarning: isHighConsumptionWarning,
+      ...(gpsPosition
+        ? {
+            gpsLat: gpsPosition.lat,
+            gpsLng: gpsPosition.lng,
+            ...(typeof gpsPosition.accuracy === 'number'
+              ? { gpsAccuracy: Math.round(gpsPosition.accuracy) }
+              : {}),
+          }
+        : {}),
       collectorUid,
       collectorName,
       recordedAt: now,
       syncStatus: 'pending',
     };
+
+    if (gpsEnabled && gpsPosition && isOnline && staffToken && !isManagerPreview) {
+      void sendCollectorLocationInCloud({
+        staffToken,
+        stationId: state.station.stationId,
+        collectorCode: resolvedCollectorCode || undefined,
+        collectorName,
+        lat: gpsPosition.lat,
+        lng: gpsPosition.lng,
+        accuracy: gpsPosition.accuracy,
+        lastSubscriberName: selectedSubscriber.subscriberName,
+        lastMeterNumber: selectedSubscriber.meterNumber,
+        zoneStreet: selectedSubscriber.zoneStreet,
+      }).catch(() => {});
+    }
 
     const alertsToQueue: ManagerAlert[] = [];
 
@@ -1057,17 +1142,34 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
 
           <div className="flex flex-wrap items-center justify-end gap-2">
             {!isManagerPreview && (
-              <button
-                type="button"
-                disabled={!isOnline || refreshingState}
-                onClick={() => void handleRefreshSubscribers()}
-                className="min-h-[44px] px-3.5 py-2 text-xs font-bold rounded-lg bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-50 text-slate-800 transition-colors inline-flex items-center gap-2 whitespace-nowrap cursor-pointer"
-              >
-                <RefreshCw
-                  className={`w-4 h-4 text-teal-700 ${refreshingState ? 'animate-spin' : ''}`}
-                />
-                {refreshingState ? 'جاري التحديث...' : 'تحديث الكشف'}
-              </button>
+              <>
+                <button
+                  type="button"
+                  onClick={() => setGpsEnabled((prev) => !prev)}
+                  className={`min-h-[44px] px-3.5 py-2 text-xs font-bold rounded-lg border transition-colors inline-flex items-center gap-2 whitespace-nowrap cursor-pointer ${
+                    gpsEnabled
+                      ? 'bg-emerald-50 border-emerald-300 text-emerald-900 hover:bg-emerald-100'
+                      : 'bg-white border-slate-300 text-slate-800 hover:bg-slate-50'
+                  }`}
+                >
+                  <MapPin
+                    className={`w-4 h-4 ${gpsEnabled ? 'text-emerald-700' : 'text-slate-600'}`}
+                  />
+                  {gpsEnabled ? 'إيقاف مشاركة GPS' : 'تفعيل تتبع GPS'}
+                </button>
+
+                <button
+                  type="button"
+                  disabled={!isOnline || refreshingState}
+                  onClick={() => void handleRefreshSubscribers()}
+                  className="min-h-[44px] px-3.5 py-2 text-xs font-bold rounded-lg bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-50 text-slate-800 transition-colors inline-flex items-center gap-2 whitespace-nowrap cursor-pointer"
+                >
+                  <RefreshCw
+                    className={`w-4 h-4 text-teal-700 ${refreshingState ? 'animate-spin' : ''}`}
+                  />
+                  {refreshingState ? 'جاري التحديث...' : 'تحديث الكشف'}
+                </button>
+              </>
             )}
 
             <button
@@ -1118,6 +1220,12 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         {refreshNotice && (
           <div className="text-xs font-medium text-teal-800 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2">
             {refreshNotice}
+          </div>
+        )}
+        {gpsStatusText && (
+          <div className="text-xs font-medium text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 flex items-center gap-2">
+            <MapPin className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
+            <span>{gpsStatusText}</span>
           </div>
         )}
       </div>
