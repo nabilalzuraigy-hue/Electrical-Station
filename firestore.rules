@@ -153,7 +153,7 @@ service cloud.firestore {
 
     function isValidStation(data) {
       return data.keys().hasAll(['stationName', 'kwhPriceYer', 'minimumFeeYer', 'mainGeneratorKwh', 'licenseCode', 'licenseStatus', 'maxCollectors', 'maxSubscribers', 'ownerUid', 'updatedAt'])
-        && data.keys().hasOnly(['stationName', 'kwhPriceYer', 'minimumFeeYer', 'mainGeneratorKwh', 'zoneGeneratorKwh', 'licenseCode', 'licenseStatus', 'maxCollectors', 'maxSubscribers', 'ownerUid', 'updatedAt'])
+        && data.keys().hasOnly(['stationName', 'kwhPriceYer', 'minimumFeeYer', 'mainGeneratorKwh', 'zoneGeneratorKwh', 'licenseCode', 'licenseStatus', 'maxCollectors', 'maxSubscribers', 'ownerUid', 'aiPhotoVerificationEnabled', 'aiPhotoVerificationSealed', 'aiPhotoVerificationSealedAt', 'updatedAt'])
         && data.stationName is string && data.stationName.size() >= 2 && data.stationName.size() <= 120
         && data.kwhPriceYer is number && data.kwhPriceYer >= 0 && data.kwhPriceYer <= 100000
         && data.minimumFeeYer is number && data.minimumFeeYer >= 0 && data.minimumFeeYer <= 500000
@@ -164,6 +164,9 @@ service cloud.firestore {
         && data.maxCollectors is number && data.maxCollectors >= 1 && data.maxCollectors <= 500
         && data.maxSubscribers is number && data.maxSubscribers >= 1 && data.maxSubscribers <= 100000
         && isValidId(data.ownerUid)
+        && (!('aiPhotoVerificationEnabled' in data) || data.aiPhotoVerificationEnabled is bool)
+        && (!('aiPhotoVerificationSealed' in data) || (data.aiPhotoVerificationSealed is string && data.aiPhotoVerificationSealed.size() <= 200))
+        && (!('aiPhotoVerificationSealedAt' in data) || data.aiPhotoVerificationSealedAt is timestamp)
         && data.updatedAt is timestamp && data.updatedAt == request.time;
     }
 
@@ -198,7 +201,7 @@ service cloud.firestore {
 
     function isValidReading(data) {
       return data.keys().hasAll(['subscriberId', 'meterNumber', 'subscriberName', 'previousReading', 'currentReading', 'consumptionKwh', 'kwhPriceYer', 'currentBillYer', 'previousDebtYer', 'totalDueYer', 'photoUrl', 'photoSizeKb', 'collectorUid', 'collectorName', 'recordedAt', 'createdAt'])
-        && data.keys().hasOnly(['subscriberId', 'meterNumber', 'subscriberName', 'previousReading', 'currentReading', 'consumptionKwh', 'kwhPriceYer', 'currentBillYer', 'previousDebtYer', 'totalDueYer', 'photoUrl', 'photoSizeKb', 'collectorUid', 'collectorName', 'recordedAt', 'createdAt'])
+        && data.keys().hasOnly(['subscriberId', 'meterNumber', 'subscriberName', 'previousReading', 'currentReading', 'consumptionKwh', 'kwhPriceYer', 'currentBillYer', 'previousDebtYer', 'totalDueYer', 'photoUrl', 'photoSizeKb', 'hasLocalPhoto', 'aiVerificationStatus', 'aiDetectedReading', 'aiConfidence', 'aiVerificationReason', 'collectorUid', 'collectorName', 'recordedAt', 'createdAt'])
         && isValidId(data.subscriberId)
         && data.meterNumber is string && data.meterNumber.size() >= 2 && data.meterNumber.size() <= 40
         && data.subscriberName is string && data.subscriberName.size() >= 2 && data.subscriberName.size() <= 120
@@ -209,8 +212,13 @@ service cloud.firestore {
         && data.currentBillYer is number && data.currentBillYer >= 0
         && data.previousDebtYer is number && data.previousDebtYer >= 0
         && data.totalDueYer is number && data.totalDueYer >= 0
-        && data.photoUrl is string && data.photoUrl.size() <= 220000
+        && data.photoUrl is string && data.photoUrl.size() == 0
         && data.photoSizeKb is number && data.photoSizeKb >= 0 && data.photoSizeKb <= 200
+        && (!('hasLocalPhoto' in data) || data.hasLocalPhoto is bool)
+        && (!('aiVerificationStatus' in data) || data.aiVerificationStatus in ['not_checked', 'matched', 'mismatch', 'unreadable', 'pending_offline'])
+        && (!('aiDetectedReading' in data) || data.aiDetectedReading is number)
+        && (!('aiConfidence' in data) || (data.aiConfidence is number && data.aiConfidence >= 0 && data.aiConfidence <= 1))
+        && (!('aiVerificationReason' in data) || (data.aiVerificationReason is string && data.aiVerificationReason.size() <= 300))
         && isValidId(data.collectorUid)
         && data.collectorName is string && data.collectorName.size() >= 1 && data.collectorName.size() <= 120
         && data.recordedAt is timestamp
@@ -246,20 +254,26 @@ service cloud.firestore {
         && data.currentBillYer is number && data.currentBillYer >= 0
         && data.previousDebtYer is number && data.previousDebtYer >= 0
         && data.totalDueYer is number && data.totalDueYer >= 0
-        && data.lastReadingPhotoUrl is string && data.lastReadingPhotoUrl.size() <= 220000
+        && data.lastReadingPhotoUrl is string && data.lastReadingPhotoUrl.size() == 0
         && data.lastPaymentYer is number && data.lastPaymentYer >= 0
         && data.updatedAt is timestamp && data.updatedAt == request.time;
     }
 
     function isValidManagerAlert(data) {
       return data.keys().hasAll(['stationId', 'subscriberId', 'meterNumber', 'subscriberName', 'collectorName', 'message', 'severity', 'resolved', 'createdAt'])
-        && data.keys().hasOnly(['stationId', 'subscriberId', 'meterNumber', 'subscriberName', 'collectorCode', 'collectorName', 'message', 'severity', 'resolved', 'createdAt'])
+        && data.keys().hasOnly(['stationId', 'subscriberId', 'meterNumber', 'subscriberName', 'collectorCode', 'collectorName', 'alertType', 'editedReading', 'aiDetectedReading', 'aiConfidence', 'aiVerificationReason', 'hasLocalPhoto', 'message', 'severity', 'resolved', 'createdAt'])
         && isValidId(data.stationId)
         && isValidId(data.subscriberId)
         && data.meterNumber is string && data.meterNumber.size() >= 2 && data.meterNumber.size() <= 40
         && data.subscriberName is string && data.subscriberName.size() >= 2 && data.subscriberName.size() <= 120
         && (!('collectorCode' in data) || (data.collectorCode is string && data.collectorCode.size() <= 60))
         && data.collectorName is string && data.collectorName.size() >= 1 && data.collectorName.size() <= 120
+        && (!('alertType' in data) || data.alertType in ['photo_mismatch', 'lower_reading', 'high_consumption'])
+        && (!('editedReading' in data) || data.editedReading is number)
+        && (!('aiDetectedReading' in data) || data.aiDetectedReading is number)
+        && (!('aiConfidence' in data) || (data.aiConfidence is number && data.aiConfidence >= 0 && data.aiConfidence <= 1))
+        && (!('aiVerificationReason' in data) || (data.aiVerificationReason is string && data.aiVerificationReason.size() <= 300))
+        && (!('hasLocalPhoto' in data) || data.hasLocalPhoto is bool)
         && data.message is string && data.message.size() >= 2 && data.message.size() <= 500
         && data.severity in ['warning', 'critical']
         && data.resolved is bool
@@ -297,7 +311,7 @@ service cloud.firestore {
       allow update, delete: if isValidId(uid) && isAdmin();
     }
 
-    // Developer Admin Cloud Vault: ONLY the Developer Admin can read, write, or delete backup snapshots
+    // Developer Admin Cloud Vault: ONLY the Developer Admin can read, write, or delete backup snapshots (text/numeric data only, no meter photos)
     match /adminVault/{docId} {
       allow get, list: if isValidId(docId) && isAdmin();
       allow create, update: if isValidId(docId) && isAdmin() && (
@@ -396,6 +410,9 @@ service cloud.firestore {
           (
             incoming().ownerUid == request.auth.uid
             && incoming().licenseStatus == 'active'
+            && !('aiPhotoVerificationEnabled' in incoming())
+            && !('aiPhotoVerificationSealed' in incoming())
+            && !('aiPhotoVerificationSealedAt' in incoming())
             && exists(/databases/$(database)/documents/licenses/$(incoming().licenseCode))
             && get(/databases/$(database)/documents/licenses/$(incoming().licenseCode)).data.stationId == stationId
             && get(/databases/$(database)/documents/licenses/$(incoming().licenseCode)).data.status == 'unused'
@@ -405,7 +422,7 @@ service cloud.firestore {
         && incoming().ownerUid == existing().ownerUid
         && incoming().licenseCode == existing().licenseCode
         && (
-          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['stationName', 'licenseStatus', 'maxCollectors', 'maxSubscribers', 'updatedAt'])) ||
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['stationName', 'licenseStatus', 'maxCollectors', 'maxSubscribers', 'aiPhotoVerificationEnabled', 'aiPhotoVerificationSealed', 'aiPhotoVerificationSealedAt', 'updatedAt'])) ||
           (existing().ownerUid == request.auth.uid && existing().licenseStatus == 'active' && incoming().diff(existing()).affectedKeys().hasOnly(['stationName', 'kwhPriceYer', 'minimumFeeYer', 'mainGeneratorKwh', 'zoneGeneratorKwh', 'updatedAt']))
         );
       allow delete: if isValidId(stationId) && isAdmin();

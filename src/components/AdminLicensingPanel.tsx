@@ -16,6 +16,7 @@ import {
   PlusCircle,
   RefreshCw,
   ShieldCheck,
+  Sparkles,
   Trash2,
   Upload,
   UserPlus,
@@ -40,6 +41,7 @@ import {
   parseSubscribersExcelFile,
   restoreAdminBackup,
   toggleAccessCodeAdmin,
+  toggleStationAiVerificationAdmin,
   toggleStationStatusAdmin,
   uploadSubscribersChunkedAdmin,
 } from '../lib/offlineDb';
@@ -96,6 +98,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
   const [deletingCode, setDeletingCode] = useState<string | null>(null);
   const [confirmDeleteStationId, setConfirmDeleteStationId] = useState<string | null>(null);
   const [deletingStationId, setDeletingStationId] = useState<string | null>(null);
+  const [togglingAiStationId, setTogglingAiStationId] = useState<string | null>(null);
   const [brochureOpen, setBrochureOpen] = useState(false);
 
   // Firebase Auth & Cloud Firestore Vault State
@@ -477,10 +480,40 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
         st.licenseStatus === 'active' ? 'suspended' : 'active',
       );
       await loadAdminData();
+      void syncBackupToFirestoreSilently();
     } catch (err) {
       setFeedback(
         err instanceof Error ? err.message : 'تعذر تحديث حالة المحطة.',
       );
+    }
+  };
+
+  const handleToggleAiVerification = async (st: StationConfig) => {
+    if (!adminToken) return;
+    const nextEnabled = !st.aiPhotoVerificationEnabled;
+    setTogglingAiStationId(st.stationId);
+    setFeedback(null);
+    try {
+      const updated = await toggleStationAiVerificationAdmin(
+        adminToken,
+        st.stationId,
+        nextEnabled,
+      );
+      setFeedback(
+        updated.station.aiPhotoVerificationEnabled
+          ? `تم تفعيل وتشفير ميزة «مطابقة صورة العداد مع رقم القراءة المحصل» عبر Gemini Vision-AI لمحطة «${st.stationName}».`
+          : `تم تعطيل ميزة مطابقة الصور بالذكاء الاصطناعي لمحطة «${st.stationName}».`,
+      );
+      await loadAdminData();
+      void syncBackupToFirestoreSilently();
+    } catch (err) {
+      setFeedback(
+        err instanceof Error
+          ? err.message
+          : 'تعذر تحديث إعداد مطابقة صورة العداد عبر Gemini Vision-AI.',
+      );
+    } finally {
+      setTogglingAiStationId(null);
     }
   };
 
@@ -892,7 +925,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
               <span dir="ltr" className="font-mono-nums font-bold text-slate-800">
                 {FIREBASE_PROJECT_ID} / {FIREBASE_DATABASE_ID}
               </span>{' '}
-              — تحفظ الأكواد المفعلة والمشتركين والبيانات في السحابة بشكل دائم لا يتأثر بأي تحديث أو إعادة تشغيل.
+              — تحفظ الأكواد المفعلة والمشتركين ونصوص القراءات والأرقام والمتأخرات وسندات القبض في السحابة بشكل دائم لاستعادة التطبيق لحظياً عند فقدان الهاتف (دون رفع صور العدادات؛ الصور تبقى في ذاكرة هاتف المحصّل محلياً).
             </p>
           </div>
 
@@ -1498,6 +1531,9 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                 <th className="py-3 px-4 font-medium">القراءات</th>
                 <th className="py-3 px-4 font-medium">التعرفة</th>
                 <th className="py-3 px-4 font-medium">الحالة</th>
+                <th className="py-3 px-4 font-medium">
+                  مطابقة صورة العداد مع رقم القراءة (Gemini Vision-AI)
+                </th>
                 <th className="py-3 px-4 font-medium">إجراء (المطور فقط)</th>
               </tr>
             </thead>
@@ -1522,6 +1558,36 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                     ) : (
                       <span className="text-rose-700">موقوفة</span>
                     )}
+                  </td>
+                  <td className="py-3 px-4">
+                    <div className="flex flex-col items-start gap-1">
+                      <button
+                        type="button"
+                        disabled={togglingAiStationId === st.stationId}
+                        onClick={() => void handleToggleAiVerification(st)}
+                        className={`px-3 py-1.5 text-xs font-bold rounded-lg border inline-flex items-center gap-1.5 whitespace-nowrap cursor-pointer transition-colors ${
+                          st.aiPhotoVerificationEnabled
+                            ? 'border-emerald-300 bg-emerald-50 text-emerald-900 hover:bg-emerald-100'
+                            : 'border-slate-300 bg-slate-50 text-slate-700 hover:bg-slate-100'
+                        }`}
+                      >
+                        <Lock className="w-3.5 h-3.5" />
+                        <Sparkles className="w-3.5 h-3.5" />
+                        {togglingAiStationId === st.stationId
+                          ? 'جاري التشفير...'
+                          : st.aiPhotoVerificationEnabled
+                            ? 'مفعّل ومشفّر (AI Vision)'
+                            : 'معطّل (تفعيل AI Vision)'}
+                      </button>
+                      {st.aiPhotoVerificationEnabled && st.aiPhotoVerificationSealed && (
+                        <span
+                          dir="ltr"
+                          className="text-[10px] font-mono-nums text-emerald-700 truncate max-w-[190px]"
+                        >
+                          {st.aiPhotoVerificationSealed.slice(0, 22)}...
+                        </span>
+                      )}
+                    </div>
                   </td>
                   <td className="py-3 px-4">
                     <div className="flex flex-wrap items-center gap-2">
@@ -1573,7 +1639,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
               ))}
               {stations.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="py-8 text-center text-slate-500 text-xs">
+                  <td colSpan={7} className="py-8 text-center text-slate-500 text-xs">
                     لا توجد محطات بعد. ولّد أول كود مدير محطة من النموذج أعلاه ليتم إنشاء المحطة تلقائياً.
                   </td>
                 </tr>

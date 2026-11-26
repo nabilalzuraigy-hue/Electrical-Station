@@ -44,6 +44,9 @@ export interface StationConfig {
   ownerUid: string;
   updatedAt: string;
   zoneGeneratorKwh?: Record<string, number>;
+  aiPhotoVerificationEnabled?: boolean;
+  aiPhotoVerificationSealed?: string;
+  aiPhotoVerificationSealedAt?: string;
   subscriberCount?: number;
   readingCount?: number;
   receiptCount?: number;
@@ -100,6 +103,7 @@ export type ReadingApprovalStatus =
   | 'rejected';
 
 export type ManagerAlertType =
+  | 'photo_mismatch'
   | 'manual_edit'
   | 'high_consumption'
   | 'lower_reading';
@@ -129,6 +133,9 @@ export interface ManagerAlert {
   lowerReadingReason?: LowerReadingReason;
   newMeterNumber?: string;
   openingReading?: number;
+  aiDetectedReading?: number;
+  aiConfidence?: number;
+  aiVerificationReason?: string;
   photoUrl: string;
   createdAt: string;
   resolvedAt?: string;
@@ -181,6 +188,10 @@ export interface MeterReading {
   isClosedHouseZero?: boolean;
   zeroConsumptionNote?: string;
   highConsumptionWarning?: boolean;
+  aiVerificationStatus?: 'matched' | 'mismatch' | 'pending_offline' | 'skipped';
+  aiDetectedReading?: number;
+  aiConfidence?: number;
+  aiVerificationReason?: string;
   gpsLat?: number;
   gpsLng?: number;
   gpsAccuracy?: number;

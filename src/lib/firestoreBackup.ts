@@ -62,6 +62,43 @@ function countSubscribersInStationData(
   return total;
 }
 
+function stripPhotosFromStationBucket(bucket: unknown): unknown {
+  if (!bucket || typeof bucket !== 'object') return {};
+  const b = bucket as Record<string, unknown>;
+  const next: Record<string, unknown> = { ...b };
+
+  if (b.readings && typeof b.readings === 'object' && !Array.isArray(b.readings)) {
+    const cleanReadings: Record<string, unknown> = {};
+    for (const [k, rawRd] of Object.entries(b.readings as Record<string, unknown>)) {
+      if (rawRd && typeof rawRd === 'object') {
+        const rd = rawRd as Record<string, unknown>;
+        cleanReadings[k] = {
+          ...rd,
+          photoUrl: '',
+          hasLocalPhoto: Boolean(rd.hasLocalPhoto || rd.photoUrl),
+        };
+      }
+    }
+    next.readings = cleanReadings;
+  }
+
+  if (b.alerts && typeof b.alerts === 'object' && !Array.isArray(b.alerts)) {
+    const cleanAlerts: Record<string, unknown> = {};
+    for (const [k, rawAl] of Object.entries(b.alerts as Record<string, unknown>)) {
+      if (rawAl && typeof rawAl === 'object') {
+        const al = rawAl as Record<string, unknown>;
+        cleanAlerts[k] = {
+          ...al,
+          photoUrl: '',
+        };
+      }
+    }
+    next.alerts = cleanAlerts;
+  }
+
+  return next;
+}
+
 export async function saveAdminStoreToFirestore(
   backup: AdminStoreBackupPayload,
 ): Promise<{
@@ -79,7 +116,7 @@ export async function saveAdminStoreToFirestore(
   const partDocs: string[] = [];
 
   for (const stationId of stationIds) {
-    const bucket = backup.stationData?.[stationId] ?? {};
+    const bucket = stripPhotosFromStationBucket(backup.stationData?.[stationId] ?? {});
     const serialized = JSON.stringify(bucket);
     const parts = splitIntoChunks(serialized, MAX_CHUNK_CHARS);
 

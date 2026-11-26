@@ -34,6 +34,7 @@ import {
   sanitizeFirestoreId,
   sendCollectorLocationInCloud,
   sendInstantManagerAlert,
+  verifyMeterPhotoWithGemini,
   type StationLocalState,
 } from '../lib/offlineDb';
 import {
@@ -171,6 +172,8 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   const [saveSuccessNotice, setSaveSuccessNotice] = useState<string | null>(
     null,
   );
+  const [aiRedAlertNotice, setAiRedAlertNotice] = useState<string | null>(null);
+  const [verifyingWithAi, setVerifyingWithAi] = useState(false);
   const [savedInvoiceText, setSavedInvoiceText] = useState<string | null>(null);
   const [copiedInvoice, setCopiedInvoice] = useState(false);
   const [localExcelNotice, setLocalExcelNotice] = useState<string | null>(null);
@@ -463,6 +466,8 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     setPhotoStatus(null);
     setValidationError(null);
     setSaveSuccessNotice(null);
+    setAiRedAlertNotice(null);
+    setVerifyingWithAi(false);
     setSavedInvoiceText(null);
     setLowerModalOpen(false);
     setNewMeterNumberInput('');
@@ -831,10 +836,68 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
 
     const isManualWithoutOcr =
       reviewChoice === 'manual_edit' && ocrOriginalReading === null;
-    const requiresManagerApproval =
-      isManuallyEdited || isManualWithoutOcr || Boolean(options?.lowerReason);
     const effectivePhoto = options?.overridePhotoUrl || proofPhotoUrl;
     const effectiveKb = options?.overridePhotoKb || proofSizeKb;
+
+    // 1. Run Gemini Vision-AI photo-vs-reading verification when Admin-enabled
+    let aiVerificationStatus: MeterReading['aiVerificationStatus'] =
+      state.station.aiPhotoVerificationEnabled ? 'pending_offline' : 'skipped';
+    let aiDetectedReading: number | undefined;
+    let aiConfidence: number | undefined;
+    let aiVerificationReason: string | undefined;
+    let aiMismatchTriggered = false;
+    let aiServerAlert: ManagerAlert | null = null;
+
+    setAiRedAlertNotice(null);
+    if (
+      state.station.aiPhotoVerificationEnabled &&
+      effectivePhoto &&
+      isOnline &&
+      staffToken &&
+      !isManagerPreview
+    ) {
+      setVerifyingWithAi(true);
+      try {
+        const aiRes = await verifyMeterPhotoWithGemini({
+          staffToken,
+          stationId: state.station.stationId,
+          imageBase64: effectivePhoto,
+          claimedReading: activeFinalReading,
+          previousReading: prevReading,
+          subscriberId: selectedSubscriber.id,
+          subscriberName: selectedSubscriber.subscriberName,
+          meterNumber: selectedSubscriber.meterNumber,
+          readingId,
+          collectorName,
+        });
+        aiConfidence = aiRes.confidence;
+        if (aiRes.detectedReading !== null) {
+          aiDetectedReading = aiRes.detectedReading;
+        }
+        if (aiRes.matched) {
+          aiVerificationStatus = 'matched';
+        } else {
+          aiVerificationStatus = 'mismatch';
+          aiVerificationReason = aiRes.discrepancyReason;
+          aiMismatchTriggered = true;
+          if (aiRes.alert) {
+            aiServerAlert = { ...aiRes.alert, syncStatus: 'synced' };
+          }
+          setAiRedAlertNotice(
+            `تنبيه أحمر فوري (Gemini Vision-AI): ${aiRes.discrepancyReason || `صورة العداد (${aiRes.detectedReading ?? 'غير مقروءة'}) لا تطابق القراءة المدخلة (${activeFinalReading})`}`,
+          );
+        }
+      } catch {
+        aiVerificationStatus = 'pending_offline';
+      } finally {
+        setVerifyingWithAi(false);
+      }
+    }
+
+    // Manual edit by collector NO LONGER sends a manual_edit alert or blocks approval;
+    // only lower-than-previous readings or Gemini Vision-AI photo mismatch require manager review.
+    const requiresManagerApproval =
+      Boolean(options?.lowerReason) || aiMismatchTriggered;
 
     const newReading: MeterReading = {
       id: readingId,
@@ -848,9 +911,10 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       currentBillYer,
       previousDebtYer,
       totalDueYer,
+      // Kept strictly on collector's phone local memory (stripped before Firestore/cloud upload)
       photoUrl: effectivePhoto,
       photoSizeKb: effectiveKb,
-      hasLocalPhoto: true,
+      hasLocalPhoto: Boolean(effectivePhoto),
       readingSource:
         isManuallyEdited || isManualWithoutOcr ? 'manual_override' : 'camera_ocr',
       ocrConfidence: ocrResult?.confidence ?? 0,
@@ -870,6 +934,10 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         ? { zeroConsumptionNote: 'استهلاك صفر - بيت مغلق' }
         : {}),
       highConsumptionWarning: isHighConsumptionWarning,
+      aiVerificationStatus,
+      ...(typeof aiDetectedReading === 'number' ? { aiDetectedReading } : {}),
+      ...(typeof aiConfidence === 'number' ? { aiConfidence } : {}),
+      ...(aiVerificationReason ? { aiVerificationReason } : {}),
       ...(gpsPosition
         ? {
             gpsLat: gpsPosition.lat,
@@ -902,33 +970,8 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
 
     const alertsToQueue: ManagerAlert[] = [];
 
-    // 1) Immediate alert when collector manually entered/modified reading
-    if ((isManuallyEdited || isManualWithoutOcr) && !options?.lowerReason) {
-      alertsToQueue.push({
-        id: sanitizeFirestoreId(`al_edit_${Date.now()}`),
-        stationId: state.station.stationId,
-        alertType: 'manual_edit',
-        severity: 'critical',
-        status: 'pending',
-        readingId,
-        subscriberId: selectedSubscriber.id,
-        subscriberName: selectedSubscriber.subscriberName,
-        meterNumber: selectedSubscriber.meterNumber,
-        collectorName,
-        collectorCode: resolvedCollectorCode || undefined,
-        ...(ocrOriginalReading !== null ? { ocrOriginalReading } : {}),
-        editedReading: activeFinalReading,
-        previousReading: prevReading,
-        difference:
-          ocrOriginalReading !== null
-            ? Math.round((activeFinalReading - ocrOriginalReading) * 100) / 100
-            : Math.round((activeFinalReading - prevReading) * 100) / 100,
-        photoUrl: effectivePhoto,
-        createdAt: now,
-        syncStatus: 'pending',
-      });
-    } else if (options?.lowerReason) {
-      // 2) Immediate alert when reading is lower than previous (reason + photo)
+    // 1) Immediate alert ONLY when reading is lower than previous (manual_edit alert removed)
+    if (options?.lowerReason) {
       alertsToQueue.push({
         id: sanitizeFirestoreId(`al_low_${Date.now()}`),
         stationId: state.station.stationId,
@@ -952,13 +995,13 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         ...(typeof options.openingReading === 'number'
           ? { openingReading: options.openingReading }
           : {}),
-        photoUrl: effectivePhoto,
+        photoUrl: '',
         createdAt: now,
         syncStatus: 'pending',
       });
     }
 
-    // 3) Yellow alert if consumption > 3x last-3-months average
+    // 2) Yellow alert if consumption > 3x last-3-months average
     if (isHighConsumptionWarning) {
       alertsToQueue.push({
         id: sanitizeFirestoreId(`al_high_${Date.now() + 1}`),
@@ -976,14 +1019,14 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         previousReading: prevReading,
         consumptionKwh,
         avg3MonthsKwh,
-        photoUrl: effectivePhoto,
+        photoUrl: '',
         createdAt: now,
         syncStatus: 'pending',
       });
     }
 
-    // Instant dispatch when online so manager gets notified right away
-    let syncedAlerts: ManagerAlert[] = alertsToQueue;
+    // Instant dispatch when online so manager gets notified right away (text-only)
+    let syncedAlerts: ManagerAlert[] = aiServerAlert ? [aiServerAlert] : [];
     if (isOnline && staffToken && alertsToQueue.length > 0) {
       const updatedAlerts: ManagerAlert[] = [];
       for (const al of alertsToQueue) {
@@ -999,7 +1042,9 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
           updatedAlerts.push(al);
         }
       }
-      syncedAlerts = updatedAlerts;
+      syncedAlerts = [...syncedAlerts, ...updatedAlerts];
+    } else if (alertsToQueue.length > 0) {
+      syncedAlerts = [...syncedAlerts, ...alertsToQueue];
     }
 
     const nextReceipts = [...state.receipts];
@@ -1025,8 +1070,6 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       nextReceipts.unshift(newReceipt);
     }
 
-    // Only advance subscriber's official previousReading / currentReading if NO manager approval is needed,
-    // while always deducting any collected cash receipt from previousDebtYer immediately.
     const updatedSubscribers = state.subscribers.map((s) => {
       if (s.id !== selectedSubscriber.id) return s;
       if (requiresManagerApproval) {
@@ -1060,6 +1103,19 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
 
     setCashPaidInput('');
 
+    if (aiMismatchTriggered) {
+      const cashNote =
+        cashPaidYer > 0
+          ? ` وتم تسجيل وخصم سند القبض (${formatYer(cashPaidYer)}).`
+          : '';
+      setSaveSuccessNotice(
+        'تم حفظ القراءة محلياً وإرسال تنبيه أحمر فوري لمدير المحطة لعدم تطابق الصورة مع الرقم.' +
+          cashNote,
+      );
+      setSavedInvoiceText(null);
+      return;
+    }
+
     if (requiresManagerApproval) {
       const cashNote =
         cashPaidYer > 0
@@ -1067,8 +1123,8 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
           : '';
       setSaveSuccessNotice(
         (isOnline
-          ? 'تم إرسال القراءة والصورة للمراجعة إلى مدير المحطة.'
-          : 'تم حفظ القراءة المعلقة وإشعار المدير محلياً.') + cashNote,
+          ? 'تم إرسال قراءة العداد الأقل من السابقة لمراجعة مدير المحطة.'
+          : 'تم حفظ القراءة المعلقة محلياً.') + cashNote,
       );
       setSavedInvoiceText(null);
       return;
@@ -1076,12 +1132,14 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
 
     setSaveSuccessNotice(
       isClosedHouseZero
-        ? 'تم حفظ القراءة بنجاح (بيت مغلق).'
+        ? 'تم حفظ القراءة بنجاح (بيت مغلق) — الصورة محفوظة بهاتفك والنصوص متزامنة.'
         : isHighConsumptionWarning
           ? 'تم حفظ القراءة وإرسال تنبيه للمدير بسبب ارتفاع الاستهلاك.'
           : cashPaidYer > 0
             ? `تم حفظ القراءة وسند القبض (${formatYer(cashPaidYer)}). المتبقي: ${formatYer(remainingBalanceYer)}.`
-            : 'تم حفظ القراءة المعتمدة أوفلاين بنجاح.',
+            : aiVerificationStatus === 'matched'
+              ? 'تم التحقق بالذكاء الاصطناعي (Gemini Vision-AI) وحفظ القراءة بنجاح.'
+              : 'تم حفظ القراءة بنجاح (الصورة محفوظة بذاكرة الهاتف فقط).',
     );
 
     if (permissions.canSendInvoices) {
@@ -1266,7 +1324,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                   <RefreshCw
                     className={`w-4 h-4 text-teal-700 ${refreshingState ? 'animate-spin' : ''}`}
                   />
-                  {refreshingState ? 'جاري التحديث...' : 'تحديث الكشف'}
+                  {refreshingState ? 'جاري الاستعادة...' : 'استعادة / تحديث فوري'}
                 </button>
               </>
             )}
@@ -1316,6 +1374,17 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
           </div>
         </div>
 
+        {state.station.aiPhotoVerificationEnabled && (
+          <div className="text-xs font-bold text-slate-900 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 flex flex-wrap items-center justify-between gap-2">
+            <span className="inline-flex items-center gap-1.5">
+              <Lock className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
+              مطابقة صورة العداد مع رقم القراءة مفعّلة ومشفّرة (Gemini Vision-AI) — أي اختلاف يطلق تنبيهاً أحمر فورياً للمدير.
+            </span>
+            <span className="text-[11px] font-medium text-emerald-800">
+              الصور محفوظة بهاتفك محلياً فقط (النصوص في السحابة)
+            </span>
+          </div>
+        )}
         {refreshNotice && (
           <div className="text-xs font-medium text-teal-800 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2">
             {refreshNotice}
@@ -1728,8 +1797,8 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                           <div className="bg-white border border-amber-300 rounded-lg p-3 space-y-2">
                             <label className="block text-xs font-bold text-amber-900">
                               {ocrOriginalReading !== null
-                                ? 'أدخل القراءة المعدلة يدوياً (تُرسل لمراجعة مدير المحطة):'
-                                : 'أدخل قراءة العداد يدوياً (تُرسل مع الصورة لمراجعة مدير المحطة):'}
+                                ? 'أدخل القراءة المعدلة يدوياً:'
+                                : 'أدخل قراءة العداد يدوياً:'}
                             </label>
                             <input
                               type="number"
@@ -1743,8 +1812,8 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                               className="w-full min-h-[48px] px-3.5 py-2.5 text-lg sm:text-xl font-bold font-mono-nums border border-amber-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-500"
                             />
                             {isManuallyEdited && activeFinalReading !== null && (
-                              <p className="text-[11px] text-rose-700 font-medium">
-                                الأصلي ({ocrOriginalReading}) ← المعدل ({activeFinalReading})
+                              <p className="text-[11px] text-slate-600 font-medium">
+                                الأصلي ({ocrOriginalReading}) ← المدخل ({activeFinalReading})
                               </p>
                             )}
                           </div>
@@ -1757,7 +1826,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                         <div>
                           <label className="flex items-center gap-1.5 text-xs font-medium text-slate-700 mb-1">
                             <Lock className="w-3.5 h-3.5 text-teal-700" />
-                            القراءة النهائية للمراجعة
+                            القراءة النهائية المعتمدة
                           </label>
                           <div className="w-full min-h-[46px] px-3 py-2 text-base font-bold font-mono-nums border border-slate-300 bg-slate-100 text-slate-900 rounded-lg flex items-center justify-between">
                             <span>
@@ -1773,7 +1842,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                               reviewChoice === 'manual_edit') && (
                               <span className="text-[11px] font-sans font-medium text-teal-800">
                                 {reviewChoice === 'manual_edit'
-                                  ? 'إدخال يدوي (بانتظار المدير)'
+                                  ? 'إدخال يدوي'
                                   : 'مؤكدة'}
                               </span>
                             )}
@@ -1825,6 +1894,13 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                         <span>
                           تنبيه: الاستهلاك ({consumptionKwh} ك.و.س) أعلى من 3 أضعاف متوسط آخر 3 أشهر ({avg3MonthsKwh} ك.و.س).
                         </span>
+                      </div>
+                    )}
+
+                    {aiRedAlertNotice && (
+                      <div className="flex items-start gap-2.5 text-xs font-bold text-rose-900 bg-rose-100 border-2 border-rose-500 rounded-lg px-3.5 py-3">
+                        <ShieldAlert className="w-4 h-4 text-rose-700 shrink-0 mt-0.5" />
+                        <span>{aiRedAlertNotice}</span>
                       </div>
                     )}
 
@@ -1907,6 +1983,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                       type="submit"
                       disabled={
                         extractingReading ||
+                        verifyingWithAi ||
                         !(
                           (permissions.canCollectCash &&
                             cashPaidYer > 0 &&
@@ -1922,17 +1999,15 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                     >
                       {extractingReading
                         ? 'جاري قراءة العداد...'
-                        : permissions.canCollectCash &&
-                            cashPaidYer > 0 &&
-                            !proofPhotoUrl &&
-                            activeFinalReading === null
-                          ? `حفظ سند القبض وخصمه (${formatCompactYer(cashPaidYer)})`
-                          : isLowerThanPrev
-                            ? 'متابعة وتحديد سبب نقص القراءة'
-                            : isManuallyEdited ||
-                                (reviewChoice === 'manual_edit' &&
-                                  ocrOriginalReading === null)
-                              ? 'حفظ وإرسال إشعار التعديل لموافقة المدير'
+                        : verifyingWithAi
+                          ? 'جاري مطابقة الصورة عبر Gemini Vision-AI...'
+                          : permissions.canCollectCash &&
+                              cashPaidYer > 0 &&
+                              !proofPhotoUrl &&
+                              activeFinalReading === null
+                            ? `حفظ سند القبض وخصمه (${formatCompactYer(cashPaidYer)})`
+                            : isLowerThanPrev
+                              ? 'متابعة وتحديد سبب نقص القراءة'
                               : `حفظ القراءة ${cashPaidYer > 0 && permissions.canCollectCash ? 'وسند القبض ' : ''}أوفلاين`}
                     </button>
                   </form>

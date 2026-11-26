@@ -36,6 +36,9 @@ interface StationRecord {
   maxCollectors: number;
   maxSubscribers: number;
   zoneGeneratorKwh?: Record<string, number>;
+  aiPhotoVerificationEnabled?: boolean;
+  aiPhotoVerificationSealed?: string;
+  aiPhotoVerificationSealedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -81,6 +84,10 @@ interface MeterReadingRecord {
   isClosedHouseZero?: boolean;
   zeroConsumptionNote?: string;
   highConsumptionWarning?: boolean;
+  aiVerificationStatus?: 'matched' | 'mismatch' | 'pending_offline' | 'skipped';
+  aiDetectedReading?: number;
+  aiConfidence?: number;
+  aiVerificationReason?: string;
   gpsLat?: number;
   gpsLng?: number;
   gpsAccuracy?: number;
@@ -92,7 +99,7 @@ interface MeterReadingRecord {
 interface ManagerAlertRecord {
   id: string;
   stationId: string;
-  alertType: 'manual_edit' | 'high_consumption' | 'lower_reading';
+  alertType: 'photo_mismatch' | 'manual_edit' | 'high_consumption' | 'lower_reading';
   severity: 'critical' | 'warning';
   status: 'pending' | 'approved' | 'rejected';
   readingId: string;
@@ -110,6 +117,9 @@ interface ManagerAlertRecord {
   lowerReadingReason?: 'meter_replaced' | 'meter_reset' | 'previous_error';
   newMeterNumber?: string;
   openingReading?: number;
+  aiDetectedReading?: number;
+  aiConfidence?: number;
+  aiVerificationReason?: string;
   photoUrl: string;
   createdAt: string;
   resolvedAt?: string;
@@ -363,6 +373,56 @@ function verifySessionToken(token: string): SessionPayload | null {
   } catch {
     return null;
   }
+}
+
+function sealAiPhotoVerification(
+  stationId: string,
+  enabled: boolean,
+  sealedAt: string,
+): string {
+  const sig = crypto
+    .createHmac('sha256', SESSION_SECRET)
+    .update(`ai_verify:${stationId}:${enabled ? '1' : '0'}:${sealedAt}`)
+    .digest('hex');
+  return `AES-HMAC-v1:${sig.slice(0, 32)}`;
+}
+
+function verifyAiPhotoSeal(station: StationRecord): boolean {
+  if (!station.aiPhotoVerificationEnabled) return false;
+  if (!station.aiPhotoVerificationSealed || !station.aiPhotoVerificationSealedAt) {
+    return false;
+  }
+  const expected = sealAiPhotoVerification(
+    station.stationId,
+    true,
+    station.aiPhotoVerificationSealedAt,
+  );
+  const a = Buffer.from(station.aiPhotoVerificationSealed);
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function stripPhotosFromBucket(bucket: StationDataBucket): StationDataBucket {
+  const cleanReadings: Record<string, MeterReadingRecord> = {};
+  for (const [k, rd] of Object.entries(bucket.readings ?? {})) {
+    cleanReadings[k] = {
+      ...rd,
+      photoUrl: '',
+      hasLocalPhoto: Boolean(rd.hasLocalPhoto || rd.photoUrl),
+    };
+  }
+  const cleanAlerts: Record<string, ManagerAlertRecord> = {};
+  for (const [k, al] of Object.entries(bucket.alerts ?? {})) {
+    cleanAlerts[k] = {
+      ...al,
+      photoUrl: '',
+    };
+  }
+  return {
+    ...bucket,
+    readings: cleanReadings,
+    alerts: cleanAlerts,
+  };
 }
 
 function extractBearer(req: Request): SessionPayload | null {
@@ -714,6 +774,33 @@ async function startServer() {
     res.json({ station });
   });
 
+  app.post(
+    '/api/admin/stations/:stationId/ai-verification',
+    requireAdmin,
+    (req, res) => {
+      const station = store.stations[req.params.stationId];
+      if (!station) {
+        res.status(404).json({ error: 'المحطة غير موجودة.' });
+        return;
+      }
+      const enabled =
+        typeof req.body?.enabled === 'boolean'
+          ? req.body.enabled
+          : !Boolean(station.aiPhotoVerificationEnabled);
+      const now = new Date().toISOString();
+      station.aiPhotoVerificationEnabled = enabled;
+      station.aiPhotoVerificationSealedAt = now;
+      station.aiPhotoVerificationSealed = sealAiPhotoVerification(
+        station.stationId,
+        enabled,
+        now,
+      );
+      station.updatedAt = now;
+      saveStore(store);
+      res.json({ station });
+    },
+  );
+
   app.post('/api/admin/codes', requireAdmin, (req, res) => {
     const name = String(req.body?.name ?? '').trim();
     const role = req.body?.role === 'collector' ? 'collector' : 'manager';
@@ -1026,10 +1113,14 @@ async function startServer() {
   // ============================================================
 
   app.get('/api/admin/backup', requireAdmin, (_req, res) => {
+    const textOnlyStationData: Record<string, StationDataBucket> = {};
+    for (const [stId, bucket] of Object.entries(store.stationData)) {
+      textOnlyStationData[stId] = stripPhotosFromBucket(bucket);
+    }
     res.json({
       stations: store.stations,
       codes: store.codes,
-      stationData: store.stationData,
+      stationData: textOnlyStationData,
       exportedAt: new Date().toISOString(),
     });
   });
@@ -1475,6 +1566,18 @@ async function startServer() {
       res.status(403).json({ error: 'تعديل التعرفة مخصص لمدير المحطة أو الأدمن.' });
       return;
     }
+    if (
+      session.role !== 'admin' &&
+      ('aiPhotoVerificationEnabled' in (req.body ?? {}) ||
+        'aiPhotoVerificationSealed' in (req.body ?? {}) ||
+        'aiPhotoVerificationSealedAt' in (req.body ?? {}))
+    ) {
+      res.status(403).json({
+        error:
+          'حقل مطابقة صورة العداد (Gemini Vision-AI) مشفّر ومقتصر التعديل على الأدمن المطور فقط.',
+      });
+      return;
+    }
     const station = store.stations[req.params.stationId];
     if (!station) {
       res.status(404).json({ error: 'المحطة غير موجودة.' });
@@ -1844,7 +1947,226 @@ If no clear electric meter kWh reading is visible in the image, set isClearMeter
     },
   );
 
-  // Instant Manager Alert Endpoint (Manual OCR Edit / High Consumption >3x / Lower Reading)
+  // Gemini Vision-AI Meter Photo vs Claimed Reading Verification (Admin-Sealed Feature)
+  // Photo stays transient in server RAM for Gemini verification and is NEVER saved to Firestore/cloud
+  app.post(
+    '/api/stations/:stationId/verify-meter-photo',
+    requireStaff,
+    async (req, res) => {
+      const session = (req as Request & { session: SessionPayload }).session;
+      const station = store.stations[req.params.stationId];
+      if (!station) {
+        res.status(404).json({ error: 'المحطة غير موجودة.' });
+        return;
+      }
+
+      if (!verifyAiPhotoSeal(station)) {
+        res.status(403).json({
+          error:
+            'ميزة "مطابقة صورة العداد مع رقم القراءة المحصل" معطلة أو غير مفعّلة من الأدمن المطور.',
+        });
+        return;
+      }
+
+      if (!geminiAi) {
+        res.status(503).json({
+          error: 'محرك Gemini Vision-AI غير مفعّل على الخادم حالياً.',
+        });
+        return;
+      }
+
+      const rawImage = String(req.body?.imageBase64 ?? '').trim();
+      const claimedReading = Number(req.body?.claimedReading);
+      const previousReading = Math.max(0, Number(req.body?.previousReading) || 0);
+      const subscriberId = normalizeId(req.body?.subscriberId);
+      const readingId = normalizeId(req.body?.readingId || `rd_${Date.now()}`);
+
+      if (!rawImage || rawImage.length > 450000) {
+        res.status(400).json({ error: 'صورة العداد غير صالحة أو حجمها كبير.' });
+        return;
+      }
+      if (!Number.isFinite(claimedReading) || claimedReading < 0) {
+        res.status(400).json({ error: 'رقم القراءة المحصل غير صالح للمطابقة.' });
+        return;
+      }
+
+      const m = rawImage.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+      const mimeType = m?.[1] || 'image/jpeg';
+      const data = m?.[2] || rawImage;
+
+      try {
+        const response = await geminiAi.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  mimeType,
+                  data,
+                },
+              },
+              {
+                text: `You are an anti-fraud utility meter auditor using Gemini Vision-AI.
+A field collector submitted the reading: ${claimedReading} kWh (previous recorded reading: ${previousReading} kWh).
+Inspect the attached electric meter photo carefully:
+1. Determine whether an electric meter kWh register is clearly visible in the photo (meterVisible: true/false).
+2. Read the exact numeric kWh value printed on the main LCD or mechanical digit drums (detectedReading: number, or -1 if no clear electric meter reading is visible).
+3. Compare detectedReading against the collector's claimedReading (${claimedReading}). Set matched=true ONLY if meterVisible is true AND detectedReading matches claimedReading within 0.1 kWh.
+4. Provide a concise Arabic discrepancyReason if matched is false (for example: "الرقم الظاهر في الصورة (X) يختلف عن القراءة المدخلة (Y)" or "الصورة لا تُظهر أرقام عداد كهرباء واضحة"). If matched is true, set discrepancyReason to "".`,
+              },
+            ],
+          },
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                meterVisible: { type: Type.BOOLEAN },
+                detectedReading: { type: Type.NUMBER },
+                rawDigits: { type: Type.STRING },
+                confidence: { type: Type.NUMBER },
+                matched: { type: Type.BOOLEAN },
+                discrepancyReason: { type: Type.STRING },
+              },
+              required: [
+                'meterVisible',
+                'detectedReading',
+                'rawDigits',
+                'confidence',
+                'matched',
+                'discrepancyReason',
+              ],
+            },
+          },
+        });
+
+        const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+          meterVisible?: boolean;
+          detectedReading?: number;
+          rawDigits?: string;
+          confidence?: number;
+          matched?: boolean;
+          discrepancyReason?: string;
+        };
+
+        const detectedReading =
+          typeof parsed.detectedReading === 'number' &&
+          Number.isFinite(parsed.detectedReading) &&
+          parsed.detectedReading >= 0
+            ? Math.round(parsed.detectedReading * 100) / 100
+            : -1;
+        const confidence = Math.max(
+          0,
+          Math.min(100, Math.round(Number(parsed.confidence) || 0)),
+        );
+        const numericMatch =
+          Boolean(parsed.meterVisible) &&
+          detectedReading >= 0 &&
+          Math.abs(detectedReading - claimedReading) <= 0.1;
+        const matched = Boolean(parsed.matched) && numericMatch;
+
+        const bucket = getBucket(station.stationId);
+        const sub = bucket.subscribers[subscriberId];
+        const existingRd = bucket.readings[readingId];
+        const now = new Date().toISOString();
+
+        if (!matched) {
+          const discrepancyReason =
+            String(parsed.discrepancyReason ?? '').trim() ||
+            (detectedReading >= 0
+              ? `عدم تطابق صورة العداد (${detectedReading}) مع القراءة المدخلة (${claimedReading}).`
+              : `الصورة المرفقة لا تُظهر عداداً واضحاً يطابق القراءة المدخلة (${claimedReading}).`);
+
+          const alertId = normalizeId(`al_ai_${Date.now()}_${crypto.randomBytes(2).toString('hex')}`);
+          const alertRecord: ManagerAlertRecord = {
+            id: alertId,
+            stationId: station.stationId,
+            alertType: 'photo_mismatch',
+            severity: 'critical',
+            status: 'pending',
+            readingId,
+            subscriberId,
+            subscriberName: String(
+              req.body?.subscriberName ?? sub?.subscriberName ?? 'مشترك',
+            ).slice(0, 120),
+            meterNumber: String(
+              req.body?.meterNumber ?? sub?.meterNumber ?? '',
+            ).slice(0, 60),
+            collectorName: String(req.body?.collectorName ?? session.name).slice(
+              0,
+              100,
+            ),
+            collectorCode: session.code || session.role,
+            ...(detectedReading >= 0
+              ? { ocrOriginalReading: detectedReading, aiDetectedReading: detectedReading }
+              : {}),
+            editedReading: claimedReading,
+            previousReading,
+            difference:
+              detectedReading >= 0
+                ? Math.round((claimedReading - detectedReading) * 100) / 100
+                : Math.round((claimedReading - previousReading) * 100) / 100,
+            aiConfidence: confidence,
+            aiVerificationReason: discrepancyReason,
+            photoUrl: '',
+            createdAt: now,
+          };
+
+          bucket.alerts[alertId] = alertRecord;
+          if (existingRd) {
+            existingRd.approvalStatus = 'pending_manager';
+            existingRd.aiVerificationStatus = 'mismatch';
+            if (detectedReading >= 0) existingRd.aiDetectedReading = detectedReading;
+            existingRd.aiConfidence = confidence;
+            existingRd.aiVerificationReason = discrepancyReason;
+            existingRd.photoUrl = '';
+            existingRd.hasLocalPhoto = true;
+          }
+          saveStore(store);
+
+          res.json({
+            enabled: true,
+            matched: false,
+            detectedReading: detectedReading >= 0 ? detectedReading : null,
+            rawDigits: String(parsed.rawDigits ?? ''),
+            confidence,
+            discrepancyReason,
+            alert: alertRecord,
+          });
+          return;
+        }
+
+        if (existingRd) {
+          existingRd.aiVerificationStatus = 'matched';
+          existingRd.aiDetectedReading = detectedReading;
+          existingRd.aiConfidence = confidence;
+          existingRd.aiVerificationReason = '';
+          existingRd.photoUrl = '';
+          existingRd.hasLocalPhoto = true;
+          saveStore(store);
+        }
+
+        res.json({
+          enabled: true,
+          matched: true,
+          detectedReading,
+          rawDigits: String(parsed.rawDigits ?? ''),
+          confidence,
+          discrepancyReason: '',
+        });
+      } catch (err) {
+        res.status(502).json({
+          error:
+            err instanceof Error
+              ? err.message
+              : 'تعذر إتمام مطابقة صورة العداد عبر Gemini Vision-AI.',
+        });
+      }
+    },
+  );
+
+  // Instant Manager Alert Endpoint (Gemini Vision-AI Mismatch / High Consumption >3x / Lower Reading)
+  // Collector manual_edit alerts are explicitly disabled per policy; photos remain local on collector device.
   app.post('/api/stations/:stationId/alerts', requireStaff, (req, res) => {
     const session = (req as Request & { session: SessionPayload }).session;
     const station = store.stations[req.params.stationId];
@@ -1865,6 +2187,14 @@ If no clear electric meter kWh reading is visible in the image, set isClearMeter
 
     const bucket = getBucket(station.stationId);
     const alertInput = req.body?.alert ?? req.body;
+    if (alertInput?.alertType === 'manual_edit') {
+      res.status(400).json({
+        error:
+          'تم إلغاء تنبيه التعديل اليدوي من المحصّل؛ يتم الاعتماد على مطابقة Gemini Vision-AI أو نقص القراءة.',
+      });
+      return;
+    }
+
     const alertId = normalizeId(alertInput?.id || `al_${Date.now()}`);
     const subscriberId = normalizeId(alertInput?.subscriberId);
     const sub = bucket.subscribers[subscriberId];
@@ -1872,9 +2202,9 @@ If no clear electric meter kWh reading is visible in the image, set isClearMeter
     const alertType: ManagerAlertRecord['alertType'] =
       alertInput?.alertType === 'high_consumption'
         ? 'high_consumption'
-        : alertInput?.alertType === 'lower_reading'
-          ? 'lower_reading'
-          : 'manual_edit';
+        : alertInput?.alertType === 'photo_mismatch'
+          ? 'photo_mismatch'
+          : 'lower_reading';
 
     const severity: ManagerAlertRecord['severity'] =
       alertInput?.severity === 'warning' ? 'warning' : 'critical';
@@ -1923,13 +2253,23 @@ If no clear electric meter kWh reading is visible in the image, set isClearMeter
       ...(typeof alertInput?.openingReading === 'number'
         ? { openingReading: Math.max(0, Number(alertInput.openingReading)) }
         : {}),
-      photoUrl: String(alertInput?.photoUrl ?? '').slice(0, 260000),
+      ...(typeof alertInput?.aiDetectedReading === 'number'
+        ? { aiDetectedReading: Number(alertInput.aiDetectedReading) }
+        : {}),
+      ...(typeof alertInput?.aiConfidence === 'number'
+        ? { aiConfidence: Number(alertInput.aiConfidence) }
+        : {}),
+      ...(alertInput?.aiVerificationReason
+        ? { aiVerificationReason: String(alertInput.aiVerificationReason).slice(0, 300) }
+        : {}),
+      // Meter photos stay strictly on the collector's phone local memory, never stored in cloud/Firestore
+      photoUrl: '',
       createdAt: String(alertInput?.createdAt ?? new Date().toISOString()),
     };
 
     bucket.alerts[alertId] = record;
 
-    // Optionally store the linked pending reading immediately so the manager can approve/reject it right away
+    // Optionally store the linked pending reading (text/numbers only) so the manager can approve/reject right away
     const linkedReading = req.body?.reading;
     if (linkedReading && sub) {
       const rdId = normalizeId(linkedReading.id || record.readingId);
@@ -1947,9 +2287,9 @@ If no clear electric meter kWh reading is visible in the image, set isClearMeter
         currentBillYer: Math.max(0, Number(linkedReading.currentBillYer) || 0),
         previousDebtYer: Math.max(0, Number(linkedReading.previousDebtYer) || 0),
         totalDueYer: Math.max(0, Number(linkedReading.totalDueYer) || 0),
-        photoUrl: String(linkedReading.photoUrl ?? record.photoUrl).slice(0, 260000),
+        photoUrl: '',
         photoSizeKb: Math.min(250, Math.max(0, Number(linkedReading.photoSizeKb) || 0)),
-        hasLocalPhoto: true,
+        hasLocalPhoto: Boolean(linkedReading.hasLocalPhoto || linkedReading.photoUrl),
         readingSource: linkedReading.wasManuallyEdited ? 'manual_override' : 'camera_ocr',
         ocrConfidence: Math.max(0, Math.min(100, Number(linkedReading.ocrConfidence) || 0)),
         ...(typeof linkedReading.ocrOriginalReading === 'number'
@@ -1969,6 +2309,18 @@ If no clear electric meter kWh reading is visible in the image, set isClearMeter
           ? { zeroConsumptionNote: String(linkedReading.zeroConsumptionNote) }
           : {}),
         highConsumptionWarning: alertType === 'high_consumption',
+        ...(linkedReading.aiVerificationStatus
+          ? { aiVerificationStatus: linkedReading.aiVerificationStatus }
+          : {}),
+        ...(typeof linkedReading.aiDetectedReading === 'number'
+          ? { aiDetectedReading: Number(linkedReading.aiDetectedReading) }
+          : {}),
+        ...(typeof linkedReading.aiConfidence === 'number'
+          ? { aiConfidence: Number(linkedReading.aiConfidence) }
+          : {}),
+        ...(linkedReading.aiVerificationReason
+          ? { aiVerificationReason: String(linkedReading.aiVerificationReason).slice(0, 300) }
+          : {}),
         collectorCode: session.code || session.role,
         collectorName: String(linkedReading.collectorName ?? session.name),
         recordedAt: String(linkedReading.recordedAt ?? record.createdAt),
@@ -2124,7 +2476,8 @@ If no clear electric meter kWh reading is visible in the image, set isClearMeter
         const rawCur = Math.max(0, Number(rd?.currentReading) || 0);
         const cur = lowerReason ? rawCur : Math.max(prev, rawCur);
         const wasManuallyEdited = Boolean(rd?.wasManuallyEdited);
-        const requiresManagerApproval = wasManuallyEdited || Boolean(lowerReason);
+        const aiMismatch = rd?.aiVerificationStatus === 'mismatch';
+        const requiresManagerApproval = Boolean(lowerReason) || aiMismatch;
         const existingRd = bucket.readings[rdId];
         const approvalStatus: MeterReadingRecord['approvalStatus'] =
           existingRd?.approvalStatus === 'approved' ||
@@ -2133,8 +2486,6 @@ If no clear electric meter kWh reading is visible in the image, set isClearMeter
             : requiresManagerApproval
               ? 'pending_manager'
               : 'approved';
-
-        const photoUrl = String(rd?.photoUrl ?? '').slice(0, 220000);
 
         bucket.readings[rdId] = {
           id: rdId,
@@ -2148,9 +2499,10 @@ If no clear electric meter kWh reading is visible in the image, set isClearMeter
           currentBillYer: Math.max(0, Number(rd?.currentBillYer) || 0),
           previousDebtYer: Math.max(0, Number(rd?.previousDebtYer) || 0),
           totalDueYer: Math.max(0, Number(rd?.totalDueYer) || 0),
-          photoUrl,
+          // Never store meter photos on cloud/Firestore — phone-local storage only
+          photoUrl: '',
           photoSizeKb: Math.min(200, Math.max(0, Number(rd?.photoSizeKb) || 0)),
-          hasLocalPhoto: Boolean(rd?.hasLocalPhoto || photoUrl),
+          hasLocalPhoto: Boolean(rd?.hasLocalPhoto || rd?.photoUrl),
           readingSource: wasManuallyEdited ? 'manual_override' : 'camera_ocr',
           ocrConfidence: Math.max(0, Math.min(100, Number(rd?.ocrConfidence) || 0)),
           ...(typeof rd?.ocrOriginalReading === 'number'
@@ -2169,6 +2521,18 @@ If no clear electric meter kWh reading is visible in the image, set isClearMeter
             ? { zeroConsumptionNote: String(rd.zeroConsumptionNote).slice(0, 120) }
             : {}),
           highConsumptionWarning: Boolean(rd?.highConsumptionWarning),
+          ...(rd?.aiVerificationStatus
+            ? { aiVerificationStatus: rd.aiVerificationStatus }
+            : {}),
+          ...(typeof rd?.aiDetectedReading === 'number'
+            ? { aiDetectedReading: Number(rd.aiDetectedReading) }
+            : {}),
+          ...(typeof rd?.aiConfidence === 'number'
+            ? { aiConfidence: Number(rd.aiConfidence) }
+            : {}),
+          ...(rd?.aiVerificationReason
+            ? { aiVerificationReason: String(rd.aiVerificationReason).slice(0, 300) }
+            : {}),
           ...(typeof rd?.gpsLat === 'number' && Number.isFinite(rd.gpsLat)
             ? { gpsLat: rd.gpsLat }
             : {}),
@@ -2215,6 +2579,7 @@ If no clear electric meter kWh reading is visible in the image, set isClearMeter
         return;
       }
       for (const al of alerts) {
+        if (al?.alertType === 'manual_edit') continue;
         const alId = normalizeId(al?.id);
         const subId = normalizeId(al?.subscriberId);
         const existingAl = bucket.alerts[alId];
@@ -2225,9 +2590,9 @@ If no clear electric meter kWh reading is visible in the image, set isClearMeter
           alertType:
             al?.alertType === 'high_consumption'
               ? 'high_consumption'
-              : al?.alertType === 'lower_reading'
-                ? 'lower_reading'
-                : 'manual_edit',
+              : al?.alertType === 'photo_mismatch'
+                ? 'photo_mismatch'
+                : 'lower_reading',
           severity: al?.severity === 'warning' ? 'warning' : 'critical',
           status: 'pending',
           readingId: normalizeId(al?.readingId),
@@ -2255,7 +2620,16 @@ If no clear electric meter kWh reading is visible in the image, set isClearMeter
           ...(typeof al?.openingReading === 'number'
             ? { openingReading: Math.max(0, Number(al.openingReading)) }
             : {}),
-          photoUrl: String(al?.photoUrl ?? '').slice(0, 260000),
+          ...(typeof al?.aiDetectedReading === 'number'
+            ? { aiDetectedReading: Number(al.aiDetectedReading) }
+            : {}),
+          ...(typeof al?.aiConfidence === 'number'
+            ? { aiConfidence: Number(al.aiConfidence) }
+            : {}),
+          ...(al?.aiVerificationReason
+            ? { aiVerificationReason: String(al.aiVerificationReason).slice(0, 300) }
+            : {}),
+          photoUrl: '',
           createdAt: String(al?.createdAt ?? new Date().toISOString()),
         };
         syncedCount++;

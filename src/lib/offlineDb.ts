@@ -140,6 +140,21 @@ export async function toggleStationStatusAdmin(
   );
 }
 
+export async function toggleStationAiVerificationAdmin(
+  adminToken: string,
+  stationId: string,
+  enabled: boolean,
+): Promise<{ station: StationConfig }> {
+  return apiRequest<{ station: StationConfig }>(
+    `/api/admin/stations/${encodeURIComponent(stationId)}/ai-verification`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    },
+    adminToken,
+  );
+}
+
 export async function generateAccessCodeAdmin(
   adminToken: string,
   params: {
@@ -464,11 +479,27 @@ function mergeLocalPendingWithCloud(
   cloud.subscribers.forEach((s) => subMap.set(s.id, s));
   pendingSubs.forEach((s) => subMap.set(s.id, s));
 
+  // Preserve meter photos stored locally in the collector's phone IndexedDB memory
+  const localPhotoByReadingId = new Map<string, string>();
+  local.readings.forEach((r) => {
+    if (r.photoUrl) localPhotoByReadingId.set(r.id, r.photoUrl);
+  });
+  const localPhotoByAlertId = new Map<string, string>();
+  (local.alerts ?? []).forEach((al) => {
+    if (al.photoUrl) localPhotoByAlertId.set(al.id, al.photoUrl);
+  });
+
   const pendingReadings = local.readings.filter((r) => r.syncStatus === 'pending');
   const rdIds = new Set(cloud.readings.map((r) => r.id));
+  const mergedCloudReadings = cloud.readings.map((r) => {
+    const localPhoto = localPhotoByReadingId.get(r.id);
+    return localPhoto
+      ? { ...r, photoUrl: localPhoto, hasLocalPhoto: true }
+      : r;
+  });
   const mergedReadings = [
     ...pendingReadings.filter((r) => !rdIds.has(r.id)),
-    ...cloud.readings,
+    ...mergedCloudReadings,
   ];
 
   const pendingReceipts = local.receipts.filter((rc) => rc.syncStatus === 'pending');
@@ -482,9 +513,13 @@ function mergeLocalPendingWithCloud(
     (al) => al.syncStatus === 'pending',
   );
   const alIds = new Set((cloud.alerts ?? []).map((al) => al.id));
+  const mergedCloudAlerts = (cloud.alerts ?? []).map((al) => {
+    const localPhoto = localPhotoByAlertId.get(al.id);
+    return localPhoto ? { ...al, photoUrl: localPhoto } : al;
+  });
   const mergedAlerts = [
     ...pendingAlerts.filter((al) => !alIds.has(al.id)),
-    ...(cloud.alerts ?? []),
+    ...mergedCloudAlerts,
   ].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 
   return {
@@ -747,19 +782,69 @@ export function computeSubscriber3MonthAvgKwh(
   return subscriber.last3MonthsAvgKwh ?? 0;
 }
 
+export interface GeminiPhotoVerificationResult {
+  enabled: boolean;
+  matched: boolean;
+  detectedReading: number | null;
+  rawDigits: string;
+  confidence: number;
+  discrepancyReason: string;
+  alert?: ManagerAlert;
+}
+
+export async function verifyMeterPhotoWithGemini(params: {
+  staffToken: string;
+  stationId: string;
+  imageBase64: string;
+  claimedReading: number;
+  previousReading: number;
+  subscriberId: string;
+  subscriberName: string;
+  meterNumber: string;
+  readingId: string;
+  collectorName: string;
+}): Promise<GeminiPhotoVerificationResult> {
+  return apiRequest<GeminiPhotoVerificationResult>(
+    `/api/stations/${encodeURIComponent(params.stationId)}/verify-meter-photo`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        imageBase64: params.imageBase64,
+        claimedReading: params.claimedReading,
+        previousReading: params.previousReading,
+        subscriberId: params.subscriberId,
+        subscriberName: params.subscriberName,
+        meterNumber: params.meterNumber,
+        readingId: params.readingId,
+        collectorName: params.collectorName,
+      }),
+    },
+    params.staffToken,
+  );
+}
+
 export async function sendInstantManagerAlert(params: {
   staffToken: string;
   stationId: string;
   alert: ManagerAlert;
   reading?: MeterReading;
 }): Promise<{ alert: ManagerAlert }> {
+  // Never upload meter photos to cloud/Firestore; photos remain on collector phone
+  const textOnlyAlert: ManagerAlert = { ...params.alert, photoUrl: '' };
+  const textOnlyReading: MeterReading | undefined = params.reading
+    ? {
+        ...params.reading,
+        photoUrl: '',
+        hasLocalPhoto: Boolean(params.reading.photoUrl || params.reading.hasLocalPhoto),
+      }
+    : undefined;
   return apiRequest<{ alert: ManagerAlert }>(
     `/api/stations/${encodeURIComponent(params.stationId)}/alerts`,
     {
       method: 'POST',
       body: JSON.stringify({
-        alert: params.alert,
-        ...(params.reading ? { reading: params.reading } : {}),
+        alert: textOnlyAlert,
+        ...(textOnlyReading ? { reading: textOnlyReading } : {}),
       }),
     },
     params.staffToken,
@@ -902,10 +987,61 @@ export async function syncStationPendingBatches(params: {
 
   for (const batch of readingBatches) {
     currentBatch++;
-    const payloadReadings = batch.map((r) => ({
+    // Run deferred Gemini Vision-AI verification for offline readings if Admin enabled it
+    const verifiedBatch: MeterReading[] = [];
+    for (const r of batch) {
+      if (
+        working.station.aiPhotoVerificationEnabled &&
+        r.aiVerificationStatus === 'pending_offline' &&
+        r.photoUrl
+      ) {
+        try {
+          const aiRes = await verifyMeterPhotoWithGemini({
+            staffToken: params.staffToken,
+            stationId,
+            imageBase64: r.photoUrl,
+            claimedReading: r.currentReading,
+            previousReading: r.previousReading,
+            subscriberId: r.subscriberId,
+            subscriberName: r.subscriberName,
+            meterNumber: r.meterNumber,
+            readingId: r.id,
+            collectorName: r.collectorName,
+          });
+          const updatedRd: MeterReading = {
+            ...r,
+            aiVerificationStatus: aiRes.matched ? 'matched' : 'mismatch',
+            ...(aiRes.detectedReading !== null
+              ? { aiDetectedReading: aiRes.detectedReading }
+              : {}),
+            aiConfidence: aiRes.confidence,
+            ...(aiRes.discrepancyReason
+              ? { aiVerificationReason: aiRes.discrepancyReason }
+              : {}),
+            ...(aiRes.matched ? {} : { approvalStatus: 'pending_manager' as const }),
+          };
+          verifiedBatch.push(updatedRd);
+          if (!aiRes.matched && aiRes.alert) {
+            working = {
+              ...working,
+              alerts: [
+                { ...aiRes.alert, syncStatus: 'synced' as const },
+                ...(working.alerts ?? []),
+              ],
+            };
+          }
+          continue;
+        } catch {
+          // Keep pending_offline if AI verification endpoint temporarily fails
+        }
+      }
+      verifiedBatch.push(r);
+    }
+
+    // Strict text-only cloud sync: meter photos remain stored locally in collector phone memory only
+    const payloadReadings = verifiedBatch.map((r) => ({
       ...r,
-      // Keep proof photo for manager review when flagged/edited/lower; otherwise store locally for ultra-fast sync
-      photoUrl: r.approvalStatus === 'pending_manager' ? r.photoUrl : '',
+      photoUrl: '',
       hasLocalPhoto: Boolean(r.photoUrl || r.hasLocalPhoto),
     }));
     await apiRequest(
@@ -920,6 +1056,11 @@ export async function syncStationPendingBatches(params: {
       },
       params.staffToken,
     );
+    const verifiedById = new Map(verifiedBatch.map((v) => [v.id, v]));
+    working = {
+      ...working,
+      readings: working.readings.map((r) => verifiedById.get(r.id) ?? r),
+    };
     const ids = new Set(batch.map((b) => b.id));
     await commitLocalProgress(new Set(), ids, new Set(), new Set());
     completed += batch.length;
@@ -946,19 +1087,24 @@ export async function syncStationPendingBatches(params: {
 
   for (const batch of alertBatches) {
     currentBatch++;
-    await apiRequest(
-      `/api/stations/${encodeURIComponent(stationId)}/sync-batch`,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          subscribers: [],
-          readings: [],
-          receipts: [],
-          alerts: batch,
-        }),
-      },
-      params.staffToken,
-    );
+    const textOnlyAlerts = batch
+      .filter((al) => al.alertType !== 'manual_edit')
+      .map((al) => ({ ...al, photoUrl: '' }));
+    if (textOnlyAlerts.length > 0) {
+      await apiRequest(
+        `/api/stations/${encodeURIComponent(stationId)}/sync-batch`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            subscribers: [],
+            readings: [],
+            receipts: [],
+            alerts: textOnlyAlerts,
+          }),
+        },
+        params.staffToken,
+      );
+    }
     const ids = new Set(batch.map((b) => b.id));
     await commitLocalProgress(new Set(), new Set(), new Set(), ids);
     completed += batch.length;
