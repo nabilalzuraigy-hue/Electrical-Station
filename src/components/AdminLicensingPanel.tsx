@@ -1,7 +1,12 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import type { User } from 'firebase/auth';
 import {
   Check,
+  Cloud,
+  CloudDownload,
+  CloudUpload,
   Copy,
+  Database,
   Download,
   FileSpreadsheet,
   FileText,
@@ -19,21 +24,45 @@ import {
   claimAdminPasscode,
   createManualSubscriberAdmin,
   deleteAccessCodeAdmin,
+  deleteExpenseAdmin,
+  deleteReadingAdmin,
+  deleteReceiptAdmin,
+  deleteStationAdmin,
   deleteSubscriberAdmin,
   downloadExcelTemplate,
+  fetchAdminBackup,
   fetchAdminOverview,
+  fetchStationDetailsAdmin,
   fetchStationSubscribersAdmin,
   generateAccessCodeAdmin,
   getAdminStatus,
   loginAdminPasscode,
   parseSubscribersExcelFile,
+  restoreAdminBackup,
   toggleAccessCodeAdmin,
   toggleStationStatusAdmin,
   uploadSubscribersChunkedAdmin,
 } from '../lib/offlineDb';
+import {
+  FIREBASE_DATABASE_ID,
+  FIREBASE_PROJECT_ID,
+  formatAuthError,
+  formatFirestoreUserMessage,
+  signInWithGooglePopup,
+  signOutUser,
+  subscribeToAuth,
+} from '../lib/firebase';
+import {
+  loadAdminStoreFromFirestore,
+  saveAdminStoreToFirestore,
+  type AdminStoreBackupPayload,
+} from '../lib/firestoreBackup';
 import { StationOwnerBrochureModal } from './StationOwnerBrochureModal';
 import type {
   AccessCodeRecord,
+  DieselExpenseEntry,
+  MeterReading,
+  PaymentReceipt,
   StationConfig,
   Subscriber,
 } from '../types/station';
@@ -50,6 +79,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
   onLogoutAdmin,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const jsonBackupInputRef = useRef<HTMLInputElement>(null);
 
   const [checkingStatus, setCheckingStatus] = useState(true);
   const [configured, setConfigured] = useState(true);
@@ -64,7 +94,16 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const [confirmDeleteCode, setConfirmDeleteCode] = useState<string | null>(null);
   const [deletingCode, setDeletingCode] = useState<string | null>(null);
+  const [confirmDeleteStationId, setConfirmDeleteStationId] = useState<string | null>(null);
+  const [deletingStationId, setDeletingStationId] = useState<string | null>(null);
   const [brochureOpen, setBrochureOpen] = useState(false);
+
+  // Firebase Auth & Cloud Firestore Vault State
+  const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
+  const [cloudBusy, setCloudBusy] = useState(false);
+  const [cloudStatus, setCloudStatus] = useState<string | null>(null);
+  const [cloudLastSyncAt, setCloudLastSyncAt] = useState<string | null>(null);
+  const autoRestoredRef = useRef(false);
 
   // Manual code generation state
   const [personName, setPersonName] = useState('');
@@ -102,7 +141,16 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
   const [subAvg3Months, setSubAvg3Months] = useState('');
   const [subSeqOrder, setSubSeqOrder] = useState('');
   const [creatingSub, setCreatingSub] = useState(false);
+  const [confirmDeleteSubId, setConfirmDeleteSubId] = useState<string | null>(null);
   const [deletingSubId, setDeletingSubId] = useState<string | null>(null);
+
+  // Developer-Admin-exclusive Station Records Inspector & Delete Console
+  const [inspectStationId, setInspectStationId] = useState('');
+  const [inspectReadings, setInspectReadings] = useState<MeterReading[]>([]);
+  const [inspectReceipts, setInspectReceipts] = useState<PaymentReceipt[]>([]);
+  const [inspectExpenses, setInspectExpenses] = useState<DieselExpenseEntry[]>([]);
+  const [loadingDetails, setLoadingDetails] = useState(false);
+  const [deletingRecordKey, setDeletingRecordKey] = useState<string | null>(null);
 
   useEffect(() => {
     if (adminToken) {
@@ -127,6 +175,27 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     };
   }, [adminToken]);
 
+  useEffect(() => {
+    const unsub = subscribeToAuth((u) => {
+      setFirebaseUser(u);
+    });
+    return () => unsub();
+  }, []);
+
+  const syncBackupToFirestoreSilently = useCallback(async () => {
+    if (!adminToken || !firebaseUser) return;
+    try {
+      const backup = await fetchAdminBackup(adminToken);
+      const res = await saveAdminStoreToFirestore(backup);
+      setCloudLastSyncAt(res.updatedAtIso);
+      setCloudStatus(
+        `تم الحفظ التلقائي في سحابة Firebase Firestore (${res.stationCount} محطة · ${res.codeCount} كود · ${res.subscriberCount} مشترك).`,
+      );
+    } catch {
+      // ignore silent background errors; manual button surfaces details
+    }
+  }, [adminToken, firebaseUser]);
+
   const loadAdminData = useCallback(async () => {
     if (!adminToken) return;
     setLoading(true);
@@ -138,6 +207,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
         setTargetStationId((prev) => prev || data.stations[0].stationId);
         setExcelStationId((prev) => prev || data.stations[0].stationId);
         setManualSubStationId((prev) => prev || data.stations[0].stationId);
+        setInspectStationId((prev) => prev || data.stations[0].stationId);
       }
     } catch (err) {
       setFeedback(
@@ -167,6 +237,31 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     [adminToken],
   );
 
+  const loadStationDetails = useCallback(
+    async (stationId: string) => {
+      if (!adminToken || !stationId) {
+        setInspectReadings([]);
+        setInspectReceipts([]);
+        setInspectExpenses([]);
+        return;
+      }
+      setLoadingDetails(true);
+      try {
+        const details = await fetchStationDetailsAdmin(adminToken, stationId);
+        setInspectReadings(details.readings);
+        setInspectReceipts(details.receipts);
+        setInspectExpenses(details.expenses);
+      } catch {
+        setInspectReadings([]);
+        setInspectReceipts([]);
+        setInspectExpenses([]);
+      } finally {
+        setLoadingDetails(false);
+      }
+    },
+    [adminToken],
+  );
+
   useEffect(() => {
     if (adminToken) {
       void loadAdminData();
@@ -178,6 +273,46 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
       void loadStationSubscribers(manualSubStationId);
     }
   }, [adminToken, manualSubStationId, loadStationSubscribers]);
+
+  useEffect(() => {
+    if (adminToken && inspectStationId) {
+      void loadStationDetails(inspectStationId);
+    }
+  }, [adminToken, inspectStationId, loadStationDetails]);
+
+  // Auto-restore from Firestore Vault once on mount if server store is empty
+  useEffect(() => {
+    if (
+      !adminToken ||
+      !firebaseUser ||
+      loading ||
+      autoRestoredRef.current ||
+      stations.length > 0 ||
+      codes.length > 0
+    ) {
+      return;
+    }
+    autoRestoredRef.current = true;
+    (async () => {
+      try {
+        const snap = await loadAdminStoreFromFirestore();
+        if (snap && (snap.stationCount > 0 || snap.codeCount > 0)) {
+          const restored = await restoreAdminBackup(
+            adminToken,
+            snap.backup,
+            'merge',
+          );
+          setCloudLastSyncAt(snap.updatedAtIso);
+          setCloudStatus(
+            `تمت الاستعادة التلقائية من سحابة Firebase (${restored.stationCount} محطة · ${restored.codeCount} كود · ${restored.subscriberCount} مشترك).`,
+          );
+          await loadAdminData();
+        }
+      } catch {
+        // non-blocking auto-restore check
+      }
+    })();
+  }, [adminToken, firebaseUser, loading, stations.length, codes.length, loadAdminData]);
 
   const handlePasscodeSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -246,6 +381,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
         `تم توليد كود ${res.codeRecord.role === 'manager' ? 'مدير المحطة' : 'المحصّل'} (${res.codeRecord.name}): ${res.codeRecord.code}`,
       );
       await loadAdminData();
+      void syncBackupToFirestoreSilently();
     } catch (err) {
       setFeedback(
         err instanceof Error ? err.message : 'تعذر توليد الكود.',
@@ -290,6 +426,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
         `تم رفع ${parsed.length} مشترك بنجاح إلى المحطة (إجمالي المشتركين الآن: ${res.totalSubscribers}).`,
       );
       await loadAdminData();
+      void syncBackupToFirestoreSilently();
       if (excelStationId === manualSubStationId) {
         await loadStationSubscribers(excelStationId);
       }
@@ -309,6 +446,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     try {
       await toggleAccessCodeAdmin(adminToken, rec.code, { active: !rec.active });
       await loadAdminData();
+      void syncBackupToFirestoreSilently();
     } catch (err) {
       setFeedback(err instanceof Error ? err.message : 'تعذر تحديث حالة الكود.');
     }
@@ -322,6 +460,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
       setConfirmDeleteCode(null);
       setFeedback(`تم مسح الكود ${rec.code} (${rec.name}) بنجاح.`);
       await loadAdminData();
+      void syncBackupToFirestoreSilently();
     } catch (err) {
       setFeedback(err instanceof Error ? err.message : 'تعذر مسح الكود.');
     } finally {
@@ -402,6 +541,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
         loadAdminData(),
         loadStationSubscribers(manualSubStationId),
       ]);
+      void syncBackupToFirestoreSilently();
     } catch (err) {
       setFeedback(
         err instanceof Error ? err.message : 'تعذر إنشاء المشترك يدوياً.',
@@ -416,17 +556,191 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     setDeletingSubId(sub.id);
     try {
       await deleteSubscriberAdmin(adminToken, manualSubStationId, sub.id);
+      setConfirmDeleteSubId(null);
       setFeedback(`تم حذف المشترك «${sub.subscriberName}» بنجاح.`);
       await Promise.all([
         loadAdminData(),
         loadStationSubscribers(manualSubStationId),
       ]);
+      void syncBackupToFirestoreSilently();
     } catch (err) {
       setFeedback(
         err instanceof Error ? err.message : 'تعذر حذف المشترك.',
       );
     } finally {
       setDeletingSubId(null);
+    }
+  };
+
+  const handleDeleteStation = async (st: StationConfig) => {
+    if (!adminToken) return;
+    setDeletingStationId(st.stationId);
+    try {
+      await deleteStationAdmin(adminToken, st.stationId);
+      setConfirmDeleteStationId(null);
+      setFeedback(`تم مسح المحطة «${st.stationName}» وكل بياناتها حصراً بصلاحية المطور.`);
+      await loadAdminData();
+      void syncBackupToFirestoreSilently();
+    } catch (err) {
+      setFeedback(err instanceof Error ? err.message : 'تعذر مسح المحطة.');
+    } finally {
+      setDeletingStationId(null);
+    }
+  };
+
+  const handleDeleteReading = async (readingId: string) => {
+    if (!adminToken || !inspectStationId) return;
+    setDeletingRecordKey(`rd_${readingId}`);
+    try {
+      await deleteReadingAdmin(adminToken, inspectStationId, readingId);
+      setFeedback('تم مسح القراءة بنجاح بصلاحية الأدمن المطور.');
+      await Promise.all([loadAdminData(), loadStationDetails(inspectStationId)]);
+      void syncBackupToFirestoreSilently();
+    } catch (err) {
+      setFeedback(err instanceof Error ? err.message : 'تعذر مسح القراءة.');
+    } finally {
+      setDeletingRecordKey(null);
+    }
+  };
+
+  const handleDeleteReceipt = async (receiptId: string) => {
+    if (!adminToken || !inspectStationId) return;
+    setDeletingRecordKey(`rc_${receiptId}`);
+    try {
+      await deleteReceiptAdmin(adminToken, inspectStationId, receiptId);
+      setFeedback('تم مسح سند القبض بنجاح بصلاحية الأدمن المطور.');
+      await Promise.all([loadAdminData(), loadStationDetails(inspectStationId)]);
+      void syncBackupToFirestoreSilently();
+    } catch (err) {
+      setFeedback(err instanceof Error ? err.message : 'تعذر مسح سند القبض.');
+    } finally {
+      setDeletingRecordKey(null);
+    }
+  };
+
+  const handleDeleteExpense = async (expenseId: string) => {
+    if (!adminToken || !inspectStationId) return;
+    setDeletingRecordKey(`exp_${expenseId}`);
+    try {
+      await deleteExpenseAdmin(adminToken, inspectStationId, expenseId);
+      setFeedback('تم مسح المصروف بنجاح بصلاحية الأدمن المطور.');
+      await Promise.all([loadAdminData(), loadStationDetails(inspectStationId)]);
+      void syncBackupToFirestoreSilently();
+    } catch (err) {
+      setFeedback(err instanceof Error ? err.message : 'تعذر مسح المصروف.');
+    } finally {
+      setDeletingRecordKey(null);
+    }
+  };
+
+  const handleConnectGoogleAdmin = async () => {
+    setCloudBusy(true);
+    setCloudStatus(null);
+    try {
+      await signInWithGooglePopup();
+      setCloudStatus('تم ربط حساب Google للأدمن المطور بنجاح.');
+    } catch (err) {
+      setCloudStatus(formatAuthError(err));
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
+  const handleCloudBackupNow = async () => {
+    if (!adminToken) return;
+    setCloudBusy(true);
+    setCloudStatus(null);
+    try {
+      const backup = await fetchAdminBackup(adminToken);
+      const res = await saveAdminStoreToFirestore(backup);
+      setCloudLastSyncAt(res.updatedAtIso);
+      setCloudStatus(
+        `تم حفظ النسخة الاحتياطية في سحابة Firebase Firestore بنجاح (${res.stationCount} محطة، ${res.codeCount} كود، ${res.subscriberCount} مشترك).`,
+      );
+    } catch (err) {
+      setCloudStatus(
+        formatFirestoreUserMessage(err, 'تعذر حفظ النسخة في سحابة Firebase.'),
+      );
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
+  const handleCloudRestoreNow = async () => {
+    if (!adminToken) return;
+    setCloudBusy(true);
+    setCloudStatus(null);
+    try {
+      const snap = await loadAdminStoreFromFirestore();
+      if (!snap) {
+        setCloudStatus('لا توجد نسخة احتياطية محفوظة في سحابة Firebase حتى الآن.');
+        return;
+      }
+      const res = await restoreAdminBackup(adminToken, snap.backup, 'merge');
+      setCloudLastSyncAt(snap.updatedAtIso);
+      setCloudStatus(
+        `تمت استعادة البيانات من سحابة Firebase بنجاح (${res.stationCount} محطة، ${res.codeCount} كود، ${res.subscriberCount} مشترك).`,
+      );
+      await loadAdminData();
+      if (manualSubStationId) await loadStationSubscribers(manualSubStationId);
+      if (inspectStationId) await loadStationDetails(inspectStationId);
+    } catch (err) {
+      setCloudStatus(
+        formatFirestoreUserMessage(err, 'تعذر الاستعادة من سحابة Firebase.'),
+      );
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
+  const handleDownloadJsonBackup = async () => {
+    if (!adminToken) return;
+    try {
+      const backup = await fetchAdminBackup(adminToken);
+      const blob = new Blob([JSON.stringify(backup, null, 2)], {
+        type: 'application/json',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `electricity-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setCloudStatus('تم تنزيل ملف النسخة الاحتياطية (JSON) على جهازك.');
+    } catch (err) {
+      setCloudStatus(
+        err instanceof Error ? err.message : 'تعذر تنزيل النسخة الاحتياطية.',
+      );
+    }
+  };
+
+  const handleImportJsonBackup = async (
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = event.target.files?.[0];
+    if (!file || !adminToken) return;
+    setCloudBusy(true);
+    setCloudStatus(null);
+    try {
+      const raw = await file.text();
+      const parsed = JSON.parse(raw) as AdminStoreBackupPayload;
+      const res = await restoreAdminBackup(adminToken, parsed, 'merge');
+      setCloudStatus(
+        `تمت استعادة النسخة من ملف JSON (${res.stationCount} محطة، ${res.codeCount} كود، ${res.subscriberCount} مشترك).`,
+      );
+      await loadAdminData();
+      if (manualSubStationId) await loadStationSubscribers(manualSubStationId);
+      if (inspectStationId) await loadStationDetails(inspectStationId);
+      void syncBackupToFirestoreSilently();
+    } catch (err) {
+      setCloudStatus(
+        err instanceof Error ? err.message : 'ملف JSON غير صالح للاستعادة.',
+      );
+    } finally {
+      setCloudBusy(false);
+      event.target.value = '';
     }
   };
 
@@ -564,6 +878,107 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
           {feedback}
         </div>
       )}
+
+      {/* Permanent Cloud Firestore Vault & JSON Backup (Never lose codes or subscribers) */}
+      <section className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-slate-200 pb-4">
+          <div>
+            <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+              <Database className="w-5 h-5 text-teal-700" />
+              خزنة حفظ واستعادة البيانات الدائمة (Firebase Firestore + نسخة احتياطية)
+            </h2>
+            <p className="text-xs text-slate-600 mt-1">
+              مشروع Firebase المرتبط:{' '}
+              <span dir="ltr" className="font-mono-nums font-bold text-slate-800">
+                {FIREBASE_PROJECT_ID} / {FIREBASE_DATABASE_ID}
+              </span>{' '}
+              — تحفظ الأكواد المفعلة والمشتركين والبيانات في السحابة بشكل دائم لا يتأثر بأي تحديث أو إعادة تشغيل.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {firebaseUser ? (
+              <>
+                <span className="text-xs font-bold text-teal-900 bg-teal-50 border border-teal-200 px-3 py-1.5 rounded-lg inline-flex items-center gap-1.5">
+                  <Cloud className="w-4 h-4 text-teal-700" />
+                  <span dir="ltr">{firebaseUser.email}</span>
+                </span>
+                <button
+                  type="button"
+                  disabled={cloudBusy}
+                  onClick={() => void handleCloudBackupNow()}
+                  className="min-h-[40px] px-3.5 py-2 text-xs font-bold bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 text-white rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                >
+                  <CloudUpload className="w-4 h-4" />
+                  حفظ في Firebase الآن
+                </button>
+                <button
+                  type="button"
+                  disabled={cloudBusy}
+                  onClick={() => void handleCloudRestoreNow()}
+                  className="min-h-[40px] px-3.5 py-2 text-xs font-bold bg-white border border-teal-300 text-teal-900 hover:bg-teal-50 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                >
+                  <CloudDownload className="w-4 h-4" />
+                  استعادة من Firebase
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void signOutUser()}
+                  className="min-h-[40px] px-3 py-2 text-xs font-medium bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg cursor-pointer"
+                >
+                  فصل حساب Google
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                disabled={cloudBusy}
+                onClick={() => void handleConnectGoogleAdmin()}
+                className="min-h-[42px] px-4 py-2 text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white rounded-lg inline-flex items-center gap-2 cursor-pointer"
+              >
+                <Cloud className="w-4 h-4 text-teal-400" />
+                ربط حساب Google لحفظ واستعادة بيانات السحابة تلقائياً
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={() => void handleDownloadJsonBackup()}
+              className="min-h-[40px] px-3.5 py-2 text-xs font-bold bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+            >
+              <Download className="w-4 h-4 text-teal-700" />
+              تصدير نسخة JSON
+            </button>
+            <input
+              ref={jsonBackupInputRef}
+              type="file"
+              accept=".json,application/json"
+              onChange={handleImportJsonBackup}
+              className="hidden"
+            />
+            <button
+              type="button"
+              disabled={cloudBusy}
+              onClick={() => jsonBackupInputRef.current?.click()}
+              className="min-h-[40px] px-3.5 py-2 text-xs font-bold bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+            >
+              <Upload className="w-4 h-4 text-teal-700" />
+              استعادة من ملف JSON
+            </button>
+          </div>
+        </div>
+
+        {(cloudStatus || cloudLastSyncAt) && (
+          <div className="text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2">
+            <span>{cloudStatus || 'البيانات متصلة بخزنة السحابة.'}</span>
+            {cloudLastSyncAt && (
+              <span className="font-mono-nums text-[11px] text-slate-500">
+                آخر مزامنة: {new Date(cloudLastSyncAt).toLocaleString('ar-YE')}
+              </span>
+            )}
+          </div>
+        )}
+      </section>
 
       {/* Main Grid: Manual Code Generator + Admin-Exclusive Excel Upload */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
@@ -1024,15 +1439,34 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                           {sub.previousDebtYer} ر.ي
                         </td>
                         <td className="py-2.5 px-3">
-                          <button
-                            type="button"
-                            disabled={deletingSubId === sub.id}
-                            onClick={() => void handleDeleteManualSubscriber(sub)}
-                            className="px-2.5 py-1 text-xs font-medium rounded border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-800 inline-flex items-center gap-1 cursor-pointer"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                            حذف
-                          </button>
+                          {confirmDeleteSubId === sub.id ? (
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                disabled={deletingSubId === sub.id}
+                                onClick={() => void handleDeleteManualSubscriber(sub)}
+                                className="px-2.5 py-1 text-xs font-bold rounded bg-rose-700 hover:bg-rose-800 text-white cursor-pointer"
+                              >
+                                {deletingSubId === sub.id ? 'جاري...' : 'تأكيد'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmDeleteSubId(null)}
+                                className="px-2 py-1 text-xs rounded border border-slate-300 bg-white text-slate-700 cursor-pointer"
+                              >
+                                إلغاء
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteSubId(sub.id)}
+                              className="px-2.5 py-1 text-xs font-medium rounded border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-800 inline-flex items-center gap-1 cursor-pointer"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                              حذف
+                            </button>
+                          )}
                         </td>
                       </tr>
                     ))}
@@ -1064,7 +1498,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                 <th className="py-3 px-4 font-medium">القراءات</th>
                 <th className="py-3 px-4 font-medium">التعرفة</th>
                 <th className="py-3 px-4 font-medium">الحالة</th>
-                <th className="py-3 px-4 font-medium">إجراء</th>
+                <th className="py-3 px-4 font-medium">إجراء (المطور فقط)</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
@@ -1090,17 +1524,50 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                     )}
                   </td>
                   <td className="py-3 px-4">
-                    <button
-                      type="button"
-                      onClick={() => void handleToggleStation(st)}
-                      className={`px-3 py-1.5 text-xs font-medium rounded-lg border cursor-pointer ${
-                        st.licenseStatus === 'active'
-                          ? 'border-rose-200 bg-rose-50 text-rose-800'
-                          : 'border-teal-200 bg-teal-50 text-teal-800'
-                      }`}
-                    >
-                      {st.licenseStatus === 'active' ? 'إيقاف' : 'تفعيل'}
-                    </button>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void handleToggleStation(st)}
+                        className={`px-3 py-1.5 text-xs font-medium rounded-lg border cursor-pointer ${
+                          st.licenseStatus === 'active'
+                            ? 'border-rose-200 bg-rose-50 text-rose-800'
+                            : 'border-teal-200 bg-teal-50 text-teal-800'
+                        }`}
+                      >
+                        {st.licenseStatus === 'active' ? 'إيقاف' : 'تفعيل'}
+                      </button>
+
+                      {confirmDeleteStationId === st.stationId ? (
+                        <>
+                          <button
+                            type="button"
+                            disabled={deletingStationId === st.stationId}
+                            onClick={() => void handleDeleteStation(st)}
+                            className="px-3 py-1.5 text-xs font-bold rounded-lg bg-rose-700 hover:bg-rose-800 text-white cursor-pointer"
+                          >
+                            {deletingStationId === st.stationId
+                              ? 'جاري المسح...'
+                              : 'تأكيد مسح المحطة'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteStationId(null)}
+                            className="px-2.5 py-1.5 text-xs rounded-lg border border-slate-300 bg-white text-slate-700 cursor-pointer"
+                          >
+                            إلغاء
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteStationId(st.stationId)}
+                          className="px-3 py-1.5 text-xs font-medium rounded-lg border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-800 inline-flex items-center gap-1 cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          مسح المحطة
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -1238,6 +1705,151 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
           </table>
         </div>
       </section>
+
+      {/* Developer-Admin Exclusive Deletion Console for Readings, Receipts & Expenses */}
+      {stations.length > 0 && (
+        <section className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200 pb-4">
+            <div>
+              <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                <Lock className="w-4 h-4 text-rose-700" />
+                إدارة ومسح القراءات وسندات القبض والمصاريف (صلاحية الأدمن المطور فقط)
+              </h2>
+              <p className="text-xs text-slate-600 mt-1">
+                لا يمتلك مدير المحطة أو المحصّل أي صلاحية لحذف أي قراءة أو سند أو مصروف. المسح يتم من هنا حصراً.
+              </p>
+            </div>
+            <select
+              value={inspectStationId}
+              onChange={(e) => setInspectStationId(e.target.value)}
+              className="min-h-[42px] px-3 py-2 text-sm font-bold border border-slate-300 rounded-lg bg-white"
+            >
+              {stations.map((st) => (
+                <option key={st.stationId} value={st.stationId}>
+                  {st.stationName}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {loadingDetails ? (
+            <p className="text-xs text-slate-500">جاري تحميل سجلات المحطة...</p>
+          ) : (
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              {/* Readings */}
+              <div className="border border-slate-200 rounded-lg p-3 space-y-2">
+                <div className="text-xs font-bold text-slate-800">
+                  القراءات ({inspectReadings.length})
+                </div>
+                <div className="max-h-56 overflow-y-auto divide-y divide-slate-100">
+                  {inspectReadings.slice(0, 30).map((rd) => (
+                    <div
+                      key={rd.id}
+                      className="py-2 flex items-center justify-between gap-2 text-xs"
+                    >
+                      <div className="min-w-0">
+                        <div className="font-bold text-slate-900 truncate">
+                          {rd.subscriberName}
+                        </div>
+                        <div className="text-[11px] text-slate-500 font-mono-nums">
+                          {rd.previousReading} ← {rd.currentReading} ({rd.consumptionKwh} ك.و.س)
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={deletingRecordKey === `rd_${rd.id}`}
+                        onClick={() => void handleDeleteReading(rd.id)}
+                        className="px-2 py-1 text-[11px] font-bold rounded border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-800 shrink-0 cursor-pointer"
+                      >
+                        مسح
+                      </button>
+                    </div>
+                  ))}
+                  {inspectReadings.length === 0 && (
+                    <div className="py-4 text-center text-[11px] text-slate-400">
+                      لا توجد قراءات
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Receipts */}
+              <div className="border border-slate-200 rounded-lg p-3 space-y-2">
+                <div className="text-xs font-bold text-slate-800">
+                  سندات القبض ({inspectReceipts.length})
+                </div>
+                <div className="max-h-56 overflow-y-auto divide-y divide-slate-100">
+                  {inspectReceipts.slice(0, 30).map((rc) => (
+                    <div
+                      key={rc.id}
+                      className="py-2 flex items-center justify-between gap-2 text-xs"
+                    >
+                      <div className="min-w-0">
+                        <div className="font-bold text-slate-900 truncate">
+                          {rc.subscriberName}
+                        </div>
+                        <div className="text-[11px] text-slate-500 font-mono-nums">
+                          {rc.amountPaidYer} ر.ي · {rc.collectorName}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={deletingRecordKey === `rc_${rc.id}`}
+                        onClick={() => void handleDeleteReceipt(rc.id)}
+                        className="px-2 py-1 text-[11px] font-bold rounded border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-800 shrink-0 cursor-pointer"
+                      >
+                        مسح
+                      </button>
+                    </div>
+                  ))}
+                  {inspectReceipts.length === 0 && (
+                    <div className="py-4 text-center text-[11px] text-slate-400">
+                      لا توجد سندات
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Diesel & Expenses */}
+              <div className="border border-slate-200 rounded-lg p-3 space-y-2">
+                <div className="text-xs font-bold text-slate-800">
+                  مصاريف الديزل والتشغيل ({inspectExpenses.length})
+                </div>
+                <div className="max-h-56 overflow-y-auto divide-y divide-slate-100">
+                  {inspectExpenses.slice(0, 30).map((exp) => (
+                    <div
+                      key={exp.id}
+                      className="py-2 flex items-center justify-between gap-2 text-xs"
+                    >
+                      <div className="min-w-0">
+                        <div className="font-bold text-slate-900 truncate">
+                          {exp.date} — {exp.amountYer} ر.ي
+                        </div>
+                        <div className="text-[11px] text-slate-500 truncate">
+                          {exp.note || exp.category}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={deletingRecordKey === `exp_${exp.id}`}
+                        onClick={() => void handleDeleteExpense(exp.id)}
+                        className="px-2 py-1 text-[11px] font-bold rounded border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-800 shrink-0 cursor-pointer"
+                      >
+                        مسح
+                      </button>
+                    </div>
+                  ))}
+                  {inspectExpenses.length === 0 && (
+                    <div className="py-4 text-center text-[11px] text-slate-400">
+                      لا توجد مصاريف
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+        </section>
+      )}
 
       <StationOwnerBrochureModal
         open={brochureOpen}

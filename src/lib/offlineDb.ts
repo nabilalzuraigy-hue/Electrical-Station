@@ -292,6 +292,115 @@ export async function deleteSubscriberAdmin(
   );
 }
 
+export async function fetchAdminBackup(adminToken: string): Promise<{
+  stations: Record<string, StationConfig>;
+  codes: Record<string, AccessCodeRecord>;
+  stationData: Record<string, unknown>;
+  exportedAt: string;
+}> {
+  return apiRequest<{
+    stations: Record<string, StationConfig>;
+    codes: Record<string, AccessCodeRecord>;
+    stationData: Record<string, unknown>;
+    exportedAt: string;
+  }>('/api/admin/backup', {}, adminToken);
+}
+
+export async function restoreAdminBackup(
+  adminToken: string,
+  backup: {
+    stations: Record<string, StationConfig>;
+    codes: Record<string, AccessCodeRecord>;
+    stationData: Record<string, unknown>;
+  },
+  mode: 'merge' | 'replace' = 'merge',
+): Promise<{
+  ok: boolean;
+  stationCount: number;
+  codeCount: number;
+  subscriberCount: number;
+}> {
+  return apiRequest<{
+    ok: boolean;
+    stationCount: number;
+    codeCount: number;
+    subscriberCount: number;
+  }>(
+    '/api/admin/restore',
+    {
+      method: 'POST',
+      body: JSON.stringify({ ...backup, mode }),
+    },
+    adminToken,
+  );
+}
+
+export async function fetchStationDetailsAdmin(
+  adminToken: string,
+  stationId: string,
+): Promise<{
+  station: StationConfig;
+  readings: MeterReading[];
+  receipts: PaymentReceipt[];
+  expenses: DieselExpenseEntry[];
+  alerts: ManagerAlert[];
+}> {
+  return apiRequest<{
+    station: StationConfig;
+    readings: MeterReading[];
+    receipts: PaymentReceipt[];
+    expenses: DieselExpenseEntry[];
+    alerts: ManagerAlert[];
+  }>(`/api/admin/stations/${encodeURIComponent(stationId)}/details`, {}, adminToken);
+}
+
+export async function deleteStationAdmin(
+  adminToken: string,
+  stationId: string,
+): Promise<{ deleted: boolean; stationId: string }> {
+  return apiRequest<{ deleted: boolean; stationId: string }>(
+    `/api/admin/stations/${encodeURIComponent(stationId)}`,
+    { method: 'DELETE' },
+    adminToken,
+  );
+}
+
+export async function deleteReadingAdmin(
+  adminToken: string,
+  stationId: string,
+  readingId: string,
+): Promise<{ deleted: boolean; id: string }> {
+  return apiRequest<{ deleted: boolean; id: string }>(
+    `/api/admin/stations/${encodeURIComponent(stationId)}/readings/${encodeURIComponent(readingId)}`,
+    { method: 'DELETE' },
+    adminToken,
+  );
+}
+
+export async function deleteReceiptAdmin(
+  adminToken: string,
+  stationId: string,
+  receiptId: string,
+): Promise<{ deleted: boolean; id: string }> {
+  return apiRequest<{ deleted: boolean; id: string }>(
+    `/api/admin/stations/${encodeURIComponent(stationId)}/receipts/${encodeURIComponent(receiptId)}`,
+    { method: 'DELETE' },
+    adminToken,
+  );
+}
+
+export async function deleteExpenseAdmin(
+  adminToken: string,
+  stationId: string,
+  expenseId: string,
+): Promise<{ deleted: boolean; id: string }> {
+  return apiRequest<{ deleted: boolean; id: string }>(
+    `/api/admin/stations/${encodeURIComponent(stationId)}/expenses/${encodeURIComponent(expenseId)}`,
+    { method: 'DELETE' },
+    adminToken,
+  );
+}
+
 // ============================================================
 // Public Code Entry & Staff Session Operations
 // ============================================================
@@ -564,18 +673,6 @@ export async function addDieselExpenseInCloud(params: {
     params.staffToken,
   );
   return res.expense;
-}
-
-export async function deleteDieselExpenseInCloud(params: {
-  staffToken: string;
-  stationId: string;
-  expenseId: string;
-}): Promise<void> {
-  await apiRequest(
-    `/api/stations/${encodeURIComponent(params.stationId)}/expenses/${encodeURIComponent(params.expenseId)}`,
-    { method: 'DELETE' },
-    params.staffToken,
-  );
 }
 
 export async function sendCollectorLocationInCloud(params: {

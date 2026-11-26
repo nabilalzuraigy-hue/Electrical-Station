@@ -11,21 +11,39 @@ import {
   doc,
   getDocFromServer,
   getFirestore,
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+  type Firestore,
 } from 'firebase/firestore';
 
-const firebaseConfig = {
-  apiKey: 'AIzaSyD4VX6i8bI67lfp8pXfNtAS3suXPolBVjY',
-  authDomain: 'electricity-station-f5a90.firebaseapp.com',
-  projectId: 'electricity-station-f5a90',
-  storageBucket: 'electricity-station-f5a90.firebasestorage.app',
-  messagingSenderId: '479970825408',
-  appId: '1:479970825408:web:ac783bf0eaad05bdeb4925',
-};
+import firebaseConfig from '../../firebase-applet-config.json';
 
 const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app);
+
+function createFirestoreClient(): Firestore {
+  try {
+    return initializeFirestore(
+      app,
+      {
+        experimentalForceLongPolling: true,
+        localCache: persistentLocalCache({
+          tabManager: persistentMultipleTabManager(),
+        }),
+      },
+      firebaseConfig.firestoreDatabaseId,
+    );
+  } catch {
+    return getFirestore(app, firebaseConfig.firestoreDatabaseId);
+  }
+}
+
+export const db = createFirestoreClient();
 export const auth = getAuth(app);
 const googleProvider = new GoogleAuthProvider();
+
+export const FIREBASE_PROJECT_ID = firebaseConfig.projectId;
+export const FIREBASE_DATABASE_ID = firebaseConfig.firestoreDatabaseId;
 
 export enum OperationType {
   CREATE = 'create',
@@ -80,16 +98,62 @@ export function handleFirestoreError(
 }
 
 export async function testFirestoreConnection(): Promise<boolean> {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return false;
+  }
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
     return true;
   } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('Please check your Firebase configuration.');
+    const code =
+      typeof error === 'object' && error !== null && 'code' in error
+        ? String((error as { code?: unknown }).code ?? '')
+        : '';
+    const msg = error instanceof Error ? error.message : String(error);
+    if (
+      code === 'unavailable' ||
+      msg.includes('the client is offline') ||
+      msg.includes('Could not reach Cloud Firestore backend')
+    ) {
       return false;
     }
     return true;
   }
+}
+
+export function formatFirestoreUserMessage(
+  error: unknown,
+  fallback: string,
+): string {
+  const raw = error instanceof Error ? error.message : String(error ?? '');
+  let inner = raw;
+  try {
+    const parsed = JSON.parse(raw) as { error?: unknown };
+    if (parsed && typeof parsed.error === 'string') {
+      inner = parsed.error;
+    }
+  } catch {
+    // plain message
+  }
+
+  const lower = inner.toLowerCase();
+  if (
+    lower.includes('unavailable') ||
+    lower.includes('offline') ||
+    lower.includes('could not reach')
+  ) {
+    return 'تعذر الوصول إلى خادم Firebase Firestore حالياً. تحقق من اتصال الإنترنت أو حاول مجدداً بعد لحظة (البيانات المحلية محفوظة بأمان).';
+  }
+  if (
+    lower.includes('permission-denied') ||
+    lower.includes('insufficient permissions')
+  ) {
+    return 'صلاحيات Firebase مقصورة على حساب الأدمن المطور المعتمد (nabilalzuraigy@gmail.com). يرجى ربط الحساب الصحيح.';
+  }
+  if (lower.includes('quota exceeded')) {
+    return 'تم تجاوز حصة الاستخدام المجانية اليومية في Firebase Firestore.';
+  }
+  return inner || fallback;
 }
 
 export function formatAuthError(error: unknown): string {
@@ -100,7 +164,7 @@ export function formatAuthError(error: unknown): string {
   const msg = error instanceof Error ? error.message : String(error);
 
   if (code === 'auth/operation-not-allowed' || msg.includes('operation-not-allowed')) {
-    return 'مزود تسجيل الدخول عبر Google غير مفعل بعد في مشروع Firebase (electricity-station-f5a90). يرجى تفعيل Google من Authentication -> Sign-in method ثم إعادة المحاولة.';
+    return `مزود تسجيل الدخول عبر Google غير مفعل في مشروع Firebase (${firebaseConfig.projectId}).`;
   }
   if (code === 'auth/unauthorized-domain' || msg.includes('unauthorized-domain')) {
     return 'هذا النطاق غير مضاف في قائمة النطاقات المصرح بها (Authorized domains) في Firebase Authentication.';

@@ -1,19 +1,18 @@
 import React, { useMemo, useState } from 'react';
 import {
   Flame,
+  Lock,
   Plus,
-  Trash2,
   TrendingDown,
   TrendingUp,
 } from 'lucide-react';
 import {
   addDieselExpenseInCloud,
-  deleteDieselExpenseInCloud,
   saveStationLocalState,
   type StationLocalState,
 } from '../lib/offlineDb';
 import { formatCompactYer, formatYer } from '../lib/formatters';
-import type { DieselExpenseEntry, ExpenseCategory } from '../types/station';
+import type { ExpenseCategory } from '../types/station';
 
 interface DieselProfitLossSectionProps {
   state: StationLocalState;
@@ -45,7 +44,6 @@ export const DieselProfitLossSection: React.FC<DieselProfitLossSectionProps> = (
   const [amountInput, setAmountInput] = useState('');
   const [noteInput, setNoteInput] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const expenses = state.expenses ?? [];
@@ -169,30 +167,6 @@ export const DieselProfitLossSection: React.FC<DieselProfitLossSectionProps> = (
       );
     } finally {
       setSubmitting(false);
-    }
-  };
-
-  const handleDeleteExpense = async (entry: DieselExpenseEntry) => {
-    setErrorMsg(null);
-    setDeletingId(entry.id);
-    try {
-      await deleteDieselExpenseInCloud({
-        staffToken,
-        stationId: state.station.stationId,
-        expenseId: entry.id,
-      });
-      const nextState: StationLocalState = {
-        ...state,
-        expenses: expenses.filter((x) => x.id !== entry.id),
-      };
-      await saveStationLocalState(nextState);
-      onUpdateState(nextState);
-    } catch (err) {
-      setErrorMsg(
-        err instanceof Error ? err.message : 'تعذر حذف السجل من الخادم.',
-      );
-    } finally {
-      setDeletingId(null);
     }
   };
 
@@ -456,7 +430,7 @@ export const DieselProfitLossSection: React.FC<DieselProfitLossSectionProps> = (
               <th className="py-3 px-4 font-medium">الكمية / السعر</th>
               <th className="py-3 px-4 font-medium">المبلغ</th>
               <th className="py-3 px-4 font-medium">البيان</th>
-              <th className="py-3 px-4 font-medium text-left">إجراء</th>
+              <th className="py-3 px-4 font-medium text-left">الحماية</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
@@ -480,15 +454,13 @@ export const DieselProfitLossSection: React.FC<DieselProfitLossSectionProps> = (
                   {exp.note || '—'}
                 </td>
                 <td className="py-3 px-4 text-left">
-                  <button
-                    type="button"
-                    disabled={deletingId === exp.id}
-                    onClick={() => void handleDeleteExpense(exp)}
-                    className="p-2 text-slate-500 hover:text-rose-700 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
-                    title="حذف"
+                  <span
+                    className="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-500"
+                    title="المسح مقتصر على الأدمن المطور فقط"
                   >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
+                    <Lock className="w-3.5 h-3.5 text-slate-400" />
+                    محمي (المطور فقط)
+                  </span>
                 </td>
               </tr>
             ))}

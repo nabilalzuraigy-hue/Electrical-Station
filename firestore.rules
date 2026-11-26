@@ -76,6 +76,37 @@ service cloud.firestore {
         && data.createdAt is timestamp && data.createdAt == request.time;
     }
 
+    function isValidAdminVaultMeta(data) {
+      return data.keys().hasAll(['kind', 'version', 'stationIds', 'partDocs', 'stationsJson', 'codesJson', 'stationCount', 'codeCount', 'subscriberCount', 'updatedByEmail', 'clientUpdatedAt', 'updatedAt'])
+        && data.keys().hasOnly(['kind', 'version', 'stationIds', 'partDocs', 'stationsJson', 'codesJson', 'stationCount', 'codeCount', 'subscriberCount', 'updatedByEmail', 'clientUpdatedAt', 'updatedAt'])
+        && data.kind == 'meta'
+        && data.version is number && data.version >= 1
+        && data.stationIds is list && data.stationIds.size() <= 1000
+        && (data.stationIds.size() == 0 || (data.stationIds[0] is string && data.stationIds[0].size() <= 128))
+        && data.partDocs is list && data.partDocs.size() <= 5000
+        && (data.partDocs.size() == 0 || (data.partDocs[0] is string && data.partDocs[0].size() <= 128))
+        && data.stationsJson is string && data.stationsJson.size() <= 900000
+        && data.codesJson is string && data.codesJson.size() <= 900000
+        && data.stationCount is number && data.stationCount >= 0
+        && data.codeCount is number && data.codeCount >= 0
+        && data.subscriberCount is number && data.subscriberCount >= 0
+        && data.updatedByEmail is string && data.updatedByEmail.size() >= 5 && data.updatedByEmail.size() <= 150
+        && data.clientUpdatedAt is string && data.clientUpdatedAt.size() <= 60
+        && data.updatedAt is timestamp && data.updatedAt == request.time;
+    }
+
+    function isValidAdminVaultPart(data) {
+      return data.keys().hasAll(['kind', 'stationId', 'partIndex', 'totalParts', 'payloadChunk', 'updatedByEmail', 'updatedAt'])
+        && data.keys().hasOnly(['kind', 'stationId', 'partIndex', 'totalParts', 'payloadChunk', 'updatedByEmail', 'updatedAt'])
+        && data.kind == 'station_part'
+        && isValidId(data.stationId)
+        && data.partIndex is number && data.partIndex >= 0
+        && data.totalParts is number && data.totalParts >= 1
+        && data.payloadChunk is string && data.payloadChunk.size() <= 450000
+        && data.updatedByEmail is string && data.updatedByEmail.size() >= 5 && data.updatedByEmail.size() <= 150
+        && data.updatedAt is timestamp && data.updatedAt == request.time;
+    }
+
     function isValidLicense(data) {
       return data.keys().hasAll(['code', 'stationId', 'stationName', 'maxCollectors', 'maxSubscribers', 'status', 'expiresAt', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['code', 'stationId', 'stationName', 'maxCollectors', 'maxSubscribers', 'status', 'activatedByUid', 'activatedByEmail', 'activatedAt', 'expiresAt', 'createdAt', 'updatedAt'])
@@ -122,11 +153,12 @@ service cloud.firestore {
 
     function isValidStation(data) {
       return data.keys().hasAll(['stationName', 'kwhPriceYer', 'minimumFeeYer', 'mainGeneratorKwh', 'licenseCode', 'licenseStatus', 'maxCollectors', 'maxSubscribers', 'ownerUid', 'updatedAt'])
-        && data.keys().hasOnly(['stationName', 'kwhPriceYer', 'minimumFeeYer', 'mainGeneratorKwh', 'licenseCode', 'licenseStatus', 'maxCollectors', 'maxSubscribers', 'ownerUid', 'updatedAt'])
+        && data.keys().hasOnly(['stationName', 'kwhPriceYer', 'minimumFeeYer', 'mainGeneratorKwh', 'zoneGeneratorKwh', 'licenseCode', 'licenseStatus', 'maxCollectors', 'maxSubscribers', 'ownerUid', 'updatedAt'])
         && data.stationName is string && data.stationName.size() >= 2 && data.stationName.size() <= 120
         && data.kwhPriceYer is number && data.kwhPriceYer >= 0 && data.kwhPriceYer <= 100000
         && data.minimumFeeYer is number && data.minimumFeeYer >= 0 && data.minimumFeeYer <= 500000
         && data.mainGeneratorKwh is number && data.mainGeneratorKwh >= 0
+        && (!('zoneGeneratorKwh' in data) || (data.zoneGeneratorKwh is map && data.zoneGeneratorKwh.size() <= 200))
         && isValidCode(data.licenseCode)
         && data.licenseStatus in ['active', 'suspended']
         && data.maxCollectors is number && data.maxCollectors >= 1 && data.maxCollectors <= 500
@@ -219,11 +251,60 @@ service cloud.firestore {
         && data.updatedAt is timestamp && data.updatedAt == request.time;
     }
 
+    function isValidManagerAlert(data) {
+      return data.keys().hasAll(['stationId', 'subscriberId', 'meterNumber', 'subscriberName', 'collectorName', 'message', 'severity', 'resolved', 'createdAt'])
+        && data.keys().hasOnly(['stationId', 'subscriberId', 'meterNumber', 'subscriberName', 'collectorCode', 'collectorName', 'message', 'severity', 'resolved', 'createdAt'])
+        && isValidId(data.stationId)
+        && isValidId(data.subscriberId)
+        && data.meterNumber is string && data.meterNumber.size() >= 2 && data.meterNumber.size() <= 40
+        && data.subscriberName is string && data.subscriberName.size() >= 2 && data.subscriberName.size() <= 120
+        && (!('collectorCode' in data) || (data.collectorCode is string && data.collectorCode.size() <= 60))
+        && data.collectorName is string && data.collectorName.size() >= 1 && data.collectorName.size() <= 120
+        && data.message is string && data.message.size() >= 2 && data.message.size() <= 500
+        && data.severity in ['warning', 'critical']
+        && data.resolved is bool
+        && data.createdAt is timestamp;
+    }
+
+    function isValidDieselExpense(data) {
+      return data.keys().hasAll(['stationId', 'category', 'description', 'amountYer', 'date', 'createdAt'])
+        && data.keys().hasOnly(['stationId', 'category', 'description', 'liters', 'amountYer', 'date', 'createdBy', 'createdAt'])
+        && isValidId(data.stationId)
+        && data.category in ['diesel', 'oil', 'maintenance', 'salary', 'other']
+        && data.description is string && data.description.size() >= 1 && data.description.size() <= 240
+        && (!('liters' in data) || (data.liters is number && data.liters >= 0))
+        && data.amountYer is number && data.amountYer >= 0
+        && data.date is string && data.date.size() >= 4 && data.date.size() <= 40
+        && (!('createdBy' in data) || (data.createdBy is string && data.createdBy.size() <= 120))
+        && data.createdAt is timestamp;
+    }
+
+    function isValidCollectorLocation(data) {
+      return data.keys().hasAll(['collectorCode', 'collectorName', 'lat', 'lng', 'updatedAt'])
+        && data.keys().hasOnly(['collectorCode', 'collectorName', 'lat', 'lng', 'accuracyMeters', 'updatedAt'])
+        && isValidId(data.collectorCode)
+        && data.collectorName is string && data.collectorName.size() >= 1 && data.collectorName.size() <= 120
+        && data.lat is number && data.lat >= -90 && data.lat <= 90
+        && data.lng is number && data.lng >= -180 && data.lng <= 180
+        && (!('accuracyMeters' in data) || (data.accuracyMeters is number && data.accuracyMeters >= 0))
+        && data.updatedAt is timestamp && data.updatedAt == request.time;
+    }
+
     match /admins/{uid} {
       allow get: if isValidId(uid) && isSignedIn() && (request.auth.uid == uid || isAdmin());
       allow list: if false;
       allow create: if isValidId(uid) && isAdmin() && isValidAdminDoc(incoming());
       allow update, delete: if isValidId(uid) && isAdmin();
+    }
+
+    // Developer Admin Cloud Vault: ONLY the Developer Admin can read, write, or delete backup snapshots
+    match /adminVault/{docId} {
+      allow get, list: if isValidId(docId) && isAdmin();
+      allow create, update: if isValidId(docId) && isAdmin() && (
+        (docId == 'meta' && isValidAdminVaultMeta(incoming())) ||
+        (docId.matches('^station_[a-zA-Z0-9_\\-]+_p[0-9]+$') && isValidAdminVaultPart(incoming()))
+      );
+      allow delete: if isValidId(docId) && isAdmin();
     }
 
     // Super Admin issues isolated station licenses; managers redeem unused codes atomically
@@ -250,7 +331,7 @@ service cloud.firestore {
       allow delete: if isValidCode(licenseCode) && isAdmin();
     }
 
-    // Station Managers issue collector activation codes; collectors claim them atomically
+    // Station Managers issue collector activation codes; deletion is Developer Admin only
     match /collectorInvites/{inviteCode} {
       allow get: if isValidCode(inviteCode) && isSignedIn();
       allow list: if isAdmin() || (isSignedIn() && resource.data.ownerUid == request.auth.uid);
@@ -274,7 +355,7 @@ service cloud.firestore {
             && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'claimedByUid', 'claimedAt'])
           )
         );
-      allow delete: if isValidCode(inviteCode) && (isAdmin() || isStationOwner(existing().stationId));
+      allow delete: if isValidCode(inviteCode) && isAdmin();
     }
 
     // Direct binding of user UID -> isolated station & role
@@ -325,7 +406,7 @@ service cloud.firestore {
         && incoming().licenseCode == existing().licenseCode
         && (
           (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['stationName', 'licenseStatus', 'maxCollectors', 'maxSubscribers', 'updatedAt'])) ||
-          (existing().ownerUid == request.auth.uid && existing().licenseStatus == 'active' && incoming().diff(existing()).affectedKeys().hasOnly(['stationName', 'kwhPriceYer', 'minimumFeeYer', 'mainGeneratorKwh', 'updatedAt']))
+          (existing().ownerUid == request.auth.uid && existing().licenseStatus == 'active' && incoming().diff(existing()).affectedKeys().hasOnly(['stationName', 'kwhPriceYer', 'minimumFeeYer', 'mainGeneratorKwh', 'zoneGeneratorKwh', 'updatedAt']))
         );
       allow delete: if isValidId(stationId) && isAdmin();
 
@@ -350,7 +431,7 @@ service cloud.firestore {
         allow update: if isValidId(collectorId) && (isAdmin() || isStationOwner(stationId)) && isValidCollector(incoming())
           && incoming().createdAt == existing().createdAt
           && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'email', 'phone', 'assignedZones', 'permissions', 'active']);
-        allow delete: if isValidId(collectorId) && (isAdmin() || isStationOwner(stationId));
+        allow delete: if isValidId(collectorId) && isAdmin();
       }
 
       match /subscribers/{subscriberId} {
@@ -363,7 +444,7 @@ service cloud.firestore {
             (collectorHasPermission(stationId, 'canRecordReadings') && incoming().diff(existing()).affectedKeys().hasOnly(['previousReading', 'currentReading', 'previousDebtYer', 'updatedAt'])) ||
             (collectorHasPermission(stationId, 'canCollectCash') && incoming().diff(existing()).affectedKeys().hasOnly(['previousDebtYer', 'updatedAt']))
           );
-        allow delete: if isValidId(subscriberId) && isStationActive(stationId) && (isAdmin() || isStationOwner(stationId));
+        allow delete: if isValidId(subscriberId) && isAdmin();
       }
 
       match /readings/{readingId} {
@@ -381,7 +462,7 @@ service cloud.firestore {
           && incoming().createdAt == existing().createdAt
           && incoming().subscriberId == existing().subscriberId
           && incoming().diff(existing()).affectedKeys().hasOnly(['currentReading', 'consumptionKwh', 'currentBillYer', 'totalDueYer', 'photoUrl', 'photoSizeKb']);
-        allow delete: if isValidId(readingId) && isStationActive(stationId) && (isAdmin() || isStationOwner(stationId));
+        allow delete: if isValidId(readingId) && isAdmin();
       }
 
       match /receipts/{receiptId} {
@@ -399,7 +480,40 @@ service cloud.firestore {
           && incoming().createdAt == existing().createdAt
           && incoming().subscriberId == existing().subscriberId
           && incoming().diff(existing()).affectedKeys().hasOnly(['amountPaidYer', 'remainingBalanceYer']);
-        allow delete: if isValidId(receiptId) && isStationActive(stationId) && (isAdmin() || isStationOwner(stationId));
+        allow delete: if isValidId(receiptId) && isAdmin();
+      }
+
+      match /alerts/{alertId} {
+        allow get: if isValidId(alertId) && isStationStaff(stationId);
+        allow list: if isStationStaff(stationId);
+        allow create: if isValidId(alertId) && isStationActive(stationId) && isStationStaff(stationId) && isValidManagerAlert(incoming())
+          && incoming().stationId == stationId
+          && incoming().createdAt == request.time;
+        allow update: if isValidId(alertId) && isStationActive(stationId) && (isAdmin() || isStationOwner(stationId)) && isValidManagerAlert(incoming())
+          && incoming().createdAt == existing().createdAt
+          && incoming().stationId == existing().stationId
+          && incoming().diff(existing()).affectedKeys().hasOnly(['resolved']);
+        allow delete: if isValidId(alertId) && isAdmin();
+      }
+
+      match /expenses/{expenseId} {
+        allow get: if isValidId(expenseId) && (isAdmin() || isStationOwner(stationId));
+        allow list: if isAdmin() || isStationOwner(stationId);
+        allow create: if isValidId(expenseId) && isStationActive(stationId) && (isAdmin() || isStationOwner(stationId)) && isValidDieselExpense(incoming())
+          && incoming().stationId == stationId
+          && incoming().createdAt == request.time;
+        allow update: if isValidId(expenseId) && isStationActive(stationId) && (isAdmin() || isStationOwner(stationId)) && isValidDieselExpense(incoming())
+          && incoming().createdAt == existing().createdAt
+          && incoming().stationId == existing().stationId;
+        allow delete: if isValidId(expenseId) && isAdmin();
+      }
+
+      match /collectorLocations/{collectorCode} {
+        allow get: if isValidId(collectorCode) && (isAdmin() || isStationOwner(stationId));
+        allow list: if isAdmin() || isStationOwner(stationId);
+        allow create, update: if isValidId(collectorCode) && isStationActive(stationId) && isStationStaff(stationId) && isValidCollectorLocation(incoming())
+          && incoming().collectorCode == collectorCode;
+        allow delete: if isValidId(collectorCode) && isAdmin();
       }
     }
 
@@ -409,7 +523,7 @@ service cloud.firestore {
       allow create, update: if isValidId(lookupHash) && isSignedIn() && isValidPortalRecord(incoming())
         && isStationActive(incoming().stationId)
         && (isAdmin() || isStationOwner(incoming().stationId) || collectorHasPermission(incoming().stationId, 'canRecordReadings') || collectorHasPermission(incoming().stationId, 'canCollectCash'));
-      allow delete: if isValidId(lookupHash) && isSignedIn() && (isAdmin() || isStationOwner(existing().stationId));
+      allow delete: if isValidId(lookupHash) && isAdmin();
     }
   }
 }

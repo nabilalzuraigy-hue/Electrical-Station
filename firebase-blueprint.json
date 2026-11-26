@@ -61,6 +61,7 @@
         "kwhPriceYer": { "type": "number" },
         "minimumFeeYer": { "type": "number" },
         "mainGeneratorKwh": { "type": "number" },
+        "zoneGeneratorKwh": { "type": "object" },
         "licenseCode": { "type": "string", "maxLength": 40 },
         "licenseStatus": { "type": "string", "enum": ["active", "suspended"] },
         "maxCollectors": { "type": "number" },
@@ -167,12 +168,99 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["stationId", "stationName", "meterNumber", "subscriberName", "zoneStreet", "previousReading", "currentReading", "consumptionKwh", "currentBillYer", "previousDebtYer", "totalDueYer", "lastReadingPhotoUrl", "lastPaymentYer", "updatedAt"]
+    },
+    "ManagerAlert": {
+      "title": "ManagerAlert",
+      "description": "Field anomaly or tampering alert reported by a collector to the station manager.",
+      "type": "object",
+      "properties": {
+        "stationId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "subscriberId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "meterNumber": { "type": "string", "minLength": 2, "maxLength": 40 },
+        "subscriberName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "collectorCode": { "type": "string", "maxLength": 60 },
+        "collectorName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "message": { "type": "string", "minLength": 2, "maxLength": 500 },
+        "severity": { "type": "string", "enum": ["warning", "critical"] },
+        "resolved": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["stationId", "subscriberId", "meterNumber", "subscriberName", "collectorName", "message", "severity", "resolved", "createdAt"]
+    },
+    "DieselExpense": {
+      "title": "DieselExpense",
+      "description": "Diesel fuel purchase or operating expense entry for profit/loss tracking.",
+      "type": "object",
+      "properties": {
+        "stationId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "category": { "type": "string", "enum": ["diesel", "oil", "maintenance", "salary", "other"] },
+        "description": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "liters": { "type": "number" },
+        "amountYer": { "type": "number" },
+        "date": { "type": "string", "maxLength": 40 },
+        "createdBy": { "type": "string", "maxLength": 120 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["stationId", "category", "description", "amountYer", "date", "createdAt"]
+    },
+    "CollectorLocation": {
+      "title": "CollectorLocation",
+      "description": "Live GPS location ping reported by an active field collector.",
+      "type": "object",
+      "properties": {
+        "collectorCode": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "collectorName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "lat": { "type": "number" },
+        "lng": { "type": "number" },
+        "accuracyMeters": { "type": "number" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["collectorCode", "collectorName", "lat", "lng", "updatedAt"]
+    },
+    "AdminVaultMeta": {
+      "title": "AdminVaultMeta",
+      "description": "Developer Admin encrypted/chunked backup metadata stored in Firestore.",
+      "type": "object",
+      "properties": {
+        "kind": { "type": "string", "enum": ["meta"] },
+        "version": { "type": "number" },
+        "stationIds": { "type": "array" },
+        "partDocs": { "type": "array" },
+        "stationsJson": { "type": "string", "maxLength": 900000 },
+        "codesJson": { "type": "string", "maxLength": 900000 },
+        "stationCount": { "type": "number" },
+        "codeCount": { "type": "number" },
+        "subscriberCount": { "type": "number" },
+        "updatedByEmail": { "type": "string", "minLength": 5, "maxLength": 150 },
+        "clientUpdatedAt": { "type": "string", "maxLength": 60 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["kind", "version", "stationIds", "partDocs", "stationsJson", "codesJson", "stationCount", "codeCount", "subscriberCount", "updatedByEmail", "clientUpdatedAt", "updatedAt"]
+    },
+    "AdminVaultPart": {
+      "title": "AdminVaultPart",
+      "description": "Chunked station backup payload document stored in Developer Admin Cloud Vault.",
+      "type": "object",
+      "properties": {
+        "kind": { "type": "string", "enum": ["station_part"] },
+        "stationId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "partIndex": { "type": "number" },
+        "totalParts": { "type": "number" },
+        "payloadChunk": { "type": "string", "maxLength": 450000 },
+        "updatedByEmail": { "type": "string", "minLength": 5, "maxLength": 150 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["kind", "stationId", "partIndex", "totalParts", "payloadChunk", "updatedByEmail", "updatedAt"]
     }
   },
   "firestore": {
     "/admins/{uid}": {
       "schema": { "$ref": "#/entities/StationConfig" },
       "description": "Super Admin role lookup collection."
+    },
+    "/adminVault/{docId}": {
+      "schema": { "$ref": "#/entities/AdminVaultMeta" },
+      "description": "Developer Admin Cloud Vault storing chunked persistent backups of stations, activation codes, and subscribers."
     },
     "/licenses/{licenseCode}": {
       "schema": { "$ref": "#/entities/LicenseRecord" },
@@ -205,6 +293,18 @@
     "/stations/{stationId}/receipts/{receiptId}": {
       "schema": { "$ref": "#/entities/PaymentReceipt" },
       "description": "Payment receipts belonging strictly to this station."
+    },
+    "/stations/{stationId}/alerts/{alertId}": {
+      "schema": { "$ref": "#/entities/ManagerAlert" },
+      "description": "Field anomaly and tampering alerts reported to the station manager."
+    },
+    "/stations/{stationId}/expenses/{expenseId}": {
+      "schema": { "$ref": "#/entities/DieselExpense" },
+      "description": "Diesel and station operating expenses."
+    },
+    "/stations/{stationId}/collectorLocations/{collectorCode}": {
+      "schema": { "$ref": "#/entities/CollectorLocation" },
+      "description": "Live GPS tracking coordinates for active collectors."
     },
     "/subscriberPortals/{lookupHash}": {
       "schema": { "$ref": "#/entities/SubscriberPortalRecord" },

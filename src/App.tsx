@@ -9,6 +9,7 @@ import { SubscriberPortal } from './components/SubscriberPortal';
 import { FlutterCodeExplorer } from './components/FlutterCodeExplorer';
 import { PWAInstallPrompt } from './components/PWAInstallPrompt';
 import { OfflineIndicator } from './components/OfflineIndicator';
+import { testFirestoreConnection } from './lib/firebase';
 import {
   saveStationLocalState,
   syncStationPendingBatches,
@@ -279,6 +280,7 @@ export default function App() {
   const [mapsQuotaExceeded, setMapsQuotaExceeded] = useState(false);
 
   useEffect(() => {
+    void testFirestoreConnection();
     const onQuota = () => setMapsQuotaExceeded(true);
     window.addEventListener('gmp-quota-exceeded', onQuota);
     return () => window.removeEventListener('gmp-quota-exceeded', onQuota);

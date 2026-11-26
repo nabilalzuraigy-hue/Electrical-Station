@@ -166,6 +166,7 @@ interface StationDataBucket {
 
 interface PersistentStore {
   adminPasscodeHash: string | null;
+  sessionSecret?: string;
   stations: Record<string, StationRecord>;
   codes: Record<string, AccessCodeRecord>;
   stationData: Record<string, StationDataBucket>;
@@ -182,8 +183,8 @@ interface SessionPayload {
 const PORT = Number(process.env.PORT || 3000);
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const STORE_FILE = path.join(DATA_DIR, 'station_store.json');
-const SESSION_SECRET =
-  process.env.SESSION_SECRET?.trim() || crypto.randomBytes(32).toString('hex');
+const BACKUP_STORE_FILE = path.join(DATA_DIR, 'station_store.backup.json');
+const SECRET_FILE = path.join(DATA_DIR, '.session_secret');
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim();
 const geminiAi = GEMINI_API_KEY
   ? new GoogleGenAI({
@@ -202,43 +203,88 @@ function ensureDataDir(): void {
   }
 }
 
-function loadStore(): PersistentStore {
-  ensureDataDir();
-  if (!fs.existsSync(STORE_FILE)) {
-    return {
-      adminPasscodeHash: null,
-      stations: {},
-      codes: {},
-      stationData: {},
-    };
-  }
+function tryReadStoreFile(filePath: string): PersistentStore | null {
+  if (!fs.existsSync(filePath)) return null;
   try {
-    const raw = fs.readFileSync(STORE_FILE, 'utf8');
+    const raw = fs.readFileSync(filePath, 'utf8');
     const parsed = JSON.parse(raw) as Partial<PersistentStore>;
     return {
       adminPasscodeHash: parsed.adminPasscodeHash ?? null,
+      ...(typeof parsed.sessionSecret === 'string' && parsed.sessionSecret
+        ? { sessionSecret: parsed.sessionSecret }
+        : {}),
       stations: parsed.stations ?? {},
       codes: parsed.codes ?? {},
       stationData: parsed.stationData ?? {},
     };
   } catch {
-    return {
-      adminPasscodeHash: null,
-      stations: {},
-      codes: {},
-      stationData: {},
-    };
+    return null;
   }
 }
 
-function saveStore(store: PersistentStore): void {
+function loadStore(): PersistentStore {
   ensureDataDir();
-  const tmpPath = `${STORE_FILE}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(store), 'utf8');
-  fs.renameSync(tmpPath, STORE_FILE);
+  const primary = tryReadStoreFile(STORE_FILE);
+  if (primary) return primary;
+  const backup = tryReadStoreFile(BACKUP_STORE_FILE);
+  if (backup) return backup;
+  return {
+    adminPasscodeHash: null,
+    stations: {},
+    codes: {},
+    stationData: {},
+  };
+}
+
+function writeAtomicJson(targetPath: string, data: unknown): void {
+  const tmpPath = `${targetPath}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(data), 'utf8');
+  fs.renameSync(tmpPath, targetPath);
+}
+
+function saveStore(nextStore: PersistentStore): void {
+  ensureDataDir();
+  writeAtomicJson(STORE_FILE, nextStore);
+  const hasRealData =
+    Object.keys(nextStore.stations).length > 0 ||
+    Object.keys(nextStore.codes).length > 0 ||
+    Boolean(nextStore.adminPasscodeHash);
+  if (hasRealData) {
+    writeAtomicJson(BACKUP_STORE_FILE, nextStore);
+  }
 }
 
 let store: PersistentStore = loadStore();
+
+function resolvePersistentSessionSecret(): string {
+  const fromEnv = process.env.SESSION_SECRET?.trim();
+  if (fromEnv) return fromEnv;
+  if (store.sessionSecret && store.sessionSecret.length >= 32) {
+    return store.sessionSecret;
+  }
+  ensureDataDir();
+  if (fs.existsSync(SECRET_FILE)) {
+    try {
+      const existing = fs.readFileSync(SECRET_FILE, 'utf8').trim();
+      if (existing.length >= 32) {
+        store.sessionSecret = existing;
+        return existing;
+      }
+    } catch {
+      // fall through to generate once
+    }
+  }
+  const generated = crypto.randomBytes(32).toString('hex');
+  store.sessionSecret = generated;
+  try {
+    fs.writeFileSync(SECRET_FILE, generated, { mode: 0o600 });
+  } catch {
+    // ignore fs permission edge cases
+  }
+  return generated;
+}
+
+const SESSION_SECRET = resolvePersistentSessionSecret();
 
 function getBucket(stationId: string): StationDataBucket {
   if (!store.stationData[stationId]) {
@@ -327,8 +373,14 @@ function extractBearer(req: Request): SessionPayload | null {
 
 function requireAdmin(req: Request, res: Response, next: NextFunction): void {
   const session = extractBearer(req);
-  if (!session || session.role !== 'admin') {
-    res.status(401).json({ error: 'صلاحية الأدمن المطور مطلوبة.' });
+  if (!session) {
+    res.status(401).json({ error: 'جلسة الأدمن المطور مطلوبة.' });
+    return;
+  }
+  if (session.role !== 'admin') {
+    res.status(403).json({
+      error: 'صلاحية المسح والإدارة العليا مقتصرة على الأدمن المطور فقط.',
+    });
     return;
   }
   (req as Request & { session: SessionPayload }).session = session;
@@ -970,6 +1022,224 @@ async function startServer() {
   );
 
   // ============================================================
+  // Developer Admin Exclusive Backup, Restore & Record Deletion
+  // ============================================================
+
+  app.get('/api/admin/backup', requireAdmin, (_req, res) => {
+    res.json({
+      stations: store.stations,
+      codes: store.codes,
+      stationData: store.stationData,
+      exportedAt: new Date().toISOString(),
+    });
+  });
+
+  app.post('/api/admin/restore', requireAdmin, (req, res) => {
+    const incomingStations =
+      req.body?.stations &&
+      typeof req.body.stations === 'object' &&
+      !Array.isArray(req.body.stations)
+        ? (req.body.stations as Record<string, StationRecord>)
+        : null;
+    const incomingCodes =
+      req.body?.codes &&
+      typeof req.body.codes === 'object' &&
+      !Array.isArray(req.body.codes)
+        ? (req.body.codes as Record<string, AccessCodeRecord>)
+        : null;
+    const incomingStationData =
+      req.body?.stationData &&
+      typeof req.body.stationData === 'object' &&
+      !Array.isArray(req.body.stationData)
+        ? (req.body.stationData as Record<string, StationDataBucket>)
+        : null;
+
+    if (!incomingStations && !incomingCodes && !incomingStationData) {
+      res.status(400).json({ error: 'ملف أو نسخة الاستعادة غير صالحة.' });
+      return;
+    }
+
+    const mode = req.body?.mode === 'replace' ? 'replace' : 'merge';
+
+    if (mode === 'replace') {
+      store.stations = incomingStations ?? {};
+      store.codes = incomingCodes ?? {};
+      store.stationData = incomingStationData ?? {};
+    } else {
+      if (incomingStations) {
+        for (const [k, v] of Object.entries(incomingStations)) {
+          if (v && typeof v === 'object' && v.stationId) {
+            store.stations[k] = v;
+          }
+        }
+      }
+      if (incomingCodes) {
+        for (const [k, v] of Object.entries(incomingCodes)) {
+          if (v && typeof v === 'object' && v.code) {
+            store.codes[normalizeCode(k)] = v;
+          }
+        }
+      }
+      if (incomingStationData) {
+        for (const [stId, bucketIn] of Object.entries(incomingStationData)) {
+          if (!bucketIn || typeof bucketIn !== 'object') continue;
+          const target = getBucket(stId);
+          Object.assign(target.subscribers, bucketIn.subscribers ?? {});
+          Object.assign(target.readings, bucketIn.readings ?? {});
+          Object.assign(target.receipts, bucketIn.receipts ?? {});
+          Object.assign(target.alerts, bucketIn.alerts ?? {});
+          Object.assign(target.expenses ?? {}, bucketIn.expenses ?? {});
+          Object.assign(
+            target.collectorLocations ?? {},
+            bucketIn.collectorLocations ?? {},
+          );
+        }
+      }
+    }
+
+    for (const stId of Object.keys(store.stations)) {
+      getBucket(stId);
+    }
+    saveStore(store);
+
+    const subscriberCount = Object.values(store.stationData).reduce(
+      (sum, b) => sum + Object.keys(b?.subscribers ?? {}).length,
+      0,
+    );
+    res.json({
+      ok: true,
+      stationCount: Object.keys(store.stations).length,
+      codeCount: Object.keys(store.codes).length,
+      subscriberCount,
+    });
+  });
+
+  app.get('/api/admin/stations/:stationId/details', requireAdmin, (req, res) => {
+    const station = store.stations[req.params.stationId];
+    if (!station) {
+      res.status(404).json({ error: 'المحطة غير موجودة.' });
+      return;
+    }
+    const bucket = getBucket(station.stationId);
+    res.json({
+      station,
+      readings: Object.values(bucket.readings).sort((a, b) =>
+        b.recordedAt.localeCompare(a.recordedAt),
+      ),
+      receipts: Object.values(bucket.receipts).sort((a, b) =>
+        b.paidAt.localeCompare(a.paidAt),
+      ),
+      expenses: Object.values(bucket.expenses ?? {}).sort((a, b) =>
+        (b.date || b.createdAt).localeCompare(a.date || a.createdAt),
+      ),
+      alerts: Object.values(bucket.alerts ?? {}).sort((a, b) =>
+        b.createdAt.localeCompare(a.createdAt),
+      ),
+    });
+  });
+
+  app.delete('/api/admin/stations/:stationId', requireAdmin, (req, res) => {
+    const stationId = req.params.stationId;
+    if (!store.stations[stationId]) {
+      res.status(404).json({ error: 'المحطة غير موجودة.' });
+      return;
+    }
+    delete store.stations[stationId];
+    delete store.stationData[stationId];
+    for (const [codeKey, codeRec] of Object.entries(store.codes)) {
+      if (codeRec.stationId === stationId) {
+        delete store.codes[codeKey];
+      }
+    }
+    saveStore(store);
+    res.json({ deleted: true, stationId });
+  });
+
+  app.delete(
+    '/api/admin/stations/:stationId/readings/:readingId',
+    requireAdmin,
+    (req, res) => {
+      const station = store.stations[req.params.stationId];
+      if (!station) {
+        res.status(404).json({ error: 'المحطة غير موجودة.' });
+        return;
+      }
+      const bucket = getBucket(station.stationId);
+      const readingId = normalizeId(req.params.readingId);
+      if (!bucket.readings[readingId]) {
+        res.status(404).json({ error: 'القراءة غير موجودة.' });
+        return;
+      }
+      delete bucket.readings[readingId];
+      saveStore(store);
+      res.json({ deleted: true, id: readingId });
+    },
+  );
+
+  app.delete(
+    '/api/admin/stations/:stationId/receipts/:receiptId',
+    requireAdmin,
+    (req, res) => {
+      const station = store.stations[req.params.stationId];
+      if (!station) {
+        res.status(404).json({ error: 'المحطة غير موجودة.' });
+        return;
+      }
+      const bucket = getBucket(station.stationId);
+      const receiptId = normalizeId(req.params.receiptId);
+      if (!bucket.receipts[receiptId]) {
+        res.status(404).json({ error: 'سند القبض غير موجود.' });
+        return;
+      }
+      delete bucket.receipts[receiptId];
+      saveStore(store);
+      res.json({ deleted: true, id: receiptId });
+    },
+  );
+
+  app.delete(
+    '/api/admin/stations/:stationId/expenses/:expenseId',
+    requireAdmin,
+    (req, res) => {
+      const station = store.stations[req.params.stationId];
+      if (!station) {
+        res.status(404).json({ error: 'المحطة غير موجودة.' });
+        return;
+      }
+      const bucket = getBucket(station.stationId);
+      const expenseId = normalizeId(req.params.expenseId);
+      if (!bucket.expenses || !bucket.expenses[expenseId]) {
+        res.status(404).json({ error: 'المصروف غير موجود.' });
+        return;
+      }
+      delete bucket.expenses[expenseId];
+      saveStore(store);
+      res.json({ deleted: true, id: expenseId });
+    },
+  );
+
+  app.delete(
+    '/api/admin/stations/:stationId/alerts/:alertId',
+    requireAdmin,
+    (req, res) => {
+      const station = store.stations[req.params.stationId];
+      if (!station) {
+        res.status(404).json({ error: 'المحطة غير موجودة.' });
+        return;
+      }
+      const bucket = getBucket(station.stationId);
+      const alertId = normalizeId(req.params.alertId);
+      if (!bucket.alerts[alertId]) {
+        res.status(404).json({ error: 'التنبيه غير موجود.' });
+        return;
+      }
+      delete bucket.alerts[alertId];
+      saveStore(store);
+      res.json({ deleted: true, id: alertId });
+    },
+  );
+
+  // ============================================================
   // Unified Public Login (Admin Passcode / Manager or Collector Code / Subscriber Name+Phone)
   // ============================================================
 
@@ -1308,15 +1578,11 @@ async function startServer() {
     res.json({ expense: record });
   });
 
+  // Deletion of expenses is strictly restricted to Developer Admin only
   app.delete(
     '/api/stations/:stationId/expenses/:expenseId',
-    requireStaff,
+    requireAdmin,
     (req, res) => {
-      const session = (req as Request & { session: SessionPayload }).session;
-      if (session.role === 'collector') {
-        res.status(403).json({ error: 'غير مصرح بحذف المصاريف.' });
-        return;
-      }
       const station = store.stations[req.params.stationId];
       if (!station) {
         res.status(404).json({ error: 'المحطة غير موجودة.' });
