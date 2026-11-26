@@ -32,8 +32,16 @@ export function buildArabicInvoiceMessage(params: {
   currentBillYer: number;
   previousDebtYer: number;
   totalDueYer: number;
+  paidYer?: number;
+  remainingBalanceYer?: number;
   stationName: string;
 }): string {
+  const paidPart =
+    typeof params.paidYer === 'number' && params.paidYer > 0
+      ? `المدفوع نقداً ${Math.round(params.paidYer)} ريال، المتبقي ${Math.round(
+          params.remainingBalanceYer ?? Math.max(0, params.totalDueYer - params.paidYer),
+        )} ريال. `
+      : '';
   return (
     `عزيزي المشترك ${params.subscriberName}، قراءة عدادك رقم ${params.meterNumber}: ` +
     `السابقة ${Math.round(params.previousReading)}، ` +
@@ -42,6 +50,7 @@ export function buildArabicInvoiceMessage(params: {
     `مبلغ الاستهلاك ${Math.round(params.currentBillYer)} ريال، ` +
     `المتأخرات ${Math.round(params.previousDebtYer)} ريال، ` +
     `الإجمالي المستحق: ${Math.round(params.totalDueYer)} ريال. ` +
+    paidPart +
     `محطة ${params.stationName}`
   );
 }

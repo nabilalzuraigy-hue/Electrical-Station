@@ -483,7 +483,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
 
   const runAutoMeterExtraction = async (
     dataUrl: string,
-    sizeKb: number,
+    _sizeKb: number,
     prevVal: number,
   ) => {
     setExtractingReading(true);
@@ -492,9 +492,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     setManualEditInput('');
     setValidationError(null);
     setSaveSuccessNotice(null);
-    setPhotoStatus(
-      `تم ضغط الصورة (${sizeKb} KB) · جاري تحسين التباين وإزالة الظل وقراءة العداد 3 مرات...`,
-    );
+    setPhotoStatus('جاري قراءة العداد...');
 
     const result = await extractMeterReadingFromImage({
       imageDataUrl: dataUrl,
@@ -508,20 +506,15 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     setOcrResult(result);
 
     if (!result.accepted || result.reading === null) {
-      setPhotoStatus(
-        `تم الفحص عبر ${result.totalPasses} قراءات · الثقة ${result.confidence}% (مطلوب ≥ 85% وتطابق مرتين على الأقل).`,
-      );
+      setPhotoStatus(null);
       setValidationError(
-        result.message ||
-          'تعذر اعتماد القراءة من الصورة — يرجى إعادة تصوير شاشة العداد بوضوح.',
+        result.message || 'لم يتم رصد أرقام عداد واضحة — أعد التصوير أو أدخل القراءة يدوياً.',
       );
       return;
     }
 
     setManualEditInput(String(result.reading));
-    setPhotoStatus(
-      `تمت قراءة العداد عبر OCR بنجاح (${result.reading}) · تطابق ${result.agreementCount}/${result.totalPasses} · نسبة الثقة ${result.confidence}%.`,
-    );
+    setPhotoStatus(`تمت قراءة العداد: ${result.reading}`);
   };
 
   const startLiveCamera = async () => {
@@ -577,26 +570,36 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   };
 
   const captureFromLiveCamera = async () => {
-    if (!videoRef.current || !selectedSubscriber) return;
+    const video = videoRef.current;
+    if (!video || !selectedSubscriber) return;
+
+    const vw = video.videoWidth || 1280;
+    const vh = video.videoHeight || 720;
+    const maxW = 800;
+    const scale = vw > maxW ? maxW / vw : 1;
     const canvas = document.createElement('canvas');
-    canvas.width = videoRef.current.videoWidth || 1280;
-    canvas.height = videoRef.current.videoHeight || 720;
+    canvas.width = Math.round(vw * scale);
+    canvas.height = Math.round(vh * scale);
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-    const blob = await new Promise<Blob | null>((resolve) =>
-      canvas.toBlob(resolve, 'image/jpeg', 0.85),
-    );
-    if (!blob) return;
+    let quality = 0.74;
+    let dataUrl = canvas.toDataURL('image/jpeg', quality);
+    let byteLength = Math.round((dataUrl.length * 3) / 4);
+    while (byteLength > 145 * 1024 && quality > 0.3) {
+      quality -= 0.12;
+      dataUrl = canvas.toDataURL('image/jpeg', quality);
+      byteLength = Math.round((dataUrl.length * 3) / 4);
+    }
+    const sizeKb = Number((byteLength / 1024).toFixed(1));
 
-    const compressed = await compressImageUnder150Kb(blob);
-    setProofPhotoUrl(compressed.dataUrl);
-    setProofSizeKb(compressed.sizeKb);
+    setProofPhotoUrl(dataUrl);
+    setProofSizeKb(sizeKb);
     stopLiveCamera();
     await runAutoMeterExtraction(
-      compressed.dataUrl,
-      compressed.sizeKb,
+      dataUrl,
+      sizeKb,
       selectedSubscriber.previousReading,
     );
   };
@@ -606,7 +609,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   ) => {
     const file = event.target.files?.[0];
     if (!file || !selectedSubscriber) return;
-    setPhotoStatus('جاري تحسين جودة صورة العداد وقراءتها عبر OCR...');
+    setPhotoStatus('جاري قراءة العداد...');
     try {
       const compressed = await compressImageUnder150Kb(file);
       setProofPhotoUrl(compressed.dataUrl);
@@ -617,7 +620,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         selectedSubscriber.previousReading,
       );
     } catch {
-      setPhotoStatus('تعذر معالجة الصورة المختارة.');
+      setPhotoStatus('تعذر قراءة الصورة المختارة.');
     } finally {
       event.target.value = '';
     }
@@ -738,6 +741,79 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     : 0;
   const remainingBalanceYer = Math.max(0, totalDueYer - cashPaidYer);
 
+  const persistCashReceiptOnly = async () => {
+    if (!selectedSubscriber || !permissions.canCollectCash || cashPaidYer <= 0) {
+      return;
+    }
+    const now = new Date().toISOString();
+    const collectorName = resolvedCollectorName;
+    const collectorUid =
+      activeCollector?.id ?? collectorAccess?.code ?? state.station.ownerUid;
+    const nextBalance = Math.max(0, previousDebtYer - cashPaidYer);
+
+    const newReceipt: PaymentReceipt = {
+      id: sanitizeFirestoreId(`rc_${Date.now()}`),
+      subscriberId: selectedSubscriber.id,
+      meterNumber: selectedSubscriber.meterNumber,
+      subscriberName: selectedSubscriber.subscriberName,
+      readingId: `cash_${Date.now()}`,
+      amountPaidYer: cashPaidYer,
+      remainingBalanceYer: nextBalance,
+      collectorUid,
+      collectorName,
+      paidAt: now,
+      syncStatus: 'pending',
+    };
+
+    if (gpsEnabled && gpsPosition && isOnline && staffToken && !isManagerPreview) {
+      void sendCollectorLocationInCloud({
+        staffToken,
+        stationId: state.station.stationId,
+        collectorCode: resolvedCollectorCode || undefined,
+        collectorName,
+        lat: gpsPosition.lat,
+        lng: gpsPosition.lng,
+        accuracy: gpsPosition.accuracy,
+        lastSubscriberName: selectedSubscriber.subscriberName,
+        lastMeterNumber: selectedSubscriber.meterNumber,
+        zoneStreet: selectedSubscriber.zoneStreet,
+      }).catch(() => {});
+    }
+
+    const updatedSubscribers = state.subscribers.map((s) =>
+      s.id === selectedSubscriber.id
+        ? {
+            ...s,
+            previousDebtYer: nextBalance,
+            syncStatus: 'pending' as const,
+            updatedAt: now,
+          }
+        : s,
+    );
+
+    onUpdateState({
+      ...state,
+      subscribers: updatedSubscribers,
+      receipts: [newReceipt, ...state.receipts],
+    });
+
+    setCashPaidInput('');
+    setValidationError(null);
+    setSaveSuccessNotice(
+      `تم تسجيل سند قبض بمبلغ ${formatYer(cashPaidYer)} وخصمه من المستحق. المتبقي على المشترك: ${formatYer(nextBalance)}.`,
+    );
+
+    if (permissions.canSendInvoices) {
+      setSavedInvoiceText(
+        `سند قبض فوري — المشترك ${selectedSubscriber.subscriberName} (عداد ${selectedSubscriber.meterNumber}): ` +
+          `المستحق السابق ${Math.round(previousDebtYer)} ريال، ` +
+          `المدفوع نقداً ${Math.round(cashPaidYer)} ريال، ` +
+          `المتبقي المستحق: ${Math.round(nextBalance)} ريال. ` +
+          `محطة ${state.station.stationName}`,
+      );
+    }
+  };
+
   const persistAndDispatchReading = async (options?: {
     lowerReason?: LowerReadingReason;
     newMeterNumber?: string;
@@ -753,8 +829,10 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     const collectorUid =
       activeCollector?.id ?? collectorAccess?.code ?? state.station.ownerUid;
 
+    const isManualWithoutOcr =
+      reviewChoice === 'manual_edit' && ocrOriginalReading === null;
     const requiresManagerApproval =
-      isManuallyEdited || Boolean(options?.lowerReason);
+      isManuallyEdited || isManualWithoutOcr || Boolean(options?.lowerReason);
     const effectivePhoto = options?.overridePhotoUrl || proofPhotoUrl;
     const effectiveKb = options?.overridePhotoKb || proofSizeKb;
 
@@ -773,11 +851,12 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       photoUrl: effectivePhoto,
       photoSizeKb: effectiveKb,
       hasLocalPhoto: true,
-      readingSource: isManuallyEdited ? 'manual_override' : 'camera_ocr',
+      readingSource:
+        isManuallyEdited || isManualWithoutOcr ? 'manual_override' : 'camera_ocr',
       ocrConfidence: ocrResult?.confidence ?? 0,
       ...(ocrOriginalReading !== null ? { ocrOriginalReading } : {}),
-      wasManuallyEdited: isManuallyEdited,
-      ...(isManuallyEdited ? { editedAt: now } : {}),
+      wasManuallyEdited: isManuallyEdited || isManualWithoutOcr,
+      ...(isManuallyEdited || isManualWithoutOcr ? { editedAt: now } : {}),
       approvalStatus: requiresManagerApproval ? 'pending_manager' : 'approved',
       ...(options?.lowerReason ? { lowerReadingReason: options.lowerReason } : {}),
       ...(options?.newMeterNumber
@@ -823,8 +902,8 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
 
     const alertsToQueue: ManagerAlert[] = [];
 
-    // 1) Immediate alert when collector manually modified OCR reading
-    if (isManuallyEdited && ocrOriginalReading !== null) {
+    // 1) Immediate alert when collector manually entered/modified reading
+    if ((isManuallyEdited || isManualWithoutOcr) && !options?.lowerReason) {
       alertsToQueue.push({
         id: sanitizeFirestoreId(`al_edit_${Date.now()}`),
         stationId: state.station.stationId,
@@ -837,20 +916,13 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         meterNumber: selectedSubscriber.meterNumber,
         collectorName,
         collectorCode: resolvedCollectorCode || undefined,
-        ocrOriginalReading,
+        ...(ocrOriginalReading !== null ? { ocrOriginalReading } : {}),
         editedReading: activeFinalReading,
         previousReading: prevReading,
         difference:
-          Math.round((activeFinalReading - ocrOriginalReading) * 100) / 100,
-        ...(options?.lowerReason
-          ? { lowerReadingReason: options.lowerReason }
-          : {}),
-        ...(options?.newMeterNumber
-          ? { newMeterNumber: options.newMeterNumber }
-          : {}),
-        ...(typeof options?.openingReading === 'number'
-          ? { openingReading: options.openingReading }
-          : {}),
+          ocrOriginalReading !== null
+            ? Math.round((activeFinalReading - ocrOriginalReading) * 100) / 100
+            : Math.round((activeFinalReading - prevReading) * 100) / 100,
         photoUrl: effectivePhoto,
         createdAt: now,
         syncStatus: 'pending',
@@ -931,11 +1003,12 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     }
 
     const nextReceipts = [...state.receipts];
-    if (
-      !requiresManagerApproval &&
-      cashPaidYer > 0 &&
-      permissions.canCollectCash
-    ) {
+    const debtAfterCashOnly = Math.max(0, previousDebtYer - cashPaidYer);
+    const effectiveRemainingAfterSave = requiresManagerApproval
+      ? debtAfterCashOnly
+      : remainingBalanceYer;
+
+    if (cashPaidYer > 0 && permissions.canCollectCash) {
       const newReceipt: PaymentReceipt = {
         id: sanitizeFirestoreId(`rc_${Date.now()}`),
         subscriberId: selectedSubscriber.id,
@@ -943,7 +1016,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         subscriberName: selectedSubscriber.subscriberName,
         readingId,
         amountPaidYer: cashPaidYer,
-        remainingBalanceYer,
+        remainingBalanceYer: effectiveRemainingAfterSave,
         collectorUid,
         collectorName,
         paidAt: now,
@@ -952,21 +1025,30 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       nextReceipts.unshift(newReceipt);
     }
 
-    // Only advance subscriber's official previousReading / balance immediately if NO manager approval is needed
-    const updatedSubscribers = requiresManagerApproval
-      ? state.subscribers
-      : state.subscribers.map((s) =>
-          s.id === selectedSubscriber.id
-            ? {
-                ...s,
-                previousReading: activeFinalReading,
-                currentReading: activeFinalReading,
-                previousDebtYer: remainingBalanceYer,
-                syncStatus: 'pending' as const,
-                updatedAt: now,
-              }
-            : s,
-        );
+    // Only advance subscriber's official previousReading / currentReading if NO manager approval is needed,
+    // while always deducting any collected cash receipt from previousDebtYer immediately.
+    const updatedSubscribers = state.subscribers.map((s) => {
+      if (s.id !== selectedSubscriber.id) return s;
+      if (requiresManagerApproval) {
+        if (cashPaidYer > 0 && permissions.canCollectCash) {
+          return {
+            ...s,
+            previousDebtYer: debtAfterCashOnly,
+            syncStatus: 'pending' as const,
+            updatedAt: now,
+          };
+        }
+        return s;
+      }
+      return {
+        ...s,
+        previousReading: activeFinalReading,
+        currentReading: activeFinalReading,
+        previousDebtYer: remainingBalanceYer,
+        syncStatus: 'pending' as const,
+        updatedAt: now,
+      };
+    });
 
     onUpdateState({
       ...state,
@@ -976,11 +1058,17 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       alerts: [...syncedAlerts, ...(state.alerts ?? [])],
     });
 
+    setCashPaidInput('');
+
     if (requiresManagerApproval) {
+      const cashNote =
+        cashPaidYer > 0
+          ? ` وتم تسجيل وخصم سند القبض (${formatYer(cashPaidYer)}).`
+          : '';
       setSaveSuccessNotice(
-        isOnline
-          ? 'تم إرسال القراءة والصورة وإشعار فوري إلى مدير المحطة — لن تُعتمد القراءة في حساب المشترك إلا بعد موافقة المدير.'
-          : 'تم حفظ القراءة المعلقة وإشعار المدير محلياً — سيُرفع الإشعار تلقائياً عند توفر الإنترنت ولن تُعتمد إلا بموافقة المدير.',
+        (isOnline
+          ? 'تم إرسال القراءة والصورة للمراجعة إلى مدير المحطة.'
+          : 'تم حفظ القراءة المعلقة وإشعار المدير محلياً.') + cashNote,
       );
       setSavedInvoiceText(null);
       return;
@@ -988,10 +1076,12 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
 
     setSaveSuccessNotice(
       isClosedHouseZero
-        ? 'تم حفظ القراءة بنجاح بحالة: استهلاك صفر - بيت مغلق.'
+        ? 'تم حفظ القراءة بنجاح (بيت مغلق).'
         : isHighConsumptionWarning
-          ? 'تم حفظ القراءة وإرسال تنبيه أصفر للمدير بسبب ارتفاع الاستهلاك عن 3 أضعاف المتوسط.'
-          : 'تم حفظ القراءة المعتمدة أوفلاين بنجاح.',
+          ? 'تم حفظ القراءة وإرسال تنبيه للمدير بسبب ارتفاع الاستهلاك.'
+          : cashPaidYer > 0
+            ? `تم حفظ القراءة وسند القبض (${formatYer(cashPaidYer)}). المتبقي: ${formatYer(remainingBalanceYer)}.`
+            : 'تم حفظ القراءة المعتمدة أوفلاين بنجاح.',
     );
 
     if (permissions.canSendInvoices) {
@@ -1004,6 +1094,9 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         currentBillYer,
         previousDebtYer,
         totalDueYer,
+        ...(cashPaidYer > 0
+          ? { paidYer: cashPaidYer, remainingBalanceYer }
+          : {}),
         stationName: state.station.stationName,
       });
       setSavedInvoiceText(
@@ -1016,31 +1109,37 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
 
   const handleSaveFormSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selectedSubscriber || !permissions.canRecordReadings) return;
+    if (!selectedSubscriber) return;
+
+    // Allow cash-only receipt submission without taking a meter reading
+    if (
+      permissions.canCollectCash &&
+      cashPaidYer > 0 &&
+      !proofPhotoUrl &&
+      activeFinalReading === null
+    ) {
+      await persistCashReceiptOnly();
+      return;
+    }
+
+    if (!permissions.canRecordReadings) return;
 
     if (!proofPhotoUrl) {
       setValidationError('يرجى تصوير العداد أو إرفاق صورة العداد أولاً.');
       return;
     }
     if (extractingReading) {
-      setValidationError('يرجى الانتظار حتى يكتمل فحص القراءة من الصورة.');
-      return;
-    }
-    if (!ocrResult?.accepted || ocrOriginalReading === null) {
-      setValidationError(
-        ocrResult?.message ||
-          'لم تُعتمد قراءة صالحة من OCR (يجب ≥ 85% ثقة وتطابق مرتين) — يرجى إعادة تصوير العداد.',
-      );
+      setValidationError('يرجى الانتظار حتى تكتمل قراءة العداد.');
       return;
     }
     if (reviewChoice === 'pending') {
       setValidationError(
-        'يرجى الضغط على زر "تأكيد القراءة" أو "تعديل يدوي" للمراجعة قبل الحفظ.',
+        'يرجى تأكيد القراءة أو اختيار الإدخال اليدوي قبل الحفظ.',
       );
       return;
     }
     if (activeFinalReading === null) {
-      setValidationError('يرجى إدخال قيمة رقمية صحيحة في خانة التعديل اليدوي.');
+      setValidationError('يرجى إدخال قيمة رقمية صحيحة للقراءة.');
       return;
     }
     setValidationError(null);
@@ -1415,187 +1514,139 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                 )}
               </div>
 
-              {!permissions.canRecordReadings ? (
+              {!permissions.canRecordReadings && !permissions.canCollectCash ? (
                 <div className="p-4 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900">
-                  صلاحية تسجيل القراءات وتصوير العداد غير مفعّلة لك حالياً من
-                  قِبل مدير المحطة.
+                  صلاحيات تسجيل القراءات والتحصيل غير مفعّلة لك حالياً من قِبل مدير المحطة.
                 </div>
               ) : (
                 <>
-                  {/* Camera Viewfinder with Auto-Flash & Zoom ROI */}
-                  <div className="space-y-3">
-                    <div className="relative h-60 rounded-xl bg-slate-900 overflow-hidden flex items-center justify-center border border-slate-800">
-                      {cameraStreamActive ? (
-                        <video
-                          ref={videoRef}
-                          playsInline
-                          muted
-                          className="w-full h-full object-cover"
-                        />
-                      ) : showEnhancedPreview && ocrResult?.zoomedBwPreviewUrl ? (
-                        <img
-                          src={ocrResult.zoomedBwPreviewUrl}
-                          alt="معالجة الصورة المكبّرة بالأبيض والأسود"
-                          referrerPolicy="no-referrer"
-                          className="w-full h-full object-contain bg-white"
-                        />
-                      ) : proofPhotoUrl ? (
-                        <img
-                          src={proofPhotoUrl}
-                          alt={`صورة إثبات العداد ${selectedSubscriber.meterNumber}`}
-                          referrerPolicy="no-referrer"
-                          className="w-full h-full object-cover"
-                        />
-                      ) : (
-                        <div className="text-center px-4 space-y-1.5">
-                          <ScanLine className="w-8 h-8 text-teal-400 mx-auto" />
-                          <p className="text-xs text-slate-200 font-medium">
-                            محرك OCR فائق الحساسية: إزالة الظل والغبار + فلاش تلقائي للإضاءة الضعيفة
-                          </p>
-                          <p className="text-[11px] text-slate-400">
-                            ضع أرقام العداد داخل الإطار ليقرأها النظام 3 مرات بدقة ≥ 85%
-                          </p>
-                        </div>
-                      )}
-
-                      {(cameraStreamActive || !proofPhotoUrl) && (
-                        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-                          <div className="w-64 h-24 border-2 border-teal-400 rounded-lg shadow-[0_0_0_9999px_rgba(15,23,42,0.38)] flex items-end justify-center pb-1">
-                            <span className="text-[10px] font-medium text-teal-100 bg-slate-900/80 px-2 rounded">
-                              إطار تكبير أرقام العداد
-                            </span>
+                  {permissions.canRecordReadings && (
+                    <div className="space-y-3">
+                      <div className="relative h-56 rounded-xl bg-slate-900 overflow-hidden flex items-center justify-center border border-slate-800">
+                        {cameraStreamActive ? (
+                          <video
+                            ref={videoRef}
+                            playsInline
+                            muted
+                            className="w-full h-full object-cover"
+                          />
+                        ) : showEnhancedPreview && ocrResult?.zoomedBwPreviewUrl ? (
+                          <img
+                            src={ocrResult.zoomedBwPreviewUrl}
+                            alt="معاينة الصورة المكبّرة"
+                            referrerPolicy="no-referrer"
+                            className="w-full h-full object-contain bg-white"
+                          />
+                        ) : proofPhotoUrl ? (
+                          <img
+                            src={proofPhotoUrl}
+                            alt={`صورة العداد ${selectedSubscriber.meterNumber}`}
+                            referrerPolicy="no-referrer"
+                            className="w-full h-full object-cover"
+                          />
+                        ) : (
+                          <div className="text-center px-4 space-y-2">
+                            <ScanLine className="w-8 h-8 text-teal-400 mx-auto" />
+                            <p className="text-xs text-slate-200 font-medium">
+                              التقط صورة العداد أو افتح الكاميرا المباشرة
+                            </p>
                           </div>
-                        </div>
-                      )}
+                        )}
 
-                      {cameraStreamActive && liveLowLight && (
-                        <div className="absolute top-3 right-3 bg-amber-500/95 text-slate-950 text-[11px] font-bold px-2.5 py-1 rounded-md inline-flex items-center gap-1.5">
-                          <Flashlight className="w-3.5 h-3.5" />
-                          {torchActive
-                            ? 'إضاءة ضعيفة — الفلاش مُفعّل تلقائياً'
-                            : 'إضاءة ضعيفة — شغّل الفلاش'}
-                        </div>
-                      )}
-                    </div>
+                        {cameraStreamActive && (
+                          <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                            <div className="w-64 h-24 border-2 border-teal-400 rounded-lg shadow-[0_0_0_9999px_rgba(15,23,42,0.38)]" />
+                          </div>
+                        )}
 
-                    <div className="flex flex-wrap items-center gap-2.5">
-                      {!cameraStreamActive ? (
-                        <button
-                          type="button"
-                          onClick={startLiveCamera}
-                          className="min-h-[44px] px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium rounded-lg inline-flex items-center gap-2 cursor-pointer"
-                        >
-                          <Camera className="w-4 h-4" />
-                          فتح الكاميرا المباشرة
-                        </button>
-                      ) : (
-                        <>
+                        {cameraStreamActive && liveLowLight && (
+                          <div className="absolute top-3 right-3 bg-amber-500/95 text-slate-950 text-[11px] font-bold px-2.5 py-1 rounded-md inline-flex items-center gap-1.5">
+                            <Flashlight className="w-3.5 h-3.5" />
+                            {torchActive ? 'الفلاش مُفعّل' : 'إضاءة منخفضة'}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2.5">
+                        {!cameraStreamActive ? (
                           <button
                             type="button"
-                            onClick={captureFromLiveCamera}
-                            className="min-h-[44px] px-4 py-2 bg-teal-700 hover:bg-teal-800 text-white text-xs font-medium rounded-lg inline-flex items-center gap-2 cursor-pointer"
+                            onClick={startLiveCamera}
+                            className="min-h-[44px] px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium rounded-lg inline-flex items-center gap-2 cursor-pointer"
                           >
                             <Camera className="w-4 h-4" />
-                            التقاط وتحليل الصورة (OCR)
+                            فتح الكاميرا المباشرة
                           </button>
-                          {torchSupported && (
+                        ) : (
+                          <>
                             <button
                               type="button"
-                              onClick={() => void toggleManualTorch()}
-                              className={`min-h-[44px] px-3.5 py-2 text-xs font-medium rounded-lg border inline-flex items-center gap-1.5 cursor-pointer ${
-                                torchActive
-                                  ? 'bg-amber-100 border-amber-400 text-amber-900'
-                                  : 'bg-white border-slate-300 text-slate-700'
-                              }`}
+                              onClick={captureFromLiveCamera}
+                              className="min-h-[44px] px-4 py-2 bg-teal-700 hover:bg-teal-800 text-white text-xs font-medium rounded-lg inline-flex items-center gap-2 cursor-pointer"
                             >
-                              <Flashlight className="w-4 h-4" />
-                              {torchActive ? 'إطفاء الفلاش' : 'تشغيل الفلاش'}
+                              <Camera className="w-4 h-4" />
+                              التقاط وقراءة الرقم
                             </button>
-                          )}
-                        </>
-                      )}
+                            {torchSupported && (
+                              <button
+                                type="button"
+                                onClick={() => void toggleManualTorch()}
+                                className={`min-h-[44px] px-3.5 py-2 text-xs font-medium rounded-lg border inline-flex items-center gap-1.5 cursor-pointer ${
+                                  torchActive
+                                    ? 'bg-amber-100 border-amber-400 text-amber-900'
+                                    : 'bg-white border-slate-300 text-slate-700'
+                                }`}
+                              >
+                                <Flashlight className="w-4 h-4" />
+                                {torchActive ? 'إطفاء الفلاش' : 'تشغيل الفلاش'}
+                              </button>
+                            )}
+                          </>
+                        )}
 
-                      <input
-                        ref={cameraInputRef}
-                        type="file"
-                        accept="image/*"
-                        capture="environment"
-                        onChange={handlePhotoUpload}
-                        className="hidden"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => cameraInputRef.current?.click()}
-                        className="min-h-[44px] px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 text-xs font-medium rounded-lg inline-flex items-center gap-2 cursor-pointer"
-                      >
-                        <Upload className="w-4 h-4" />
-                        التقاط / اختيار صورة عداد
-                      </button>
-
-                      {ocrResult?.zoomedBwPreviewUrl && (
+                        <input
+                          ref={cameraInputRef}
+                          type="file"
+                          accept="image/*"
+                          capture="environment"
+                          onChange={handlePhotoUpload}
+                          className="hidden"
+                        />
                         <button
                           type="button"
-                          onClick={() => setShowEnhancedPreview((v) => !v)}
-                          className="min-h-[44px] px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                          onClick={() => cameraInputRef.current?.click()}
+                          className="min-h-[44px] px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 text-xs font-medium rounded-lg inline-flex items-center gap-2 cursor-pointer"
                         >
-                          <Eye className="w-4 h-4 text-teal-700" />
-                          {showEnhancedPreview
-                            ? 'عرض الصورة الأصلية'
-                            : 'عرض المعالجة المكبّرة'}
+                          <Upload className="w-4 h-4" />
+                          التقاط / اختيار صورة عداد
                         </button>
-                      )}
-                    </div>
 
-                    {photoStatus && (
-                      <p className="text-xs text-teal-900 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2">
-                        {photoStatus}
-                      </p>
-                    )}
-
-                    {/* Multi-Engine 3-Pass Diagnostic Strip */}
-                    {ocrResult && (
-                      <div className="border border-slate-200 rounded-xl p-3.5 bg-slate-50 space-y-2.5">
-                        <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                          <span className="font-bold text-slate-800">
-                            نتائج القراءة المتعددة ({ocrResult.totalPasses}{' '}
-                            قراءات بأكثر من محرك OCR)
-                          </span>
-                          <span
-                            className={`font-mono-nums font-bold ${
-                              ocrResult.accepted
-                                ? 'text-teal-700'
-                                : 'text-rose-700'
-                            }`}
+                        {ocrResult?.zoomedBwPreviewUrl && (
+                          <button
+                            type="button"
+                            onClick={() => setShowEnhancedPreview((v) => !v)}
+                            className="min-h-[44px] px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
                           >
-                            الثقة: {ocrResult.confidence}% · التطابق:{' '}
-                            {ocrResult.agreementCount}/{ocrResult.totalPasses}
+                            <Eye className="w-4 h-4 text-teal-700" />
+                            {showEnhancedPreview
+                              ? 'الصورة الأصلية'
+                              : 'تكبير الأرقام'}
+                          </button>
+                        )}
+                      </div>
+
+                      {photoStatus && (
+                        <p className="text-xs text-teal-900 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2 font-medium">
+                          {photoStatus}
+                        </p>
+                      )}
+
+                      {ocrResult && !ocrResult.accepted && reviewChoice !== 'manual_edit' && (
+                        <div className="flex flex-wrap items-center justify-between gap-2 bg-rose-50 border border-rose-200 rounded-lg p-3">
+                          <span className="text-xs text-rose-800 font-medium">
+                            {ocrResult.message || 'لم يتم رصد أرقام عداد واضحة في الصورة.'}
                           </span>
-                        </div>
-                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                          {ocrResult.passes.map((p, idx) => (
-                            <div
-                              key={`${p.engine}_${idx}`}
-                              className="bg-white border border-slate-200 rounded-lg px-2.5 py-2 text-[11px]"
-                            >
-                              <div className="text-slate-500 truncate">
-                                {p.label}
-                              </div>
-                              <div className="flex items-center justify-between mt-1 font-mono-nums">
-                                <span className="font-bold text-slate-900">
-                                  {p.reading !== null ? p.reading : 'غير مقروء'}
-                                </span>
-                                <span className="text-slate-600">
-                                  {p.confidence}%
-                                </span>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                        {!ocrResult.accepted && (
-                          <div className="flex items-center justify-between gap-3 bg-rose-50 border border-rose-200 rounded-lg p-2.5">
-                            <span className="text-xs text-rose-800 font-medium">
-                              {ocrResult.message}
-                            </span>
+                          <div className="flex items-center gap-2">
                             <button
                               type="button"
                               onClick={() => cameraInputRef.current?.click()}
@@ -1604,67 +1655,81 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                               <RotateCcw className="w-3.5 h-3.5" />
                               إعادة التصوير
                             </button>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-
-                  {/* OCR Review, Confirm or Manual Edit + Cash Receipt Form */}
-                  <form onSubmit={handleSaveFormSubmit} className="space-y-4">
-                    {ocrResult?.accepted && ocrOriginalReading !== null && (
-                      <div className="border border-teal-200 bg-teal-50/50 rounded-xl p-4 space-y-3">
-                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                          <div>
-                            <div className="text-xs font-medium text-slate-600">
-                              الرقم المقروء والمعتمد من OCR (تطابق{' '}
-                              {ocrResult.agreementCount}/
-                              {ocrResult.totalPasses})
-                            </div>
-                            <div className="text-2xl font-bold font-mono-nums text-slate-900 mt-0.5">
-                              {ocrOriginalReading}
-                            </div>
-                          </div>
-                          <div className="flex flex-wrap items-center gap-2">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setReviewChoice('confirmed');
-                                setValidationError(null);
-                              }}
-                              className={`min-h-[42px] px-4 py-2 text-xs font-bold rounded-lg inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
-                                reviewChoice === 'confirmed'
-                                  ? 'bg-teal-700 text-white'
-                                  : 'bg-white border border-teal-300 text-teal-900 hover:bg-teal-50'
-                              }`}
-                            >
-                              <Check className="w-4 h-4" />
-                              تأكيد القراءة
-                            </button>
                             <button
                               type="button"
                               onClick={() => {
                                 setReviewChoice('manual_edit');
-                                setManualEditInput(String(ocrOriginalReading));
+                                setManualEditInput('');
                                 setValidationError(null);
                               }}
-                              className={`min-h-[42px] px-4 py-2 text-xs font-bold rounded-lg inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
-                                reviewChoice === 'manual_edit'
-                                  ? 'bg-amber-600 text-white'
-                                  : 'bg-white border border-amber-300 text-amber-900 hover:bg-amber-50'
-                              }`}
+                              className="px-3 py-1.5 text-xs font-bold bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 rounded-md inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
                             >
-                              <Edit3 className="w-4 h-4" />
-                              تعديل يدوي
+                              <Edit3 className="w-3.5 h-3.5" />
+                              إدخال يدوي
                             </button>
                           </div>
                         </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* OCR Review, Confirm or Manual Edit + Cash Receipt Form */}
+                  <form onSubmit={handleSaveFormSubmit} className="space-y-4">
+                    {((ocrResult?.accepted && ocrOriginalReading !== null) ||
+                      (proofPhotoUrl && reviewChoice === 'manual_edit')) && (
+                      <div className="border border-teal-200 bg-teal-50/50 rounded-xl p-4 space-y-3">
+                        {ocrResult?.accepted && ocrOriginalReading !== null && (
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                            <div>
+                              <div className="text-xs font-medium text-slate-600">
+                                الرقم المقروء من العداد
+                              </div>
+                              <div className="text-2xl font-bold font-mono-nums text-slate-900 mt-0.5">
+                                {ocrOriginalReading}
+                              </div>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setReviewChoice('confirmed');
+                                  setValidationError(null);
+                                }}
+                                className={`min-h-[42px] px-4 py-2 text-xs font-bold rounded-lg inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
+                                  reviewChoice === 'confirmed'
+                                    ? 'bg-teal-700 text-white'
+                                    : 'bg-white border border-teal-300 text-teal-900 hover:bg-teal-50'
+                                }`}
+                              >
+                                <Check className="w-4 h-4" />
+                                تأكيد القراءة
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setReviewChoice('manual_edit');
+                                  setManualEditInput(String(ocrOriginalReading));
+                                  setValidationError(null);
+                                }}
+                                className={`min-h-[42px] px-4 py-2 text-xs font-bold rounded-lg inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
+                                  reviewChoice === 'manual_edit'
+                                    ? 'bg-amber-600 text-white'
+                                    : 'bg-white border border-amber-300 text-amber-900 hover:bg-amber-50'
+                                }`}
+                              >
+                                <Edit3 className="w-4 h-4" />
+                                تعديل يدوي
+                              </button>
+                            </div>
+                          </div>
+                        )}
 
                         {reviewChoice === 'manual_edit' && (
                           <div className="bg-white border border-amber-300 rounded-lg p-3 space-y-2">
                             <label className="block text-xs font-bold text-amber-900">
-                              أدخل القراءة المعدلة يدوياً (سيُرسل إشعار فوري
-                              للمدير ولن تُعتمد إلا بموافقته):
+                              {ocrOriginalReading !== null
+                                ? 'أدخل القراءة المعدلة يدوياً (تُرسل لمراجعة مدير المحطة):'
+                                : 'أدخل قراءة العداد يدوياً (تُرسل مع الصورة لمراجعة مدير المحطة):'}
                             </label>
                             <input
                               type="number"
@@ -1674,18 +1739,12 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                               onChange={(e) =>
                                 setManualEditInput(e.target.value)
                               }
+                              placeholder="أدخل رقم القراءة"
                               className="w-full min-h-[48px] px-3.5 py-2.5 text-lg sm:text-xl font-bold font-mono-nums border border-amber-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-500"
                             />
                             {isManuallyEdited && activeFinalReading !== null && (
                               <p className="text-[11px] text-rose-700 font-medium">
-                                سجل التدقيق: الأصلي من OCR ({ocrOriginalReading})
-                                ← الجديد ({activeFinalReading}) · الفارق (
-                                {Math.round(
-                                  (activeFinalReading - ocrOriginalReading) *
-                                    100,
-                                ) / 100}
-                                ) · المحصّل:{' '}
-                                {activeCollector?.name ?? 'مدير المحطة'}
+                                الأصلي ({ocrOriginalReading}) ← المعدل ({activeFinalReading})
                               </p>
                             )}
                           </div>
@@ -1694,30 +1753,33 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                     )}
 
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                      <div>
-                        <label className="flex items-center gap-1.5 text-xs font-medium text-slate-700 mb-1">
-                          <Lock className="w-3.5 h-3.5 text-teal-700" />
-                          القراءة النهائية للمراجعة
-                        </label>
-                        <div className="w-full min-h-[46px] px-3 py-2 text-base font-bold font-mono-nums border border-slate-300 bg-slate-100 text-slate-900 rounded-lg flex items-center justify-between">
-                          <span>
-                            {extractingReading
-                              ? 'جاري المسح 3 مرات...'
-                              : activeFinalReading !== null
-                                ? activeFinalReading
-                                : ocrResult?.accepted
-                                  ? 'اختر تأكيد أو تعديل أعلاه'
-                                  : 'بانتظار صورة واضحة ≥ 85%'}
-                          </span>
-                          <span className="text-[11px] font-sans font-medium text-teal-800">
-                            {isManuallyEdited
-                              ? 'معدّلة (بانتظار المدير)'
-                              : reviewChoice === 'confirmed'
-                                ? 'مؤكدة من OCR'
-                                : 'قراءة OCR'}
-                          </span>
+                      {permissions.canRecordReadings && (
+                        <div>
+                          <label className="flex items-center gap-1.5 text-xs font-medium text-slate-700 mb-1">
+                            <Lock className="w-3.5 h-3.5 text-teal-700" />
+                            القراءة النهائية للمراجعة
+                          </label>
+                          <div className="w-full min-h-[46px] px-3 py-2 text-base font-bold font-mono-nums border border-slate-300 bg-slate-100 text-slate-900 rounded-lg flex items-center justify-between">
+                            <span>
+                              {extractingReading
+                                ? 'جاري القراءة...'
+                                : activeFinalReading !== null
+                                  ? activeFinalReading
+                                  : ocrResult?.accepted
+                                    ? 'اختر تأكيد أو تعديل أعلاه'
+                                    : '—'}
+                            </span>
+                            {(reviewChoice === 'confirmed' ||
+                              reviewChoice === 'manual_edit') && (
+                              <span className="text-[11px] font-sans font-medium text-teal-800">
+                                {reviewChoice === 'manual_edit'
+                                  ? 'إدخال يدوي (بانتظار المدير)'
+                                  : 'مؤكدة'}
+                              </span>
+                            )}
+                          </div>
                         </div>
-                      </div>
+                      )}
 
                       {permissions.canCollectCash && (
                         <div>
@@ -1751,7 +1813,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                       <div className="bg-amber-50 border border-amber-300 rounded-lg px-3.5 py-2.5 text-xs text-amber-950 flex items-center gap-2">
                         <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
                         <span>
-                          القراءة ({activeFinalReading}) أقل من السابقة ({prevReading}) — عند الحفظ سيُطلب تحديد السبب وإرسال إشعار لموافقة المدير.
+                          القراءة ({activeFinalReading}) أقل من السابقة ({prevReading}) — عند الحفظ سيُطلب تحديد السبب لموافقة المدير.
                         </span>
                       </div>
                     )}
@@ -1761,7 +1823,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                       <div className="bg-amber-50 border border-amber-300 rounded-lg px-3.5 py-2.5 text-xs text-amber-950 flex items-center gap-2">
                         <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
                         <span>
-                          تنبيه أصفر: الاستهلاك ({consumptionKwh} ك.و.س) أعلى من 3 أضعاف متوسط آخر 3 أشهر ({avg3MonthsKwh} ك.و.س) — سيُرسل تنبيه للمدير.
+                          تنبيه: الاستهلاك ({consumptionKwh} ك.و.س) أعلى من 3 أضعاف متوسط آخر 3 أشهر ({avg3MonthsKwh} ك.و.س).
                         </span>
                       </div>
                     )}
@@ -1796,7 +1858,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                           {formatYer(currentBillYer)}
                         </span>
                       </div>
-                      {permissions.canViewDebts && (
+                      {(permissions.canViewDebts || cashPaidYer > 0) && (
                         <>
                           <div className="flex justify-between">
                             <span className="text-slate-600">
@@ -1814,6 +1876,29 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                               {formatYer(totalDueYer)}
                             </span>
                           </div>
+                          {permissions.canCollectCash && cashPaidYer > 0 && (
+                            <>
+                              <div className="flex justify-between text-sm font-bold text-emerald-700">
+                                <span>سند قبض فوري (المدفوع نقداً)</span>
+                                <span className="font-mono-nums" dir="ltr">
+                                  - {formatYer(cashPaidYer)}
+                                </span>
+                              </div>
+                              <div className="border-t border-slate-200 pt-2.5 flex justify-between text-base font-extrabold">
+                                <span className="text-slate-900">
+                                  المتبقي بعد السداد
+                                </span>
+                                <span className="font-mono-nums text-slate-950">
+                                  {formatYer(remainingBalanceYer)}
+                                </span>
+                              </div>
+                              {cashPaidYer > totalDueYer && (
+                                <p className="text-[11px] font-medium text-amber-800">
+                                  تنبيه: المبلغ المدفوع ({formatYer(cashPaidYer)}) أكبر من الإجمالي المستحق ({formatYer(totalDueYer)}).
+                                </p>
+                              )}
+                            </>
+                          )}
                         </>
                       )}
                     </div>
@@ -1822,20 +1907,33 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                       type="submit"
                       disabled={
                         extractingReading ||
-                        !proofPhotoUrl ||
-                        !ocrResult?.accepted ||
-                        reviewChoice === 'pending' ||
-                        activeFinalReading === null
+                        !(
+                          (permissions.canCollectCash &&
+                            cashPaidYer > 0 &&
+                            !proofPhotoUrl &&
+                            activeFinalReading === null) ||
+                          (permissions.canRecordReadings &&
+                            Boolean(proofPhotoUrl) &&
+                            reviewChoice !== 'pending' &&
+                            activeFinalReading !== null)
+                        )
                       }
                       className="w-full min-h-[48px] py-3 px-4 bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 disabled:text-slate-600 text-white text-sm font-bold rounded-lg transition-colors cursor-pointer"
                     >
                       {extractingReading
-                        ? 'جاري قراءة العداد 3 مرات وتحسين الصورة...'
-                        : isLowerThanPrev
-                          ? 'متابعة وتحديد سبب نقص القراءة'
-                          : isManuallyEdited
-                            ? 'حفظ وإرسال إشعار التعديل لموافقة المدير'
-                            : `حفظ القراءة المؤكدة ${permissions.canCollectCash ? 'وسند القبض ' : ''}أوفلاين`}
+                        ? 'جاري قراءة العداد...'
+                        : permissions.canCollectCash &&
+                            cashPaidYer > 0 &&
+                            !proofPhotoUrl &&
+                            activeFinalReading === null
+                          ? `حفظ سند القبض وخصمه (${formatCompactYer(cashPaidYer)})`
+                          : isLowerThanPrev
+                            ? 'متابعة وتحديد سبب نقص القراءة'
+                            : isManuallyEdited ||
+                                (reviewChoice === 'manual_edit' &&
+                                  ocrOriginalReading === null)
+                              ? 'حفظ وإرسال إشعار التعديل لموافقة المدير'
+                              : `حفظ القراءة ${cashPaidYer > 0 && permissions.canCollectCash ? 'وسند القبض ' : ''}أوفلاين`}
                     </button>
                   </form>
 
