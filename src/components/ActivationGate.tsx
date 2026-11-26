@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Eye, EyeOff, Lock, ShieldAlert, User } from 'lucide-react';
 import { loginUnified, type UnifiedLoginResult } from '../lib/offlineDb';
+import { PWAInstallPrompt } from './PWAInstallPrompt';
 
 interface ActivationGateProps {
   onAuthenticated: (result: UnifiedLoginResult) => void;
@@ -39,7 +40,7 @@ export const ActivationGate: React.FC<ActivationGateProps> = ({
   return (
     <div
       dir="rtl"
-      className="relative min-h-[100dvh] w-full overflow-hidden bg-gradient-to-br from-[#041224] via-[#062738] to-[#053328] flex flex-col items-center justify-center px-4 py-10 sm:px-6"
+      className="relative min-h-[100dvh] w-full overflow-x-hidden bg-gradient-to-br from-[#041224] via-[#062738] to-[#053328] flex flex-col items-center justify-center safe-top safe-bottom px-4 py-8 sm:px-6 sm:py-10"
     >
       {/* Ambient Electric Green & Blue Light Glow */}
       <div
@@ -97,7 +98,7 @@ export const ActivationGate: React.FC<ActivationGateProps> = ({
                     setUsername(e.target.value);
                     if (error) setError(null);
                   }}
-                  className="w-full min-h-[54px] pr-12 pl-4 py-3 text-base sm:text-lg text-slate-900 bg-slate-50/70 border border-slate-300 rounded-2xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-colors"
+                  className="w-full min-h-[54px] pr-12 pl-4 py-3 text-lg sm:text-xl font-bold placeholder:font-medium placeholder:text-base text-slate-900 bg-slate-50/70 border border-slate-300 rounded-2xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-colors"
                 />
               </div>
             </div>
@@ -122,7 +123,7 @@ export const ActivationGate: React.FC<ActivationGateProps> = ({
                     setPassword(e.target.value);
                     if (error) setError(null);
                   }}
-                  className="w-full min-h-[54px] pr-12 pl-14 py-3 text-base sm:text-lg text-slate-900 bg-slate-50/70 border border-slate-300 rounded-2xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-colors"
+                  className="w-full min-h-[54px] pr-12 pl-14 py-3 text-lg sm:text-xl font-bold placeholder:font-medium placeholder:text-base text-slate-900 bg-slate-50/70 border border-slate-300 rounded-2xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-colors"
                 />
                 <button
                   type="button"
@@ -161,6 +162,8 @@ export const ActivationGate: React.FC<ActivationGateProps> = ({
             </p>
           </form>
         </main>
+
+        <PWAInstallPrompt variant="banner" darkSurface />
       </div>
     </div>
   );

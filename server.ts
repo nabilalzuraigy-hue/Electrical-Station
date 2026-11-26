@@ -47,6 +47,7 @@ interface SubscriberRecord {
   previousReading: number;
   currentReading: number;
   previousDebtYer: number;
+  last3MonthsAvgKwh?: number;
   zoneStreet: string;
   sequenceOrder: number;
   updatedAt: string;
@@ -365,6 +366,45 @@ function normalizePhone(phone: string): string {
   return digits;
 }
 
+function normalizeArabicZone(value: string): string {
+  return String(value ?? '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/ى/g, 'ي')
+    .replace(/ة/g, 'ه')
+    .replace(/[٠-٩]/g, (d) => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)))
+    .toLowerCase();
+}
+
+const WILDCARD_ZONES = new Set([
+  'جميع الحارات',
+  'جميع المناطق',
+  'كل الحارات',
+  'كل المناطق',
+  'الكل',
+  'عام',
+  'all',
+  '*',
+]);
+
+function filterSubscribersByZones<T extends { zoneStreet: string }>(
+  subscribers: T[],
+  assignedZones: string[],
+): T[] {
+  const effective = assignedZones
+    .map(normalizeArabicZone)
+    .filter((z) => z.length > 0 && !WILDCARD_ZONES.has(z));
+  if (effective.length === 0) return subscribers;
+  return subscribers.filter((sub) => {
+    const subZone = normalizeArabicZone(sub.zoneStreet);
+    if (!subZone) return false;
+    return effective.some(
+      (z) => subZone === z || subZone.includes(z) || z.includes(subZone),
+    );
+  });
+}
+
 function buildStationStatePayload(
   stationId: string,
   role: 'admin' | 'manager' | 'collector',
@@ -390,10 +430,7 @@ function buildStationStatePayload(
   if (role === 'collector' && collectorCode) {
     const colRecord = store.codes[collectorCode];
     const zones = colRecord?.assignedZones ?? [];
-    const filteredSubscribers =
-      zones.length > 0
-        ? allSubscribers.filter((s) => zones.includes(s.zoneStreet))
-        : allSubscribers;
+    const filteredSubscribers = filterSubscribersByZones(allSubscribers, zones);
     const subIds = new Set(filteredSubscribers.map((s) => s.id));
     return {
       station,
@@ -736,6 +773,137 @@ async function startServer() {
       saveStore(store);
       res.json({
         importedCount,
+        totalSubscribers: Object.keys(bucket.subscribers).length,
+      });
+    },
+  );
+
+  app.get(
+    '/api/admin/stations/:stationId/subscribers',
+    requireAdmin,
+    (req, res) => {
+      const station = store.stations[req.params.stationId];
+      if (!station) {
+        res.status(404).json({ error: 'المحطة غير موجودة.' });
+        return;
+      }
+      const bucket = getBucket(station.stationId);
+      const subscribers = Object.values(bucket.subscribers).sort(
+        (a, b) => a.sequenceOrder - b.sequenceOrder,
+      );
+      res.json({ subscribers });
+    },
+  );
+
+  app.post(
+    '/api/admin/stations/:stationId/subscribers',
+    requireAdmin,
+    (req, res) => {
+      const station = store.stations[req.params.stationId];
+      if (!station) {
+        res.status(404).json({ error: 'المحطة غير موجودة.' });
+        return;
+      }
+
+      const subscriberName = String(req.body?.subscriberName ?? '').trim();
+      const meterNumber = String(req.body?.meterNumber ?? '').trim();
+      const phone = String(req.body?.phone ?? '').trim() || '770000000';
+      const zoneStreet = String(req.body?.zoneStreet ?? '').trim() || 'شارع عام';
+
+      if (subscriberName.length < 2) {
+        res
+          .status(400)
+          .json({ error: 'يرجى إدخال اسم المشترك الكامل (حرفان على الأقل).' });
+        return;
+      }
+      if (!meterNumber) {
+        res.status(400).json({ error: 'يرجى إدخال رقم العداد.' });
+        return;
+      }
+
+      const bucket = getBucket(station.stationId);
+      const id = normalizeId(`sub_${meterNumber}`);
+      const duplicateMeter = Object.values(bucket.subscribers).some(
+        (s) =>
+          s.id === id ||
+          s.meterNumber.trim().toLowerCase() === meterNumber.toLowerCase(),
+      );
+      if (duplicateMeter) {
+        res
+          .status(409)
+          .json({ error: 'رقم العداد مسجل مسبقاً في هذه المحطة.' });
+        return;
+      }
+
+      const rawPrev = Number(req.body?.previousReading ?? 0);
+      const previousReading =
+        Number.isFinite(rawPrev) && rawPrev >= 0 ? rawPrev : 0;
+      const rawDebt = Number(req.body?.previousDebtYer ?? 0);
+      const previousDebtYer =
+        Number.isFinite(rawDebt) && rawDebt >= 0 ? rawDebt : 0;
+
+      const maxSeq = Object.values(bucket.subscribers).reduce(
+        (max, s) => Math.max(max, s.sequenceOrder || 0),
+        0,
+      );
+      const rawSeq = Number(req.body?.sequenceOrder ?? 0);
+      const sequenceOrder =
+        Number.isFinite(rawSeq) && rawSeq >= 1
+          ? Math.round(rawSeq)
+          : maxSeq + 1;
+
+      const rawAvg = req.body?.last3MonthsAvgKwh;
+      const avgNum =
+        rawAvg !== undefined && rawAvg !== null && String(rawAvg).trim() !== ''
+          ? Number(rawAvg)
+          : undefined;
+      const last3MonthsAvgKwh =
+        avgNum !== undefined && Number.isFinite(avgNum) && avgNum >= 0
+          ? avgNum
+          : undefined;
+
+      const subscriber: SubscriberRecord = {
+        id,
+        meterNumber,
+        subscriberName,
+        phone,
+        previousReading,
+        currentReading: previousReading,
+        previousDebtYer,
+        ...(last3MonthsAvgKwh !== undefined ? { last3MonthsAvgKwh } : {}),
+        zoneStreet,
+        sequenceOrder,
+        updatedAt: new Date().toISOString(),
+      };
+
+      bucket.subscribers[id] = subscriber;
+      saveStore(store);
+      res.status(201).json({
+        subscriber,
+        totalSubscribers: Object.keys(bucket.subscribers).length,
+      });
+    },
+  );
+
+  app.delete(
+    '/api/admin/stations/:stationId/subscribers/:subscriberId',
+    requireAdmin,
+    (req, res) => {
+      const station = store.stations[req.params.stationId];
+      if (!station) {
+        res.status(404).json({ error: 'المحطة غير موجودة.' });
+        return;
+      }
+      const bucket = getBucket(station.stationId);
+      const subId = String(req.params.subscriberId ?? '').trim();
+      if (!bucket.subscribers[subId]) {
+        res.status(404).json({ error: 'المشترك غير موجود.' });
+        return;
+      }
+      delete bucket.subscribers[subId];
+      saveStore(store);
+      res.json({
+        deleted: true,
         totalSubscribers: Object.keys(bucket.subscribers).length,
       });
     },
@@ -1677,8 +1845,29 @@ If no clear electric meter kWh reading is visible in the image, set isClearMeter
   if (!isProd) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+        ws: false,
+      },
       appType: 'spa',
+      plugins: [
+        {
+          name: 'ai-studio-disable-hmr-ws',
+          enforce: 'post',
+          transform(code, id) {
+            if (
+              id.includes('vite/dist/client/client.mjs') &&
+              code.includes('transport.connect(createHMRHandler(handleMessage));')
+            ) {
+              return code.replace(
+                'transport.connect(createHMRHandler(handleMessage));',
+                '/* HMR disabled */',
+              );
+            }
+          },
+        },
+      ],
     });
     app.use(vite.middlewares);
   } else {

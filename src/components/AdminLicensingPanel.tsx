@@ -13,12 +13,16 @@ import {
   ShieldCheck,
   Trash2,
   Upload,
+  UserPlus,
 } from 'lucide-react';
 import {
   claimAdminPasscode,
+  createManualSubscriberAdmin,
   deleteAccessCodeAdmin,
+  deleteSubscriberAdmin,
   downloadExcelTemplate,
   fetchAdminOverview,
+  fetchStationSubscribersAdmin,
   generateAccessCodeAdmin,
   getAdminStatus,
   loginAdminPasscode,
@@ -28,7 +32,11 @@ import {
   uploadSubscribersChunkedAdmin,
 } from '../lib/offlineDb';
 import { StationOwnerBrochureModal } from './StationOwnerBrochureModal';
-import type { AccessCodeRecord, StationConfig } from '../types/station';
+import type {
+  AccessCodeRecord,
+  StationConfig,
+  Subscriber,
+} from '../types/station';
 
 interface AdminLicensingPanelProps {
   adminToken: string | null;
@@ -81,6 +89,21 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     total: number;
   } | null>(null);
 
+  // Manual subscriber creation state (real simulation)
+  const [manualSubStationId, setManualSubStationId] = useState('');
+  const [stationSubscribers, setStationSubscribers] = useState<Subscriber[]>([]);
+  const [loadingSubscribers, setLoadingSubscribers] = useState(false);
+  const [subName, setSubName] = useState('');
+  const [subMeter, setSubMeter] = useState('');
+  const [subPhone, setSubPhone] = useState('');
+  const [subZone, setSubZone] = useState('حارة النصر');
+  const [subPrevReading, setSubPrevReading] = useState('1200');
+  const [subPrevDebt, setSubPrevDebt] = useState('0');
+  const [subAvg3Months, setSubAvg3Months] = useState('');
+  const [subSeqOrder, setSubSeqOrder] = useState('');
+  const [creatingSub, setCreatingSub] = useState(false);
+  const [deletingSubId, setDeletingSubId] = useState<string | null>(null);
+
   useEffect(() => {
     if (adminToken) {
       setCheckingStatus(false);
@@ -114,6 +137,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
       if (data.stations.length > 0) {
         setTargetStationId((prev) => prev || data.stations[0].stationId);
         setExcelStationId((prev) => prev || data.stations[0].stationId);
+        setManualSubStationId((prev) => prev || data.stations[0].stationId);
       }
     } catch (err) {
       setFeedback(
@@ -124,11 +148,36 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     }
   }, [adminToken]);
 
+  const loadStationSubscribers = useCallback(
+    async (stationId: string) => {
+      if (!adminToken || !stationId) {
+        setStationSubscribers([]);
+        return;
+      }
+      setLoadingSubscribers(true);
+      try {
+        const list = await fetchStationSubscribersAdmin(adminToken, stationId);
+        setStationSubscribers(list);
+      } catch {
+        setStationSubscribers([]);
+      } finally {
+        setLoadingSubscribers(false);
+      }
+    },
+    [adminToken],
+  );
+
   useEffect(() => {
     if (adminToken) {
       void loadAdminData();
     }
   }, [adminToken, loadAdminData]);
+
+  useEffect(() => {
+    if (adminToken && manualSubStationId) {
+      void loadStationSubscribers(manualSubStationId);
+    }
+  }, [adminToken, manualSubStationId, loadStationSubscribers]);
 
   const handlePasscodeSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -241,6 +290,9 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
         `تم رفع ${parsed.length} مشترك بنجاح إلى المحطة (إجمالي المشتركين الآن: ${res.totalSubscribers}).`,
       );
       await loadAdminData();
+      if (excelStationId === manualSubStationId) {
+        await loadStationSubscribers(excelStationId);
+      }
     } catch (err) {
       setFeedback(
         err instanceof Error ? err.message : 'تعذر قراءة أو رفع ملف Excel.',
@@ -299,6 +351,85 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     setTimeout(() => setCopiedCode(null), 2000);
   };
 
+  const handleCreateManualSubscriber = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!adminToken) return;
+    if (!manualSubStationId) {
+      setFeedback('يرجى اختيار المحطة المستهدفة لإضافة المشترك.');
+      return;
+    }
+    if (subName.trim().length < 2) {
+      setFeedback('يرجى إدخال اسم المشترك الكامل (حرفان على الأقل).');
+      return;
+    }
+    if (!subMeter.trim()) {
+      setFeedback('يرجى إدخال رقم العداد.');
+      return;
+    }
+
+    setCreatingSub(true);
+    setFeedback(null);
+    try {
+      const avgVal =
+        subAvg3Months.trim() !== '' ? Number(subAvg3Months) : undefined;
+      const seqVal =
+        subSeqOrder.trim() !== '' ? Number(subSeqOrder) : undefined;
+      const res = await createManualSubscriberAdmin(adminToken, {
+        stationId: manualSubStationId,
+        subscriberName: subName.trim(),
+        meterNumber: subMeter.trim(),
+        phone: subPhone.trim() || '770000000',
+        previousReading: Math.max(0, Number(subPrevReading) || 0),
+        previousDebtYer: Math.max(0, Number(subPrevDebt) || 0),
+        ...(avgVal !== undefined && Number.isFinite(avgVal) && avgVal >= 0
+          ? { last3MonthsAvgKwh: avgVal }
+          : {}),
+        zoneStreet: subZone.trim() || 'شارع عام',
+        ...(seqVal !== undefined && Number.isFinite(seqVal) && seqVal >= 1
+          ? { sequenceOrder: seqVal }
+          : {}),
+      });
+      setFeedback(
+        `تم إنشاء المشترك «${res.subscriber.subscriberName}» (عداد ${res.subscriber.meterNumber}) للمحاكاة بنجاح — إجمالي مشتركي المحطة: ${res.totalSubscribers}.`,
+      );
+      setSubName('');
+      setSubMeter('');
+      setSubPhone('');
+      setSubPrevDebt('0');
+      setSubAvg3Months('');
+      setSubSeqOrder('');
+      await Promise.all([
+        loadAdminData(),
+        loadStationSubscribers(manualSubStationId),
+      ]);
+    } catch (err) {
+      setFeedback(
+        err instanceof Error ? err.message : 'تعذر إنشاء المشترك يدوياً.',
+      );
+    } finally {
+      setCreatingSub(false);
+    }
+  };
+
+  const handleDeleteManualSubscriber = async (sub: Subscriber) => {
+    if (!adminToken || !manualSubStationId) return;
+    setDeletingSubId(sub.id);
+    try {
+      await deleteSubscriberAdmin(adminToken, manualSubStationId, sub.id);
+      setFeedback(`تم حذف المشترك «${sub.subscriberName}» بنجاح.`);
+      await Promise.all([
+        loadAdminData(),
+        loadStationSubscribers(manualSubStationId),
+      ]);
+    } catch (err) {
+      setFeedback(
+        err instanceof Error ? err.message : 'تعذر حذف المشترك.',
+      );
+    } finally {
+      setDeletingSubId(null);
+    }
+  };
+
   if (!adminToken) {
     return (
       <div className="max-w-md mx-auto py-10">
@@ -330,7 +461,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                 value={passcodeInput}
                 onChange={(e) => setPasscodeInput(e.target.value)}
                 placeholder="••••••••"
-                className="w-full min-h-[46px] px-3 py-2 text-sm font-mono-nums border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+                className="w-full min-h-[48px] px-3.5 py-2.5 text-lg font-bold font-mono-nums placeholder:font-medium border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
               />
             </div>
 
@@ -454,7 +585,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                   value={personName}
                   onChange={(e) => setPersonName(e.target.value)}
                   placeholder="أدخل اسم المدير أو المحصّل"
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+                  className="w-full min-h-[46px] px-3.5 py-2 text-base sm:text-lg font-bold placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
                 />
               </div>
 
@@ -469,7 +600,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                       e.target.value === 'collector' ? 'collector' : 'manager',
                     )
                   }
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white"
+                  className="w-full min-h-[46px] px-3 py-2 text-base font-bold border border-slate-300 rounded-lg bg-white"
                 >
                   <option value="manager">مدير محطة</option>
                   <option value="collector">محصّل ميداني</option>
@@ -485,7 +616,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                 <select
                   value={targetStationId}
                   onChange={(e) => setTargetStationId(e.target.value)}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white"
+                  className="w-full min-h-[46px] px-3 py-2 text-base font-bold border border-slate-300 rounded-lg bg-white"
                 >
                   <option value="">+ إنشاء محطة جديدة</option>
                   {stations.map((st) => (
@@ -506,7 +637,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                     value={newStationName}
                     onChange={(e) => setNewStationName(e.target.value)}
                     placeholder="اكتب اسم المحطة الجديدة"
-                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
+                    className="w-full min-h-[46px] px-3.5 py-2 text-base sm:text-lg font-bold placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg"
                   />
                 </div>
               ) : (
@@ -519,7 +650,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                     value={personPhone}
                     onChange={(e) => setPersonPhone(e.target.value)}
                     placeholder="77xxxxxxx"
-                    className="w-full px-3 py-2 text-sm font-mono-nums border border-slate-300 rounded-lg"
+                    className="w-full min-h-[46px] px-3.5 py-2 text-base sm:text-lg font-bold font-mono-nums placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg"
                   />
                 </div>
               )}
@@ -538,7 +669,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                   placeholder={
                     personRole === 'manager' ? 'MGR-XXXX-XXXX' : 'COL-XXXX-XXXX'
                   }
-                  className="w-full px-3 py-2 text-sm font-mono-nums border border-slate-300 rounded-lg"
+                  className="w-full min-h-[46px] px-3.5 py-2 text-base sm:text-lg font-bold font-mono-nums placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg"
                 />
               </div>
 
@@ -552,7 +683,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                     value={assignedZones}
                     onChange={(e) => setAssignedZones(e.target.value)}
                     placeholder="اتركه فارغاً لجميع الحارات"
-                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
+                    className="w-full min-h-[46px] px-3.5 py-2 text-base sm:text-lg font-bold placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg"
                   />
                 </div>
               )}
@@ -640,7 +771,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
             <select
               value={excelStationId}
               onChange={(e) => setExcelStationId(e.target.value)}
-              className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white"
+              className="w-full min-h-[46px] px-3 py-2 text-base font-bold border border-slate-300 rounded-lg bg-white"
             >
               <option value="">-- اختر محطة --</option>
               {stations.map((st) => (
@@ -689,6 +820,233 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
           </div>
         </section>
       </div>
+
+      {/* Manual Subscriber Creation (for Real Simulation) */}
+      <section className="bg-white border border-slate-200 rounded-xl p-6 space-y-5">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200 pb-4">
+          <div>
+            <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+              <UserPlus className="w-5 h-5 text-teal-700" />
+              إنشاء مشترك يدوي (لعمل محاكاة حقيقية)
+            </h2>
+            <p className="text-xs text-slate-600 mt-1">
+              أضف مشتركين يدوياً لأي محطة لاختبار تطبيق المحصّل، لوحة المدير، وبوابة المشترك فوراً بدون الحاجة لملف Excel.
+            </p>
+          </div>
+          <div className="w-full sm:w-64">
+            <select
+              value={manualSubStationId}
+              onChange={(e) => setManualSubStationId(e.target.value)}
+              className="w-full min-h-[46px] px-3 py-2 text-base font-bold border border-slate-300 rounded-lg bg-white"
+            >
+              <option value="">-- اختر المحطة --</option>
+              {stations.map((st) => (
+                <option key={st.stationId} value={st.stationId}>
+                  {st.stationName} ({st.subscriberCount ?? 0} مشترك)
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        <form onSubmit={handleCreateManualSubscriber} className="space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                اسم المشترك الكامل
+              </label>
+              <input
+                type="text"
+                value={subName}
+                onChange={(e) => setSubName(e.target.value)}
+                placeholder="مثال: أحمد محمد علي"
+                className="w-full min-h-[46px] px-3.5 py-2 text-base sm:text-lg font-bold placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                رقم العداد
+              </label>
+              <input
+                type="text"
+                dir="ltr"
+                value={subMeter}
+                onChange={(e) => setSubMeter(e.target.value)}
+                placeholder="104501"
+                className="w-full min-h-[46px] px-3.5 py-2 text-base sm:text-lg font-bold font-mono-nums placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                رقم الهاتف
+              </label>
+              <input
+                type="tel"
+                dir="ltr"
+                value={subPhone}
+                onChange={(e) => setSubPhone(e.target.value)}
+                placeholder="771234567"
+                className="w-full min-h-[46px] px-3.5 py-2 text-base sm:text-lg font-bold font-mono-nums placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                الحارة / الشارع
+              </label>
+              <input
+                type="text"
+                value={subZone}
+                onChange={(e) => setSubZone(e.target.value)}
+                placeholder="حارة النصر"
+                className="w-full min-h-[46px] px-3.5 py-2 text-base sm:text-lg font-bold placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                القراءة السابقة (ك.و.س)
+              </label>
+              <input
+                type="number"
+                step="0.01"
+                min={0}
+                value={subPrevReading}
+                onChange={(e) => setSubPrevReading(e.target.value)}
+                className="w-full min-h-[46px] px-3.5 py-2 text-base sm:text-lg font-bold font-mono-nums border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                المتأخرات السابقة (ر.ي)
+              </label>
+              <input
+                type="number"
+                min={0}
+                value={subPrevDebt}
+                onChange={(e) => setSubPrevDebt(e.target.value)}
+                className="w-full min-h-[46px] px-3.5 py-2 text-base sm:text-lg font-bold font-mono-nums border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                متوسط آخر 3 أشهر (ك.و.س - اختياري)
+              </label>
+              <input
+                type="number"
+                min={0}
+                value={subAvg3Months}
+                onChange={(e) => setSubAvg3Months(e.target.value)}
+                placeholder="اختياري لاختبار التنبيه الأصفر"
+                className="w-full min-h-[46px] px-3.5 py-2 text-base sm:text-lg font-bold font-mono-nums placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                ترتيب خط السير (تلقائي إذا تُرك فارغاً)
+              </label>
+              <input
+                type="number"
+                min={1}
+                value={subSeqOrder}
+                onChange={(e) => setSubSeqOrder(e.target.value)}
+                placeholder="تلقائي"
+                className="w-full min-h-[46px] px-3.5 py-2 text-base sm:text-lg font-bold font-mono-nums placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+              />
+            </div>
+          </div>
+
+          <button
+            type="submit"
+            disabled={creatingSub || !manualSubStationId}
+            className="w-full sm:w-auto min-h-[46px] px-6 py-2.5 bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 text-white text-sm font-bold rounded-lg inline-flex items-center justify-center gap-2 cursor-pointer"
+          >
+            <UserPlus className="w-4 h-4" />
+            {creatingSub ? 'جاري الإضافة...' : 'إضافة المشترك للمحطة'}
+          </button>
+        </form>
+
+        {/* Live list of subscribers in selected station */}
+        {manualSubStationId && (
+          <div className="border-t border-slate-200 pt-4 space-y-2">
+            <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
+              <span>
+                المشتركون المسجلون في المحطة المختارة ({stationSubscribers.length})
+              </span>
+              {loadingSubscribers && (
+                <span className="text-teal-700">جاري التحديث...</span>
+              )}
+            </div>
+            {stationSubscribers.length > 0 ? (
+              <div className="overflow-x-auto border border-slate-200 rounded-lg">
+                <table className="w-full text-xs sm:text-sm text-right">
+                  <thead className="bg-slate-50 text-slate-600 text-xs border-b border-slate-200">
+                    <tr>
+                      <th className="py-2.5 px-3 font-medium">الترتيب</th>
+                      <th className="py-2.5 px-3 font-medium">اسم المشترك</th>
+                      <th className="py-2.5 px-3 font-medium">رقم العداد</th>
+                      <th className="py-2.5 px-3 font-medium">الهاتف</th>
+                      <th className="py-2.5 px-3 font-medium">الحارة</th>
+                      <th className="py-2.5 px-3 font-medium">القراءة السابقة</th>
+                      <th className="py-2.5 px-3 font-medium">المتأخرات</th>
+                      <th className="py-2.5 px-3 font-medium">إجراء</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {stationSubscribers.slice(0, 50).map((sub) => (
+                      <tr key={sub.id}>
+                        <td className="py-2.5 px-3 font-mono-nums text-slate-500">
+                          {sub.sequenceOrder}
+                        </td>
+                        <td className="py-2.5 px-3 font-bold text-slate-900">
+                          {sub.subscriberName}
+                        </td>
+                        <td className="py-2.5 px-3 font-mono-nums font-bold text-teal-800">
+                          {sub.meterNumber}
+                        </td>
+                        <td className="py-2.5 px-3 font-mono-nums text-slate-700">
+                          {sub.phone}
+                        </td>
+                        <td className="py-2.5 px-3 text-slate-600">
+                          {sub.zoneStreet}
+                        </td>
+                        <td className="py-2.5 px-3 font-mono-nums text-slate-800">
+                          {sub.previousReading}
+                        </td>
+                        <td className="py-2.5 px-3 font-mono-nums text-slate-800">
+                          {sub.previousDebtYer} ر.ي
+                        </td>
+                        <td className="py-2.5 px-3">
+                          <button
+                            type="button"
+                            disabled={deletingSubId === sub.id}
+                            onClick={() => void handleDeleteManualSubscriber(sub)}
+                            className="px-2.5 py-1 text-xs font-medium rounded border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-800 inline-flex items-center gap-1 cursor-pointer"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            حذف
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p className="text-xs text-slate-500 py-2">
+                لا يوجد مشتركون في هذه المحطة بعد. أضف أول مشترك من النموذج أعلاه لبدء المحاكاة.
+              </p>
+            )}
+          </div>
+        )}
+      </section>
 
       {/* Stations Table */}
       <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">

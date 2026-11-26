@@ -7,6 +7,8 @@ import { ManagerDashboard } from './components/ManagerDashboard';
 import { CollectorApp } from './components/CollectorApp';
 import { SubscriberPortal } from './components/SubscriberPortal';
 import { FlutterCodeExplorer } from './components/FlutterCodeExplorer';
+import { PWAInstallPrompt } from './components/PWAInstallPrompt';
+import { OfflineIndicator } from './components/OfflineIndicator';
 import {
   saveStationLocalState,
   syncStationPendingBatches,
@@ -118,18 +120,25 @@ function StationWorkspace() {
 
   const activeCollector =
     accessRecord?.role === 'collector' && stationState
-      ? stationState.collectors.find((c) => c.id === accessRecord.code)
+      ? stationState.collectors.find(
+          (c) => c.id === accessRecord.code || c.code === accessRecord.code,
+        )
       : undefined;
 
   if (!isLoggedIn) {
-    return <ActivationGate onAuthenticated={handleUnifiedAuth} />;
+    return (
+      <>
+        <ActivationGate onAuthenticated={handleUnifiedAuth} />
+        <OfflineIndicator />
+      </>
+    );
   }
 
   return (
-    <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
+    <div className="min-h-[100dvh] flex flex-col bg-slate-50 text-slate-900">
       {/* Top Bar */}
-      <header className="sticky top-0 z-30 bg-white border-b border-slate-200">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-6">
+      <header className="sticky top-0 z-30 safe-top bg-white border-b border-slate-200">
+        <div className="max-w-7xl mx-auto px-3 sm:px-6 min-h-16 py-2 flex items-center justify-between gap-2 sm:gap-6">
           <a
             href="#top"
             onClick={(e) => {
@@ -141,12 +150,12 @@ function StationWorkspace() {
               else if (subscriberResult) setActiveTab('subscriber');
               else setActiveTab('activation');
             }}
-            className="inline-flex items-center gap-2.5 text-lg sm:text-xl font-extrabold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
+            className="inline-flex items-center gap-2 sm:gap-2.5 text-sm sm:text-xl font-extrabold tracking-tight text-slate-900 min-w-0"
           >
             <span className="w-8 h-8 rounded-lg bg-teal-700 text-white inline-flex items-center justify-center shrink-0">
               <Zap className="w-4 h-4" />
             </span>
-            <span>نظام إدارة الكهرباء التجارية</span>
+            <span className="truncate">نظام إدارة الكهرباء التجارية</span>
           </a>
 
           {isLoggedIn && (
@@ -168,11 +177,12 @@ function StationWorkspace() {
                 ))}
               </nav>
 
-              <div className="shrink-0">
+              <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+                <PWAInstallPrompt variant="header" />
                 <button
                   type="button"
                   onClick={handleLogout}
-                  className="px-4 py-2 text-xs font-medium text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors inline-flex items-center gap-2 whitespace-nowrap shrink-0 cursor-pointer"
+                  className="px-3 sm:px-4 py-2 text-xs font-bold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   <LogOut className="w-3.5 h-3.5" />
                   خروج
@@ -203,9 +213,10 @@ function StationWorkspace() {
         )}
       </header>
 
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-8">
+      <main className="flex-1 max-w-7xl w-full mx-auto px-3 sm:px-6 py-5 sm:py-8 space-y-5">
+        <PWAInstallPrompt variant="banner" />
         {syncNotice && (
-          <div className="mb-6 px-4 py-3 text-xs font-medium bg-teal-50 border border-teal-200 text-teal-900 rounded-lg">
+          <div className="px-4 py-3 text-xs font-medium bg-teal-50 border border-teal-200 text-teal-900 rounded-lg">
             {syncNotice}
           </div>
         )}
@@ -247,17 +258,19 @@ function StationWorkspace() {
             isSyncing={isSyncing}
             syncProgress={syncProgress}
             activeCollector={activeCollector}
+            collectorAccess={accessRecord}
           />
         ) : (
           <ActivationGate onAuthenticated={handleUnifiedAuth} />
         )}
       </main>
 
-      <footer className="border-t border-slate-200 bg-white">
+      <footer className="border-t border-slate-200 bg-white safe-bottom">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 text-center text-xs font-medium text-slate-600">
           نظام اتمتة موحدة للكهرباء
         </div>
       </footer>
+      <OfflineIndicator />
     </div>
   );
 }

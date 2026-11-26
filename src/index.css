@@ -1,11 +1,21 @@
 @import "tailwindcss";
 
 @layer base {
+  html,
+  body {
+    overflow-x: hidden;
+    -webkit-text-size-adjust: 100%;
+    font-family: 'IBM Plex Sans Arabic', system-ui, -apple-system, sans-serif;
+  }
+
   :root {
     font-family: 'IBM Plex Sans Arabic', system-ui, -apple-system, sans-serif;
   }
 
-  h1, h2, h3, .font-display {
+  h1,
+  h2,
+  h3,
+  .font-display {
     font-family: 'Cairo', 'IBM Plex Sans Arabic', sans-serif;
   }
 
@@ -13,6 +23,36 @@
     font-family: 'IBM Plex Mono', monospace;
     font-variant-numeric: tabular-nums;
   }
+
+  /* Clear, bold & slightly larger typography on all inputs across Samsung, iPhone (>=16px stops iOS zoom), and Laptops */
+  input:not([type='checkbox']):not([type='radio']):not([type='file']):not([type='range']),
+  select,
+  textarea {
+    font-size: 1.0625rem;
+    font-weight: 700;
+    line-height: 1.5;
+  }
+
+  input:not([type='checkbox']):not([type='radio']):not([type='file']):not([type='range']):not(:placeholder-shown),
+  textarea:not(:placeholder-shown) {
+    font-size: 1.125rem;
+    font-weight: 700;
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    font-weight: 500;
+    font-size: 0.9375rem;
+    opacity: 0.72;
+  }
+}
+
+.safe-top {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
 .tabular-nums {
@@ -94,4 +134,3 @@
     animation: none;
   }
 }
-

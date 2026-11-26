@@ -157,7 +157,7 @@ export const SubscriberPortal: React.FC<SubscriberPortalProps> = ({
                 value={subscriberName}
                 onChange={(e) => setSubscriberName(e.target.value)}
                 placeholder="أدخل الاسم الكامل"
-                className="w-full min-h-[44px] px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+                className="w-full min-h-[48px] px-3.5 py-2.5 text-base sm:text-lg font-bold placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
               />
             </div>
 
@@ -170,7 +170,7 @@ export const SubscriberPortal: React.FC<SubscriberPortalProps> = ({
                 value={phone}
                 onChange={(e) => setPhone(e.target.value)}
                 placeholder="أدخل رقم الهاتف"
-                className="w-full min-h-[44px] px-3 py-2 text-sm font-mono-nums border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+                className="w-full min-h-[48px] px-3.5 py-2.5 text-base sm:text-lg font-bold font-mono-nums placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
               />
             </div>
 

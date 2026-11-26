@@ -227,6 +227,66 @@ export async function uploadSubscribersChunkedAdmin(
   return { totalSubscribers };
 }
 
+export async function fetchStationSubscribersAdmin(
+  adminToken: string,
+  stationId: string,
+): Promise<Subscriber[]> {
+  const res = await apiRequest<{ subscribers: Array<Omit<Subscriber, 'syncStatus'>> }>(
+    `/api/admin/stations/${encodeURIComponent(stationId)}/subscribers`,
+    {},
+    adminToken,
+  );
+  return (res.subscribers ?? []).map((s) => ({
+    ...s,
+    syncStatus: 'synced' as const,
+  }));
+}
+
+export async function createManualSubscriberAdmin(
+  adminToken: string,
+  params: {
+    stationId: string;
+    subscriberName: string;
+    meterNumber: string;
+    phone: string;
+    previousReading: number;
+    previousDebtYer: number;
+    last3MonthsAvgKwh?: number;
+    zoneStreet: string;
+    sequenceOrder?: number;
+  },
+): Promise<{ subscriber: Subscriber; totalSubscribers: number }> {
+  const res = await apiRequest<{
+    subscriber: Omit<Subscriber, 'syncStatus'>;
+    totalSubscribers: number;
+  }>(
+    `/api/admin/stations/${encodeURIComponent(params.stationId)}/subscribers`,
+    {
+      method: 'POST',
+      body: JSON.stringify(params),
+    },
+    adminToken,
+  );
+  return {
+    subscriber: { ...res.subscriber, syncStatus: 'synced' },
+    totalSubscribers: res.totalSubscribers,
+  };
+}
+
+export async function deleteSubscriberAdmin(
+  adminToken: string,
+  stationId: string,
+  subscriberId: string,
+): Promise<{ deleted: boolean; totalSubscribers: number }> {
+  return apiRequest<{ deleted: boolean; totalSubscribers: number }>(
+    `/api/admin/stations/${encodeURIComponent(stationId)}/subscribers/${encodeURIComponent(subscriberId)}`,
+    {
+      method: 'DELETE',
+    },
+    adminToken,
+  );
+}
+
 // ============================================================
 // Public Code Entry & Staff Session Operations
 // ============================================================

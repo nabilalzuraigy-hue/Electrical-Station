@@ -663,10 +663,10 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
                 type="text"
                 value={stationName}
                 onChange={(e) => setStationName(e.target.value)}
-                className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+                className="w-full min-h-[46px] px-3.5 py-2 text-base sm:text-lg font-bold border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
               />
             </div>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1">
                   سعر الكيلووات (ريال يمني)
@@ -676,7 +676,7 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
                   min={0}
                   value={kwhPrice}
                   onChange={(e) => setKwhPrice(e.target.value)}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg font-mono-nums focus:outline-none focus:ring-2 focus:ring-teal-600"
+                  className="w-full min-h-[46px] px-3.5 py-2 text-base sm:text-lg font-bold font-mono-nums border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
                 />
               </div>
               <div>
@@ -688,7 +688,7 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
                   min={0}
                   value={minFee}
                   onChange={(e) => setMinFee(e.target.value)}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg font-mono-nums focus:outline-none focus:ring-2 focus:ring-teal-600"
+                  className="w-full min-h-[46px] px-3.5 py-2 text-base sm:text-lg font-bold font-mono-nums border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
                 />
               </div>
             </div>
@@ -701,7 +701,7 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
                 min={0}
                 value={mainGenKwh}
                 onChange={(e) => setMainGenKwh(e.target.value)}
-                className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg font-mono-nums focus:outline-none focus:ring-2 focus:ring-teal-600"
+                className="w-full min-h-[46px] px-3.5 py-2 text-base sm:text-lg font-bold font-mono-nums border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
               />
             </div>
             <button
@@ -817,21 +817,21 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
               مرتّب حسب تسلسل خط السير الميداني
             </p>
           </div>
-          <div className="flex flex-wrap items-center gap-3">
-            <div className="relative">
+          <div className="flex flex-col sm:flex-row sm:items-center gap-3 w-full md:w-auto">
+            <div className="relative flex-1 sm:flex-initial">
               <Search className="w-4 h-4 text-slate-400 absolute right-3 top-1/2 -translate-y-1/2" />
               <input
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder="بحث برقم العداد أو الاسم..."
-                className="pr-9 pl-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+                className="w-full sm:w-64 min-h-[46px] pr-9 pl-3 py-2 text-base sm:text-lg font-bold placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
               />
             </div>
             <select
               value={zoneFilter}
               onChange={(e) => setZoneFilter(e.target.value)}
-              className="px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white"
+              className="w-full sm:w-auto min-h-[46px] px-3 py-2 text-base font-bold border border-slate-300 rounded-lg bg-white"
             >
               <option value="all">كل الحارات والشوارع</option>
               {zones.map((z) => (

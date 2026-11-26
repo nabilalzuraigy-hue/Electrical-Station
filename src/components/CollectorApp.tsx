@@ -14,11 +14,13 @@ import {
   Lock,
   MessageCircle,
   MessageSquare,
+  RefreshCw,
   RotateCcw,
   ScanLine,
   Search,
   ShieldAlert,
   Upload,
+  User,
   Wifi,
   WifiOff,
   X,
@@ -27,6 +29,7 @@ import {
   computeSubscriber3MonthAvgKwh,
   exportCollectorReadingsExcel,
   parseSubscribersExcelFile,
+  refreshStationState,
   sanitizeFirestoreId,
   sendInstantManagerAlert,
   type StationLocalState,
@@ -46,6 +49,7 @@ import {
   getWhatsAppInvoiceUrl,
 } from '../lib/formatters';
 import type {
+  AccessCodeRecord,
   CollectorPermissions,
   CollectorProfile,
   LowerReadingReason,
@@ -63,6 +67,7 @@ interface CollectorAppProps {
   isSyncing: boolean;
   syncProgress: import('../types/station').SyncProgress | null;
   activeCollector?: CollectorProfile;
+  collectorAccess?: AccessCodeRecord;
   isManagerPreview?: boolean;
 }
 
@@ -72,6 +77,49 @@ const LOWER_REASON_LABELS: Record<LowerReadingReason, string> = {
   previous_error: 'خطأ في القراءة السابقة',
 };
 
+const WILDCARD_ZONES = new Set([
+  'جميع الحارات',
+  'جميع المناطق',
+  'كل الحارات',
+  'كل المناطق',
+  'الكل',
+  'عام',
+  'all',
+  '*',
+]);
+
+function normalizeArabicZone(zone: string | undefined | null): string {
+  return String(zone ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\u064B-\u065F\u0670]/g, '')
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/ى/g, 'ي')
+    .replace(/[٠-٩]/g, (d) => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)))
+    .replace(/\s+/g, ' ');
+}
+
+function subscriberMatchesAssignedZones(
+  subZone: string | undefined | null,
+  assignedZones: string[],
+  importedLocally?: boolean,
+): boolean {
+  if (importedLocally || assignedZones.length === 0) return true;
+  const effectiveAssigned = assignedZones
+    .map((z) => normalizeArabicZone(z))
+    .filter((z) => z.length > 0 && !WILDCARD_ZONES.has(z));
+  if (effectiveAssigned.length === 0) return true;
+  const normalizedSub = normalizeArabicZone(subZone);
+  if (!normalizedSub) return false;
+  return effectiveAssigned.some(
+    (z) =>
+      normalizedSub === z ||
+      normalizedSub.includes(z) ||
+      z.includes(normalizedSub),
+  );
+}
+
 export const CollectorApp: React.FC<CollectorAppProps> = ({
   state,
   staffToken,
@@ -80,6 +128,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   isSyncing,
   syncProgress,
   activeCollector,
+  collectorAccess,
   isManagerPreview = false,
 }) => {
   const cameraInputRef = useRef<HTMLInputElement>(null);
@@ -123,6 +172,11 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   const [savedInvoiceText, setSavedInvoiceText] = useState<string | null>(null);
   const [copiedInvoice, setCopiedInvoice] = useState(false);
   const [localExcelNotice, setLocalExcelNotice] = useState<string | null>(null);
+  const [refreshingState, setRefreshingState] = useState(false);
+  const [refreshNotice, setRefreshNotice] = useState<string | null>(null);
+
+  const onUpdateStateRef = useRef(onUpdateState);
+  onUpdateStateRef.current = onUpdateState;
 
   // Lower-than-previous modal state
   const [lowerModalOpen, setLowerModalOpen] = useState(false);
@@ -144,6 +198,61 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       window.removeEventListener('offline', handleOffline);
     };
   }, []);
+
+  // Auto-refresh subscribers and collector assignment from server on mount & every 15s
+  useEffect(() => {
+    if (!isOnline || isManagerPreview || !staffToken || !state.station.stationId) {
+      return;
+    }
+    let cancelled = false;
+    const pullLatest = async () => {
+      try {
+        const latest = await refreshStationState(
+          state.station.stationId,
+          staffToken,
+        );
+        if (!cancelled) {
+          onUpdateStateRef.current(latest);
+        }
+      } catch {
+        // Offline / transient network errors keep cached local state intact
+      }
+    };
+    void pullLatest();
+    const timer = window.setInterval(() => {
+      void pullLatest();
+    }, 15000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [isOnline, isManagerPreview, staffToken, state.station.stationId]);
+
+  const handleRefreshSubscribers = async () => {
+    if (!staffToken || isManagerPreview) return;
+    if (!isOnline) {
+      setRefreshNotice('لا يوجد اتصال بالإنترنت لتحديث الكشف حالياً.');
+      return;
+    }
+    setRefreshingState(true);
+    setRefreshNotice(null);
+    try {
+      const latest = await refreshStationState(
+        state.station.stationId,
+        staffToken,
+      );
+      onUpdateState(latest);
+      setRefreshNotice(
+        `تم تحديث الكشف (${latest.subscribers.length} مشترك في نطاق المحطة).`,
+      );
+    } catch (err) {
+      setRefreshNotice(
+        err instanceof Error ? err.message : 'تعذر تحديث الكشف من الخادم.',
+      );
+    } finally {
+      setRefreshingState(false);
+    }
+  };
 
   // Monitor live video brightness and auto-enable torch in dim environments
   useEffect(() => {
@@ -176,6 +285,13 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     return () => window.clearInterval(interval);
   }, [cameraStreamActive, torchActive]);
 
+  const resolvedCollectorName =
+    activeCollector?.name ||
+    collectorAccess?.name ||
+    (isManagerPreview ? 'مدير المحطة' : 'المحصّل الميداني');
+  const resolvedCollectorCode =
+    activeCollector?.code || activeCollector?.id || collectorAccess?.code || '';
+
   const permissions: CollectorPermissions = isManagerPreview
     ? {
         canRecordReadings: true,
@@ -183,27 +299,32 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         canSendInvoices: true,
         canViewDebts: true,
       }
-    : (activeCollector?.permissions ?? {
-        canRecordReadings: false,
-        canCollectCash: false,
-        canSendInvoices: false,
-        canViewDebts: false,
-      });
+    : (activeCollector?.permissions ??
+        collectorAccess?.permissions ?? {
+          canRecordReadings: false,
+          canCollectCash: false,
+          canSendInvoices: false,
+          canViewDebts: false,
+        });
 
   const collectorActive = isManagerPreview
     ? true
-    : Boolean(activeCollector?.active);
+    : Boolean(
+        activeCollector ? activeCollector.active : collectorAccess?.active,
+      );
   const assignedZones = isManagerPreview
     ? []
-    : (activeCollector?.assignedZones ?? []);
+    : (activeCollector?.assignedZones ?? collectorAccess?.assignedZones ?? []);
 
   const zones = useMemo(() => {
     const s = new Set<string>();
     state.subscribers.forEach((sub) => {
       if (
-        sub.importedLocally ||
-        assignedZones.length === 0 ||
-        assignedZones.includes(sub.zoneStreet)
+        subscriberMatchesAssignedZones(
+          sub.zoneStreet,
+          assignedZones,
+          sub.importedLocally,
+        )
       ) {
         s.add(sub.zoneStreet);
       }
@@ -217,9 +338,11 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       .sort((a, b) => a.sequenceOrder - b.sequenceOrder)
       .filter((sub) => {
         if (
-          !sub.importedLocally &&
-          assignedZones.length > 0 &&
-          !assignedZones.includes(sub.zoneStreet)
+          !subscriberMatchesAssignedZones(
+            sub.zoneStreet,
+            assignedZones,
+            sub.importedLocally,
+          )
         ) {
           return false;
         }
@@ -565,8 +688,9 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
 
     const now = new Date().toISOString();
     const readingId = sanitizeFirestoreId(`rd_${Date.now()}`);
-    const collectorName = activeCollector?.name ?? 'مدير المحطة';
-    const collectorUid = activeCollector?.id ?? state.station.ownerUid;
+    const collectorName = resolvedCollectorName;
+    const collectorUid =
+      activeCollector?.id ?? collectorAccess?.code ?? state.station.ownerUid;
 
     const requiresManagerApproval =
       isManuallyEdited || Boolean(options?.lowerReason);
@@ -627,7 +751,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         subscriberName: selectedSubscriber.subscriberName,
         meterNumber: selectedSubscriber.meterNumber,
         collectorName,
-        collectorCode: activeCollector?.code,
+        collectorCode: resolvedCollectorCode || undefined,
         ocrOriginalReading,
         editedReading: activeFinalReading,
         previousReading: prevReading,
@@ -659,7 +783,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         subscriberName: selectedSubscriber.subscriberName,
         meterNumber: selectedSubscriber.meterNumber,
         collectorName,
-        collectorCode: activeCollector?.code,
+        collectorCode: resolvedCollectorCode || undefined,
         ...(ocrOriginalReading !== null ? { ocrOriginalReading } : {}),
         editedReading: activeFinalReading,
         previousReading: prevReading,
@@ -690,7 +814,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         subscriberName: selectedSubscriber.subscriberName,
         meterNumber: selectedSubscriber.meterNumber,
         collectorName,
-        collectorCode: activeCollector?.code,
+        collectorCode: resolvedCollectorCode || undefined,
         editedReading: activeFinalReading,
         previousReading: prevReading,
         consumptionKwh,
@@ -891,75 +1015,111 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
 
   return (
     <div className="space-y-6">
-      {/* Real Connectivity & One-Tap Sync Bar */}
-      <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-5 flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-xl font-bold text-slate-900">
-            تطبيق المحصّل الميداني · {state.station.stationName}
-          </h1>
-          <p className="text-xs text-slate-600 mt-1 flex items-center gap-2">
-            {isOnline ? (
-              <span className="inline-flex items-center gap-1 text-teal-700 font-medium">
-                <Wifi className="w-3.5 h-3.5" /> متصل بالإنترنت
+      {/* Real Connectivity, Collector Identity & One-Tap Sync Bar */}
+      <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-5 space-y-3">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="space-y-1.5 min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-teal-50 border border-teal-200 text-teal-900 text-sm font-extrabold">
+                <User className="w-4 h-4 text-teal-700 shrink-0" />
+                <span>المحصّل: {resolvedCollectorName}</span>
               </span>
-            ) : (
-              <span className="inline-flex items-center gap-1 text-amber-800 font-medium">
-                <WifiOff className="w-3.5 h-3.5" /> وضع أوفلاين (يتم الحفظ محلياً)
+              {resolvedCollectorCode && (
+                <span className="inline-flex items-center px-2.5 py-1 rounded-lg bg-slate-100 border border-slate-200 text-slate-700 text-xs font-bold font-mono-nums">
+                  كود: {resolvedCollectorCode}
+                </span>
+              )}
+              <span className="inline-flex items-center px-2.5 py-1 rounded-lg bg-slate-100 text-slate-700 text-xs font-bold">
+                المشتركين: {routeSubscribers.length}
               </span>
-            )}
-            <span>·</span>
-            <span>
-              {pendingCount > 0
-                ? `${pendingCount} عملية بانتظار المزامنة`
-                : 'جميع السجلات متزامنة'}
-            </span>
-          </p>
-        </div>
-
-        <div className="flex flex-wrap items-center justify-end gap-2">
-          <button
-            type="button"
-            onClick={() =>
-              exportCollectorReadingsExcel(state, activeCollector?.name)
-            }
-            className="min-h-[44px] px-3.5 py-2 text-xs font-medium rounded-lg bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 transition-colors inline-flex items-center gap-2 whitespace-nowrap cursor-pointer"
-          >
-            <Download className="w-4 h-4 text-teal-700" />
-            حفظ القراءات للكمبيوتر (USB)
-          </button>
-
-          <button
-            type="button"
-            disabled={!isOnline || isSyncing || pendingCount === 0}
-            onClick={() => void onSyncNow()}
-            className="min-h-[44px] px-4 py-2 text-xs font-medium rounded-lg bg-teal-700 hover:bg-teal-800 disabled:bg-slate-200 disabled:text-slate-500 text-white transition-colors inline-flex items-center gap-2 whitespace-nowrap cursor-pointer"
-          >
-            {pendingCount === 0 ? (
-              <CheckCircle2 className="w-4 h-4" />
-            ) : (
-              <CloudUpload className="w-4 h-4" />
-            )}
-            {isSyncing
-              ? syncProgress
-                ? `دفعة ${syncProgress.currentBatch} / ${syncProgress.totalBatches} (${syncProgress.completed} / ${syncProgress.total})`
-                : 'جاري المزامنة...'
-              : !isOnline
-                ? 'بانتظار توفر الإنترنت'
-                : pendingCount > 0
-                  ? `مزامنة آمنة على دفعات (${pendingCount} معلق)`
-                  : 'تمت المزامنة السحابية'}
-          </button>
-          {isSyncing && syncProgress && syncProgress.total > 0 && (
-            <div className="w-full min-w-[200px] bg-slate-200 rounded-full h-1.5 overflow-hidden">
-              <div
-                className="bg-teal-700 h-full transition-all"
-                style={{
-                  width: `${Math.round((syncProgress.completed / syncProgress.total) * 100)}%`,
-                }}
-              />
             </div>
-          )}
+            <h1 className="text-lg sm:text-xl font-bold text-slate-900">
+              تطبيق المحصّل الميداني · {state.station.stationName}
+            </h1>
+            <p className="text-xs text-slate-600 flex flex-wrap items-center gap-2">
+              {isOnline ? (
+                <span className="inline-flex items-center gap-1 text-teal-700 font-medium">
+                  <Wifi className="w-3.5 h-3.5" /> متصل بالإنترنت
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 text-amber-800 font-medium">
+                  <WifiOff className="w-3.5 h-3.5" /> وضع أوفلاين (يتم الحفظ محلياً)
+                </span>
+              )}
+              <span>·</span>
+              <span>
+                {pendingCount > 0
+                  ? `${pendingCount} عملية بانتظار المزامنة`
+                  : 'جميع السجلات متزامنة'}
+              </span>
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {!isManagerPreview && (
+              <button
+                type="button"
+                disabled={!isOnline || refreshingState}
+                onClick={() => void handleRefreshSubscribers()}
+                className="min-h-[44px] px-3.5 py-2 text-xs font-bold rounded-lg bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-50 text-slate-800 transition-colors inline-flex items-center gap-2 whitespace-nowrap cursor-pointer"
+              >
+                <RefreshCw
+                  className={`w-4 h-4 text-teal-700 ${refreshingState ? 'animate-spin' : ''}`}
+                />
+                {refreshingState ? 'جاري التحديث...' : 'تحديث الكشف'}
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={() =>
+                exportCollectorReadingsExcel(state, resolvedCollectorName)
+              }
+              className="min-h-[44px] px-3.5 py-2 text-xs font-medium rounded-lg bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 transition-colors inline-flex items-center gap-2 whitespace-nowrap cursor-pointer"
+            >
+              <Download className="w-4 h-4 text-teal-700" />
+              حفظ القراءات للكمبيوتر (USB)
+            </button>
+
+            <button
+              type="button"
+              disabled={!isOnline || isSyncing || pendingCount === 0}
+              onClick={() => void onSyncNow()}
+              className="min-h-[44px] px-4 py-2 text-xs font-medium rounded-lg bg-teal-700 hover:bg-teal-800 disabled:bg-slate-200 disabled:text-slate-500 text-white transition-colors inline-flex items-center gap-2 whitespace-nowrap cursor-pointer"
+            >
+              {pendingCount === 0 ? (
+                <CheckCircle2 className="w-4 h-4" />
+              ) : (
+                <CloudUpload className="w-4 h-4" />
+              )}
+              {isSyncing
+                ? syncProgress
+                  ? `دفعة ${syncProgress.currentBatch} / ${syncProgress.totalBatches} (${syncProgress.completed} / ${syncProgress.total})`
+                  : 'جاري المزامنة...'
+                : !isOnline
+                  ? 'بانتظار توفر الإنترنت'
+                  : pendingCount > 0
+                    ? `مزامنة آمنة على دفعات (${pendingCount} معلق)`
+                    : 'تمت المزامنة السحابية'}
+            </button>
+            {isSyncing && syncProgress && syncProgress.total > 0 && (
+              <div className="w-full min-w-[200px] bg-slate-200 rounded-full h-1.5 overflow-hidden">
+                <div
+                  className="bg-teal-700 h-full transition-all"
+                  style={{
+                    width: `${Math.round((syncProgress.completed / syncProgress.total) * 100)}%`,
+                  }}
+                />
+              </div>
+            )}
+          </div>
         </div>
+
+        {refreshNotice && (
+          <div className="text-xs font-medium text-teal-800 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2">
+            {refreshNotice}
+          </div>
+        )}
       </div>
 
       {/* Main 2-Column Field Workspace */}
@@ -1009,14 +1169,14 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
                 placeholder="بحث بآخر 3-4 أرقام من العداد أو الاسم..."
-                className="w-full min-h-[44px] pr-9 pl-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+                className="w-full min-h-[48px] pr-9 pl-3 py-2 text-base sm:text-lg font-bold placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
               />
             </div>
 
             <select
               value={selectedZone}
               onChange={(e) => setSelectedZone(e.target.value)}
-              className="w-full min-h-[44px] px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white"
+              className="w-full min-h-[48px] px-3 py-2 text-base font-bold border border-slate-300 rounded-lg bg-white"
             >
               <option value="all">جميع الشوارع المخصصة</option>
               {zones.map((z) => (
@@ -1039,7 +1199,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                     active ? 'bg-teal-50/80' : 'hover:bg-slate-50'
                   }`}
                 >
-                  <div className="flex items-center gap-3 min-w-0">
+                  <div className="flex-1 flex items-center gap-3 min-w-0">
                     <div
                       className={`w-9 h-9 rounded-lg flex items-center justify-center text-xs font-bold font-mono-nums shrink-0 ${
                         active
@@ -1049,8 +1209,8 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                     >
                       {sub.sequenceOrder}
                     </div>
-                    <div className="min-w-0">
-                      <div className="text-sm font-semibold text-slate-900 truncate">
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-bold text-slate-900 truncate">
                         {sub.subscriberName}
                       </div>
                       <div className="text-xs text-slate-500 mt-0.5 truncate">
@@ -1084,8 +1244,28 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
               );
             })}
             {routeSubscribers.length === 0 && (
-              <div className="p-8 text-center text-xs text-slate-500">
-                لا يوجد مشتركين في نطاق حاراتك المخصصة.
+              <div className="p-8 text-center space-y-3">
+                <p className="text-sm font-bold text-slate-700">
+                  لا يوجد مشتركين في نطاق حاراتك المخصصة حالياً.
+                </p>
+                <p className="text-xs text-slate-500">
+                  {assignedZones.length > 0
+                    ? `النطاق المخصص: ${assignedZones.join('، ')}`
+                    : 'تأكد من إضافة مشتركين للمحطة أو تحديث الكشف من الخادم.'}
+                </p>
+                {!isManagerPreview && isOnline && (
+                  <button
+                    type="button"
+                    disabled={refreshingState}
+                    onClick={() => void handleRefreshSubscribers()}
+                    className="min-h-[40px] px-4 py-2 text-xs font-bold rounded-lg bg-teal-700 hover:bg-teal-800 disabled:opacity-60 text-white inline-flex items-center gap-2 cursor-pointer"
+                  >
+                    <RefreshCw
+                      className={`w-3.5 h-3.5 ${refreshingState ? 'animate-spin' : ''}`}
+                    />
+                    تحديث الكشف من الخادم
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -1386,7 +1566,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                               onChange={(e) =>
                                 setManualEditInput(e.target.value)
                               }
-                              className="w-full min-h-[44px] px-3 py-2 text-base font-bold font-mono-nums border border-amber-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-500"
+                              className="w-full min-h-[48px] px-3.5 py-2.5 text-lg sm:text-xl font-bold font-mono-nums border border-amber-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-500"
                             />
                             {isManuallyEdited && activeFinalReading !== null && (
                               <p className="text-[11px] text-rose-700 font-medium">
@@ -1442,7 +1622,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                             value={cashPaidInput}
                             onChange={(e) => setCashPaidInput(e.target.value)}
                             placeholder="0 (اختياري)"
-                            className="w-full min-h-[46px] px-3 py-2 text-base font-bold font-mono-nums border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+                            className="w-full min-h-[48px] px-3.5 py-2.5 text-lg sm:text-xl font-bold font-mono-nums placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
                           />
                         </div>
                       )}
@@ -1680,7 +1860,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                         value={newMeterNumberInput}
                         onChange={(e) => setNewMeterNumberInput(e.target.value)}
                         placeholder="أدخل رقم العداد الجديد"
-                        className="w-full px-3 py-2 text-sm font-mono-nums border border-slate-300 rounded-lg bg-white"
+                        className="w-full min-h-[46px] px-3 py-2 text-base sm:text-lg font-bold font-mono-nums placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg bg-white"
                       />
                     </div>
                     <div>
@@ -1693,7 +1873,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                         min={0}
                         value={openingReadingInput}
                         onChange={(e) => setOpeningReadingInput(e.target.value)}
-                        className="w-full px-3 py-2 text-sm font-mono-nums border border-slate-300 rounded-lg bg-white"
+                        className="w-full min-h-[46px] px-3 py-2 text-base sm:text-lg font-bold font-mono-nums border border-slate-300 rounded-lg bg-white"
                       />
                     </div>
                   </div>
