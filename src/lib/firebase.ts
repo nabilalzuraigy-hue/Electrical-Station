@@ -1,8 +1,12 @@
 import { initializeApp } from 'firebase/app';
 import {
   GoogleAuthProvider,
+  browserLocalPersistence,
   getAuth,
   onAuthStateChanged,
+  sendEmailVerification,
+  setPersistence,
+  signInWithEmailAndPassword,
   signInWithPopup,
   signOut,
   type User,
@@ -48,6 +52,9 @@ function createFirestoreClient(): Firestore {
 
 export const db = createFirestoreClient();
 export const auth = getAuth(app);
+void setPersistence(auth, browserLocalPersistence).catch(() => {
+  // Fallback to default browser persistence in restricted environments
+});
 const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: 'select_account' });
 
@@ -174,8 +181,27 @@ export function formatAuthError(error: unknown): string {
       : '';
   const msg = error instanceof Error ? error.message : String(error);
 
+  if (
+    code === 'auth/invalid-credential' ||
+    code === 'auth/wrong-password' ||
+    code === 'auth/user-not-found' ||
+    msg.includes('invalid-credential') ||
+    msg.includes('wrong-password') ||
+    msg.includes('user-not-found')
+  ) {
+    return `كلمة المرور غير صحيحة أو أن حساب ${ADMIN_GOOGLE_EMAIL} غير مضاف بمزود Email/Password في Firebase Authentication.`;
+  }
+  if (code === 'auth/invalid-email' || msg.includes('invalid-email')) {
+    return 'صيغة البريد الإلكتروني غير صحيحة.';
+  }
+  if (code === 'auth/too-many-requests' || msg.includes('too-many-requests')) {
+    return 'تم حظر المحاولات مؤقتاً لكثرة الإدخال الخاطئ. انتظر قليلاً ثم حاول مجدداً.';
+  }
+  if (code === 'auth/user-disabled' || msg.includes('user-disabled')) {
+    return 'تم تعطيل حساب المطور في Firebase Authentication.';
+  }
   if (code === 'auth/operation-not-allowed' || msg.includes('operation-not-allowed')) {
-    return `مزود تسجيل الدخول عبر Google غير مفعل في مشروع Firebase (${FIREBASE_PROJECT_ID}).`;
+    return `مزود تسجيل الدخول (Google أو Email/Password) غير مفعل في مشروع Firebase (${FIREBASE_PROJECT_ID}).`;
   }
   if (code === 'auth/unauthorized-domain' || msg.includes('unauthorized-domain')) {
     return `هذا النطاق غير مضاف في قائمة النطاقات المصرح بها (Authorized domains) في Firebase Authentication للمشروع ${FIREBASE_PROJECT_ID}.`;
@@ -186,10 +212,42 @@ export function formatAuthError(error: unknown): string {
   if (code === 'auth/popup-closed-by-user' || msg.includes('popup-closed-by-user')) {
     return 'تم إغلاق نافذة تسجيل الدخول قبل إتمام العملية.';
   }
-  return msg || 'تعذر إتمام تسجيل الدخول بحساب Google.';
+  return msg || 'تعذر إتمام تسجيل الدخول بحساب Firebase.';
+}
+
+export function resolveDeveloperAdminEmail(identifier: string): string | null {
+  const trimmed = identifier.trim().replace(/\s+/g, ' ');
+  if (!trimmed) return null;
+  if (trimmed.toLowerCase() === ADMIN_GOOGLE_EMAIL.toLowerCase()) {
+    return ADMIN_GOOGLE_EMAIL;
+  }
+  if (
+    normalizeArabicIdentifierForHash(trimmed) ===
+    normalizeArabicIdentifierForHash('نبيل الزريقي')
+  ) {
+    return ADMIN_GOOGLE_EMAIL;
+  }
+  return null;
+}
+
+export async function signInDeveloperWithEmailPassword(
+  email: string,
+  password: string,
+): Promise<User> {
+  await setPersistence(auth, browserLocalPersistence).catch(() => {});
+  const result = await signInWithEmailAndPassword(auth, email.trim(), password);
+  return result.user;
+}
+
+export async function sendDeveloperVerificationEmail(): Promise<void> {
+  if (!auth.currentUser) {
+    throw new Error('لا يوجد مستخدم مسجل حالياً.');
+  }
+  await sendEmailVerification(auth.currentUser);
 }
 
 export async function signInWithGooglePopup(): Promise<User> {
+  await setPersistence(auth, browserLocalPersistence).catch(() => {});
   const result = await signInWithPopup(auth, googleProvider);
   return result.user;
 }

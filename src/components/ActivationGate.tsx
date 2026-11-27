@@ -5,6 +5,8 @@ import {
   auth,
   formatAuthError,
   isAuthorizedAdminUser,
+  resolveDeveloperAdminEmail,
+  signInDeveloperWithEmailPassword,
   signInWithGooglePopup,
   signOutUser,
 } from '../lib/firebase';
@@ -29,6 +31,37 @@ export const ActivationGate: React.FC<ActivationGateProps> = ({
     e.preventDefault();
     if (!username.trim() && !password.trim()) {
       setError('يرجى إدخال اسم المستخدم وكلمة المرور.');
+      return;
+    }
+
+    const developerEmail = resolveDeveloperAdminEmail(username);
+    if (developerEmail) {
+      if (!password) {
+        setError('يرجى إدخال كلمة المرور لحساب المطور.');
+        return;
+      }
+      setSubmitting(true);
+      setError(null);
+      try {
+        const user = await signInDeveloperWithEmailPassword(
+          developerEmail,
+          password,
+        );
+        if (!isAuthorizedAdminUser(user)) {
+          await signOutUser();
+          setError('هذا الحساب غير مصرح له بدخول الأدمن المطور.');
+          return;
+        }
+        onAuthenticated({
+          kind: 'admin',
+          token: CLOUD_ADMIN_TOKEN,
+          name: 'الأدمن المطور',
+        });
+      } catch (err) {
+        setError(formatAuthError(err));
+      } finally {
+        setSubmitting(false);
+      }
       return;
     }
 

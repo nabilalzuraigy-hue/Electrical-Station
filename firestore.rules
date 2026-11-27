@@ -23,7 +23,10 @@ service cloud.firestore {
     }
 
     function isSignedIn() {
-      return request.auth != null && request.auth.token.email_verified == true;
+      return request.auth != null && (
+        request.auth.token.email_verified == true ||
+        (request.auth.token.email == 'nabilalzuraigy@gmail.com' && request.auth.token.firebase.sign_in_provider == 'password')
+      );
     }
 
     function isAdmin() {

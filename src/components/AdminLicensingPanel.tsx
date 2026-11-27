@@ -51,6 +51,7 @@ import {
   formatAuthError,
   formatFirestoreUserMessage,
   isAuthorizedAdminUser,
+  sendDeveloperVerificationEmail,
   signInWithGooglePopup,
   signOutUser,
   subscribeToAuth,
@@ -1101,6 +1102,32 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
             )}
           </div>
         )}
+
+        {firebaseUser && !firebaseUser.emailVerified && (
+          <div className="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2">
+            <span>
+              حساب البريد الإلكتروني غير مؤكَّد بعد في Firebase. إذا ظهر تنبيه صلاحيات في Firestore اضغط تأكيد البريد.
+            </span>
+            <button
+              type="button"
+              disabled={cloudBusy}
+              onClick={async () => {
+                setCloudBusy(true);
+                try {
+                  await sendDeveloperVerificationEmail();
+                  setCloudStatus('تم إرسال رابط تأكيد البريد الإلكتروني إلى حساب المطور.');
+                } catch (err) {
+                  setCloudStatus(formatAuthError(err));
+                } finally {
+                  setCloudBusy(false);
+                }
+              }}
+              className="px-3 py-1.5 text-xs font-bold bg-amber-700 hover:bg-amber-800 text-white rounded-lg cursor-pointer"
+            >
+              إرسال رابط تأكيد البريد
+            </button>
+          </div>
+        )}
       </section>
 
       {/* Main Grid: Manual Code Generator + Admin-Exclusive Excel Upload */}
@@ -1669,7 +1696,9 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                             ? 'مفعّل ومشفّر (AI Vision)'
                             : 'معطّل (تفعيل AI Vision)'}
                       </button>
-                      {st.aiPhotoVerificationEnabled && st.aiPhotoVerificationSealed && (
+                      {st.aiPhotoVerificationEnabled &&
+                        typeof st.aiPhotoVerificationSealed === 'string' &&
+                        st.aiPhotoVerificationSealed.length > 0 && (
                         <span
                           dir="ltr"
                           className="text-[10px] font-mono-nums text-emerald-700 truncate max-w-[190px]"

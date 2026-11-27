@@ -17,7 +17,7 @@ import {
   subscribeToAuth,
   testFirestoreConnection,
 } from './lib/firebase';
-import { isCloudAdminToken } from './lib/cloudAdminStore';
+import { CLOUD_ADMIN_TOKEN, isCloudAdminToken } from './lib/cloudAdminStore';
 import {
   loadAdminStoreFromFirestore,
   saveAdminStoreToFirestore,
@@ -52,6 +52,7 @@ function StationWorkspace() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null);
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
+  const [authInitialized, setAuthInitialized] = useState(false);
   const autoSyncLockRef = useRef(false);
 
   const runSilentGlobalCloudSync = useCallback(async () => {
@@ -97,15 +98,20 @@ function StationWorkspace() {
   useEffect(() => {
     let intervalId: ReturnType<typeof setInterval> | null = null;
     const unsub = subscribeToAuth((user) => {
+      setAuthInitialized(true);
       if (intervalId) {
         clearInterval(intervalId);
         intervalId = null;
       }
       if (isAuthorizedAdminUser(user)) {
+        setAdminToken((prev) => prev || CLOUD_ADMIN_TOKEN);
+        setActiveTab((prev) => (prev === 'activation' ? 'admin' : prev));
         void runSilentGlobalCloudSync();
         intervalId = setInterval(() => {
           void runSilentGlobalCloudSync();
         }, 45000);
+      } else {
+        setAdminToken((prev) => (isCloudAdminToken(prev) ? null : prev));
       }
     });
     return () => {
@@ -205,6 +211,24 @@ function StationWorkspace() {
         )
       : undefined;
 
+  if (!isLoggedIn && !authInitialized) {
+    return (
+      <div
+        dir="rtl"
+        className="min-h-[100dvh] w-full bg-gradient-to-br from-[#041224] via-[#062738] to-[#053328] flex flex-col items-center justify-center px-4 text-white"
+      >
+        <div className="bg-white/10 backdrop-blur-md border border-emerald-400/25 rounded-2xl px-6 py-5 text-center space-y-2 shadow-xl">
+          <div className="w-10 h-10 mx-auto rounded-xl bg-emerald-400/20 text-emerald-300 inline-flex items-center justify-center">
+            <Zap className="w-5 h-5 animate-pulse" />
+          </div>
+          <p className="text-sm font-bold text-white">
+            جاري استعادة جلسة الدخول...
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   if (!isLoggedIn) {
     return (
       <>
@@ -301,16 +325,10 @@ function StationWorkspace() {
           </div>
         )}
 
-        {activeTab === 'subscriber' ? (
+        {activeTab === 'subscriber' && subscriberResult ? (
           <SubscriberPortal
             state={stationState}
             initialResult={subscriberResult}
-          />
-        ) : activeTab === 'admin' && adminToken ? (
-          <AdminLicensingPanel
-            adminToken={adminToken}
-            onAdminAuthenticated={(tok) => setAdminToken(tok)}
-            onLogoutAdmin={handleLogout}
           />
         ) : activeTab === 'flutter' && adminToken ? (
           <FlutterCodeExplorer />
@@ -339,6 +357,15 @@ function StationWorkspace() {
             syncProgress={syncProgress}
             activeCollector={activeCollector}
             collectorAccess={accessRecord}
+          />
+        ) : adminToken ? (
+          <AdminLicensingPanel
+            adminToken={adminToken}
+            onAdminAuthenticated={(tok) => {
+              setAdminToken(tok);
+              setActiveTab('admin');
+            }}
+            onLogoutAdmin={handleLogout}
           />
         ) : (
           <ActivationGate onAuthenticated={handleUnifiedAuth} />

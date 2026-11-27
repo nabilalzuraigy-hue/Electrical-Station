@@ -170,7 +170,7 @@ export async function cloudAdminOverview(): Promise<{
     enrichStationCounts(st, vault.stationData[st.stationId]),
   );
   const codes = Object.values(vault.codes).sort((a, b) =>
-    b.createdAt.localeCompare(a.createdAt),
+    String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')),
   );
   return { stations, codes };
 }
@@ -507,16 +507,18 @@ export async function cloudAdminFetchStationDetails(stationId: string): Promise<
   return {
     station: enrichStationCounts(st, bucket),
     readings: Object.values(bucket.readings).sort((a, b) =>
-      b.recordedAt.localeCompare(a.recordedAt),
+      String(b.recordedAt ?? '').localeCompare(String(a.recordedAt ?? '')),
     ),
     receipts: Object.values(bucket.receipts).sort((a, b) =>
-      b.paidAt.localeCompare(a.paidAt),
+      String(b.paidAt ?? '').localeCompare(String(a.paidAt ?? '')),
     ),
     expenses: Object.values(bucket.expenses).sort((a, b) =>
-      (b.date || b.createdAt).localeCompare(a.date || a.createdAt),
+      String(b.date || b.createdAt || '').localeCompare(
+        String(a.date || a.createdAt || ''),
+      ),
     ),
     alerts: Object.values(bucket.alerts).sort((a, b) =>
-      b.createdAt.localeCompare(a.createdAt),
+      String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')),
     ),
   };
 }
