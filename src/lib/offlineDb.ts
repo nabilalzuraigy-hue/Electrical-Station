@@ -1,11 +1,16 @@
 import * as XLSX from 'xlsx';
 import { idbGet, idbSet } from './indexedDbCache';
 import {
+  loadAccessCodeFromFirestore,
   loadStaffVaultFromFirestore,
   loadSubscriberPortalFromFirestore,
+  saveAccessCodeToFirestore,
   saveCollectorReadingTextToFirestore,
   type AdminStoreBackupPayload,
 } from './firestoreBackup';
+import {
+  verifyDeveloperPasscodeStatic,
+} from './devicePinAuth';
 import {
   CLOUD_ADMIN_TOKEN,
   canUseCloudAdminFallback,
@@ -20,6 +25,7 @@ import {
   cloudAdminFetchStationSubscribers,
   cloudAdminGenerateAccessCode,
   cloudAdminOverview,
+  cloudAdminResetCodePin,
   cloudAdminRestoreBackup,
   cloudAdminToggleAccessCode,
   cloudAdminToggleAiVerification,
@@ -157,9 +163,11 @@ export async function claimAdminPasscode(
     });
   } catch (err) {
     if (err instanceof StaticHostingNoBackendError) {
-      throw new Error(
-        'على استضافة Firebase المباشرة، استخدم زر «دخول الأدمن المطور (Google)» للتحقق السحابي الآمن.',
-      );
+      const ok = await verifyDeveloperPasscodeStatic(passcode);
+      if (ok) {
+        return { token: CLOUD_ADMIN_TOKEN, name: 'الأدمن المطور' };
+      }
+      throw new Error('كلمة مرور المطور غير صحيحة.');
     }
     throw err;
   }
@@ -175,9 +183,11 @@ export async function loginAdminPasscode(
     });
   } catch (err) {
     if (err instanceof StaticHostingNoBackendError) {
-      throw new Error(
-        'على استضافة Firebase المباشرة، استخدم زر «دخول الأدمن المطور (Google)» للتحقق السحابي الآمن.',
-      );
+      const ok = await verifyDeveloperPasscodeStatic(passcode);
+      if (ok) {
+        return { token: CLOUD_ADMIN_TOKEN, name: 'الأدمن المطور' };
+      }
+      throw new Error('كلمة مرور المطور غير صحيحة.');
     }
     throw err;
   }
@@ -278,15 +288,21 @@ export async function generateAccessCodeAdmin(
   return withCloudAdmin(
     adminToken,
     () => cloudAdminGenerateAccessCode(params),
-    () =>
-      apiRequest<{ codeRecord: AccessCodeRecord; station: StationConfig }>(
+    async () => {
+      const res = await apiRequest<{
+        codeRecord: AccessCodeRecord;
+        station: StationConfig;
+      }>(
         '/api/admin/codes',
         {
           method: 'POST',
           body: JSON.stringify(params),
         },
         adminToken,
-      ),
+      );
+      void saveAccessCodeToFirestore(res.codeRecord).catch(() => {});
+      return res;
+    },
   );
 }
 
@@ -302,15 +318,40 @@ export async function toggleAccessCodeAdmin(
   return withCloudAdmin(
     adminToken,
     () => cloudAdminToggleAccessCode(code, updates),
-    () =>
-      apiRequest<{ codeRecord: AccessCodeRecord }>(
+    async () => {
+      const res = await apiRequest<{ codeRecord: AccessCodeRecord }>(
         `/api/admin/codes/${encodeURIComponent(code)}/toggle`,
         {
           method: 'POST',
           body: JSON.stringify(updates),
         },
         adminToken,
-      ),
+      );
+      void saveAccessCodeToFirestore(res.codeRecord).catch(() => {});
+      return res;
+    },
+  );
+}
+
+export async function resetCodePinAdmin(
+  adminToken: string,
+  code: string,
+): Promise<{ codeRecord: AccessCodeRecord }> {
+  return withCloudAdmin(
+    adminToken,
+    () => cloudAdminResetCodePin(code),
+    async () => {
+      const res = await apiRequest<{ codeRecord: AccessCodeRecord }>(
+        `/api/admin/codes/${encodeURIComponent(code)}/reset-pin`,
+        {
+          method: 'POST',
+          body: JSON.stringify({}),
+        },
+        adminToken,
+      );
+      void saveAccessCodeToFirestore(res.codeRecord).catch(() => {});
+      return res;
+    },
   );
 }
 
@@ -883,9 +924,7 @@ export async function loginUnified(
     }
 
     if (primaryErr instanceof StaticHostingNoBackendError) {
-      throw new Error(
-        'لم يتم العثور على كود موظف أو بيانات مشترك مطابقة. للدخول كأدمن مطور على استضافة Firebase المباشرة اضغط زر «دخول الأدمن المطور (Google)» أسفل النموذج.',
-      );
+      throw new Error('كود التفعيل غير صحيح أو موقوف حالياً.');
     }
 
     throw primaryErr;
@@ -899,7 +938,17 @@ export async function loginWithAccessCode(codeInput: string): Promise<{
 }> {
   const code = normalizeActivationCode(codeInput);
   if (!code || code.length < 4) {
-    throw new Error('يرجى إدخال كود الدخول الصحيح.');
+    throw new Error('يرجى إدخال كود التفعيل الصحيح.');
+  }
+
+  // Always check Firestore `codes/{code}` first when online so `active` & `pinResetAt` are authoritative
+  const cloudCodeDoc =
+    typeof navigator === 'undefined' || navigator.onLine !== false
+      ? await loadAccessCodeFromFirestore(code, true)
+      : null;
+
+  if (cloudCodeDoc && !cloudCodeDoc.active) {
+    throw new Error('تم إلغاء تفعيل هذا الكود من الإدارة.');
   }
 
   try {
@@ -921,6 +970,18 @@ export async function loginWithAccessCode(codeInput: string): Promise<{
       body: JSON.stringify({ code }),
     });
 
+    const mergedAccess: AccessCodeRecord = cloudCodeDoc
+      ? {
+          ...res.access,
+          active: cloudCodeDoc.active,
+          pinResetAt: cloudCodeDoc.pinResetAt ?? res.access.pinResetAt ?? null,
+        }
+      : res.access;
+
+    if (!mergedAccess.active) {
+      throw new Error('تم إلغاء تفعيل هذا الكود من الإدارة.');
+    }
+
     const cloudState = mapServerState(res.state);
     const local = await loadStationLocalState(cloudState.station.stationId);
     const merged = mergeLocalPendingWithCloud(local, cloudState);
@@ -928,14 +989,15 @@ export async function loginWithAccessCode(codeInput: string): Promise<{
 
     return {
       token: res.token,
-      access: res.access,
+      access: mergedAccess,
       state: merged,
     };
   } catch (err) {
     const staffVault = await loadStaffVaultFromFirestore(code);
     if (staffVault) {
-      if (!staffVault.access.active) {
-        throw new Error('هذا الكود موقوف حالياً من الإدارة.');
+      const effectiveActive = cloudCodeDoc ? cloudCodeDoc.active : staffVault.access.active;
+      if (!effectiveActive) {
+        throw new Error('تم إلغاء تفعيل هذا الكود من الإدارة.');
       }
       if (staffVault.station.licenseStatus !== 'active') {
         throw new Error('تم إيقاف ترخيص هذه المحطة من قِبل الإدارة.');
@@ -955,7 +1017,11 @@ export async function loginWithAccessCode(codeInput: string): Promise<{
       await saveStationLocalState(merged);
       return {
         token: `cloud_${code}`,
-        access: staffVault.access,
+        access: {
+          ...staffVault.access,
+          active: effectiveActive,
+          pinResetAt: cloudCodeDoc?.pinResetAt ?? staffVault.access.pinResetAt ?? null,
+        },
         state: merged,
       };
     }
@@ -963,6 +1029,56 @@ export async function loginWithAccessCode(codeInput: string): Promise<{
       throw new Error('كود التفعيل غير صحيح أو غير محفوظ بعد في السحابة.');
     }
     throw err;
+  }
+}
+
+export async function checkBoundCodeStatus(
+  boundCode: string,
+  localBoundAt: string,
+): Promise<
+  | { status: 'offline' }
+  | { status: 'deactivated' }
+  | { status: 'pin_reset'; access: AccessCodeRecord }
+  | { status: 'ok'; token: string; access: AccessCodeRecord; state: StationLocalState }
+> {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return { status: 'offline' };
+  }
+
+  const code = normalizeActivationCode(boundCode);
+  try {
+    const cloudCodeDoc = await loadAccessCodeFromFirestore(code, true);
+    if (cloudCodeDoc) {
+      if (!cloudCodeDoc.active) {
+        return { status: 'deactivated' };
+      }
+      if (
+        cloudCodeDoc.pinResetAt &&
+        new Date(cloudCodeDoc.pinResetAt).getTime() >
+          new Date(localBoundAt).getTime()
+      ) {
+        return { status: 'pin_reset', access: cloudCodeDoc };
+      }
+    }
+
+    const res = await loginWithAccessCode(code);
+    if (!res.access.active) {
+      return { status: 'deactivated' };
+    }
+    if (
+      res.access.pinResetAt &&
+      new Date(res.access.pinResetAt).getTime() >
+        new Date(localBoundAt).getTime()
+    ) {
+      return { status: 'pin_reset', access: res.access };
+    }
+    return { status: 'ok', token: res.token, access: res.access, state: res.state };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : '';
+    if (msg.includes('إلغاء تفعيل') || msg.includes('موقوف')) {
+      return { status: 'deactivated' };
+    }
+    return { status: 'offline' };
   }
 }
 

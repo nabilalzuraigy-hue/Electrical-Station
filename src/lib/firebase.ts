@@ -1,17 +1,5 @@
 import { initializeApp } from 'firebase/app';
 import {
-  GoogleAuthProvider,
-  browserLocalPersistence,
-  getAuth,
-  onAuthStateChanged,
-  sendEmailVerification,
-  setPersistence,
-  signInWithEmailAndPassword,
-  signInWithPopup,
-  signOut,
-  type User,
-} from 'firebase/auth';
-import {
   doc,
   getDocFromServer,
   getFirestore,
@@ -32,7 +20,6 @@ export const FIREBASE_CONFIG = {
 
 export const FIREBASE_PROJECT_ID = FIREBASE_CONFIG.projectId;
 export const FIREBASE_DATABASE_ID = '(default)';
-export const ADMIN_GOOGLE_EMAIL = 'nabilalzuraigy@gmail.com';
 
 const app = initializeApp(FIREBASE_CONFIG);
 
@@ -51,12 +38,6 @@ function createFirestoreClient(): Firestore {
 }
 
 export const db = createFirestoreClient();
-export const auth = getAuth(app);
-void setPersistence(auth, browserLocalPersistence).catch(() => {
-  // Fallback to default browser persistence in restricted environments
-});
-const googleProvider = new GoogleAuthProvider();
-googleProvider.setCustomParameters({ prompt: 'select_account' });
 
 export enum OperationType {
   CREATE = 'create',
@@ -71,17 +52,6 @@ export interface FirestoreErrorInfo {
   error: string;
   operationType: OperationType;
   path: string | null;
-  authInfo: {
-    userId?: string | null;
-    email?: string | null;
-    emailVerified?: boolean | null;
-    isAnonymous?: boolean | null;
-    tenantId?: string | null;
-    providerInfo?: {
-      providerId?: string | null;
-      email?: string | null;
-    }[];
-  };
 }
 
 export function handleFirestoreError(
@@ -91,18 +61,6 @@ export function handleFirestoreError(
 ): never {
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-      isAnonymous: auth.currentUser?.isAnonymous,
-      tenantId: auth.currentUser?.tenantId,
-      providerInfo:
-        auth.currentUser?.providerData?.map((provider) => ({
-          providerId: provider.providerId,
-          email: provider.email,
-        })) || [],
-    },
     operationType,
     path,
   };
@@ -166,116 +124,12 @@ export function formatFirestoreUserMessage(
     lower.includes('permission-denied') ||
     lower.includes('insufficient permissions')
   ) {
-    return `صلاحيات Firebase مقصورة على حساب الأدمن المطور المعتمد (${ADMIN_GOOGLE_EMAIL}). يرجى ربط الحساب الصحيح ونشر قواعد Firestore المحدّثة.`;
+    return 'تعذر تنفيذ العملية بسبب قواعد صلاحيات Firebase Firestore. يرجى نشر ملف firestore.rules المحدّث على المشروع.';
   }
   if (lower.includes('quota exceeded')) {
     return 'تم تجاوز حصة الاستخدام المجانية اليومية في Firebase Firestore.';
   }
   return inner || fallback;
-}
-
-export function formatAuthError(error: unknown): string {
-  const code =
-    typeof error === 'object' && error !== null && 'code' in error
-      ? String((error as { code?: unknown }).code ?? '')
-      : '';
-  const msg = error instanceof Error ? error.message : String(error);
-
-  if (
-    code === 'auth/invalid-credential' ||
-    code === 'auth/wrong-password' ||
-    code === 'auth/user-not-found' ||
-    msg.includes('invalid-credential') ||
-    msg.includes('wrong-password') ||
-    msg.includes('user-not-found')
-  ) {
-    return `كلمة المرور غير صحيحة أو أن حساب ${ADMIN_GOOGLE_EMAIL} غير مضاف بمزود Email/Password في Firebase Authentication.`;
-  }
-  if (code === 'auth/invalid-email' || msg.includes('invalid-email')) {
-    return 'صيغة البريد الإلكتروني غير صحيحة.';
-  }
-  if (code === 'auth/too-many-requests' || msg.includes('too-many-requests')) {
-    return 'تم حظر المحاولات مؤقتاً لكثرة الإدخال الخاطئ. انتظر قليلاً ثم حاول مجدداً.';
-  }
-  if (code === 'auth/user-disabled' || msg.includes('user-disabled')) {
-    return 'تم تعطيل حساب المطور في Firebase Authentication.';
-  }
-  if (code === 'auth/operation-not-allowed' || msg.includes('operation-not-allowed')) {
-    return `مزود تسجيل الدخول (Google أو Email/Password) غير مفعل في مشروع Firebase (${FIREBASE_PROJECT_ID}).`;
-  }
-  if (code === 'auth/unauthorized-domain' || msg.includes('unauthorized-domain')) {
-    return `هذا النطاق غير مضاف في قائمة النطاقات المصرح بها (Authorized domains) في Firebase Authentication للمشروع ${FIREBASE_PROJECT_ID}.`;
-  }
-  if (code === 'auth/popup-blocked' || msg.includes('popup-blocked')) {
-    return 'تم حظر نافذة تسجيل الدخول من المتصفح. يرجى السماح بالنوافذ المنبثقة لهذا الموقع والمحاولة مجدداً.';
-  }
-  if (code === 'auth/popup-closed-by-user' || msg.includes('popup-closed-by-user')) {
-    return 'تم إغلاق نافذة تسجيل الدخول قبل إتمام العملية.';
-  }
-  return msg || 'تعذر إتمام تسجيل الدخول بحساب Firebase.';
-}
-
-export function resolveDeveloperAdminEmail(identifier: string): string | null {
-  const trimmed = identifier.trim().replace(/\s+/g, ' ');
-  if (!trimmed) return null;
-  if (trimmed.toLowerCase() === ADMIN_GOOGLE_EMAIL.toLowerCase()) {
-    return ADMIN_GOOGLE_EMAIL;
-  }
-  if (
-    normalizeArabicIdentifierForHash(trimmed) ===
-    normalizeArabicIdentifierForHash('نبيل الزريقي')
-  ) {
-    return ADMIN_GOOGLE_EMAIL;
-  }
-  return null;
-}
-
-export async function signInDeveloperWithEmailPassword(
-  email: string,
-  password: string,
-): Promise<User> {
-  await setPersistence(auth, browserLocalPersistence).catch(() => {});
-  const result = await signInWithEmailAndPassword(auth, email.trim(), password);
-  return result.user;
-}
-
-export async function sendDeveloperVerificationEmail(): Promise<void> {
-  if (!auth.currentUser) {
-    throw new Error('لا يوجد مستخدم مسجل حالياً.');
-  }
-  await sendEmailVerification(auth.currentUser);
-}
-
-export async function signInWithGooglePopup(): Promise<User> {
-  await setPersistence(auth, browserLocalPersistence).catch(() => {});
-  const result = await signInWithPopup(auth, googleProvider);
-  return result.user;
-}
-
-export async function signOutUser(): Promise<void> {
-  await signOut(auth);
-}
-
-export function subscribeToAuth(callback: (user: User | null) => void) {
-  return onAuthStateChanged(auth, callback);
-}
-
-export function isAuthorizedAdminUser(user: User | null): boolean {
-  return Boolean(
-    user?.email &&
-      user.email.trim().toLowerCase() === ADMIN_GOOGLE_EMAIL.toLowerCase(),
-  );
-}
-
-export async function getFirebaseAdminIdToken(
-  user: User | null = auth.currentUser,
-): Promise<string | null> {
-  if (!user || !isAuthorizedAdminUser(user)) return null;
-  try {
-    return await user.getIdToken();
-  } catch {
-    return null;
-  }
 }
 
 async function sha256Hex(raw: string): Promise<string> {
@@ -303,9 +157,9 @@ export function normalizeArabicIdentifierForHash(raw: string): string {
 }
 
 export function normalizePhoneForHash(raw: string): string {
-  const digits = raw.replace(/[٠-٩]/g, (d) =>
-    String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)),
-  ).replace(/\D/g, '');
+  const digits = raw
+    .replace(/[٠-٩]/g, (d) => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)))
+    .replace(/\D/g, '');
   if (digits.startsWith('00967')) return digits.slice(5);
   if (digits.startsWith('967') && digits.length >= 11) return digits.slice(3);
   if (digits.startsWith('0') && digits.length === 10) return digits.slice(1);

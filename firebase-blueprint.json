@@ -1,5 +1,26 @@
 {
   "entities": {
+    "AccessCode": {
+      "title": "AccessCode",
+      "description": "Manager or Collector activation code created by Developer Admin in the top-level codes collection.",
+      "type": "object",
+      "properties": {
+        "code": { "type": "string", "pattern": "^[A-Z0-9\\-]+$", "maxLength": 40 },
+        "role": { "type": "string", "enum": ["manager", "collector"] },
+        "stationId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "active": { "type": "boolean" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "name": { "type": "string", "maxLength": 120 },
+        "phone": { "type": "string", "maxLength": 30 },
+        "stationName": { "type": "string", "maxLength": 120 },
+        "assignedZones": { "type": "array" },
+        "permissions": { "type": "object" },
+        "pinResetAt": { "type": "string", "maxLength": 60 },
+        "createdAt": { "type": "string", "maxLength": 60 },
+        "updatedAt": { "type": "string", "maxLength": 60 }
+      },
+      "required": ["code", "role", "stationId", "active", "createdBy"]
+    },
     "LicenseRecord": {
       "title": "LicenseRecord",
       "description": "Station activation code and commercial license issued by the Super Admin.",
@@ -286,6 +307,10 @@
     }
   },
   "firestore": {
+    "/codes/{code}": {
+      "schema": { "$ref": "#/entities/AccessCode" },
+      "description": "Manager and Collector activation codes created by Developer Admin with active status and pinResetAt tracking."
+    },
     "/admins/{uid}": {
       "schema": { "$ref": "#/entities/StationConfig" },
       "description": "Super Admin role lookup collection."

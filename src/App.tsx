@@ -9,15 +9,12 @@ import { SubscriberPortal } from './components/SubscriberPortal';
 import { FlutterCodeExplorer } from './components/FlutterCodeExplorer';
 import { PWAInstallPrompt } from './components/PWAInstallPrompt';
 import { OfflineIndicator } from './components/OfflineIndicator';
+import { testFirestoreConnection } from './lib/firebase';
+import { isCloudAdminToken } from './lib/cloudAdminStore';
 import {
-  auth,
-  getFirebaseAdminIdToken,
-  isAuthorizedAdminUser,
-  signOutUser,
-  subscribeToAuth,
-  testFirestoreConnection,
-} from './lib/firebase';
-import { CLOUD_ADMIN_TOKEN, isCloudAdminToken } from './lib/cloudAdminStore';
+  clearDeveloperSession,
+  loadDeveloperSession,
+} from './lib/devicePinAuth';
 import {
   loadAdminStoreFromFirestore,
   saveAdminStoreToFirestore,
@@ -57,19 +54,14 @@ function StationWorkspace() {
 
   const runSilentGlobalCloudSync = useCallback(async () => {
     if (autoSyncLockRef.current) return;
+    if (!adminToken) return;
     if (isCloudAdminToken(adminToken)) return;
-    const currentUser = auth.currentUser;
-    if (!isAuthorizedAdminUser(currentUser)) return;
     if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
 
     autoSyncLockRef.current = true;
     try {
-      const firebaseIdToken = await getFirebaseAdminIdToken(currentUser);
-      if (!firebaseIdToken && !adminToken) return;
-
       const serverSnapshot = await fetchCloudAutoBackup({
         adminToken,
-        firebaseIdToken,
       });
 
       if (!serverSnapshot.hasData) {
@@ -80,7 +72,6 @@ function StationWorkspace() {
         ) {
           await restoreCloudAutoBackup({
             adminToken,
-            firebaseIdToken,
             backup: cloudSnap.backup,
             mode: 'merge',
           });
@@ -96,29 +87,31 @@ function StationWorkspace() {
   }, [adminToken]);
 
   useEffect(() => {
-    let intervalId: ReturnType<typeof setInterval> | null = null;
-    const unsub = subscribeToAuth((user) => {
-      setAuthInitialized(true);
-      if (intervalId) {
-        clearInterval(intervalId);
-        intervalId = null;
+    let active = true;
+    (async () => {
+      try {
+        const savedDev = await loadDeveloperSession();
+        if (active && savedDev?.token) {
+          setAdminToken(savedDev.token);
+          setActiveTab('admin');
+        }
+      } finally {
+        if (active) setAuthInitialized(true);
       }
-      if (isAuthorizedAdminUser(user)) {
-        setAdminToken((prev) => prev || CLOUD_ADMIN_TOKEN);
-        setActiveTab((prev) => (prev === 'activation' ? 'admin' : prev));
-        void runSilentGlobalCloudSync();
-        intervalId = setInterval(() => {
-          void runSilentGlobalCloudSync();
-        }, 45000);
-      } else {
-        setAdminToken((prev) => (isCloudAdminToken(prev) ? null : prev));
-      }
-    });
+    })();
     return () => {
-      unsub();
-      if (intervalId) clearInterval(intervalId);
+      active = false;
     };
-  }, [runSilentGlobalCloudSync]);
+  }, []);
+
+  useEffect(() => {
+    if (!adminToken) return;
+    void runSilentGlobalCloudSync();
+    const intervalId = setInterval(() => {
+      void runSilentGlobalCloudSync();
+    }, 45000);
+    return () => clearInterval(intervalId);
+  }, [adminToken, runSilentGlobalCloudSync]);
 
   const isLoggedIn = Boolean(
     adminToken || (staffToken && accessRecord) || subscriberResult,
@@ -175,8 +168,8 @@ function StationWorkspace() {
   };
 
   const handleLogout = () => {
-    if (isCloudAdminToken(adminToken)) {
-      void signOutUser();
+    if (adminToken) {
+      void clearDeveloperSession();
     }
     setAdminToken(null);
     setStaffToken(null);

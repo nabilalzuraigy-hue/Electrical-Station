@@ -1,5 +1,4 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import type { User } from 'firebase/auth';
 import {
   Check,
   Cloud,
@@ -15,6 +14,7 @@ import {
   LogOut,
   PlusCircle,
   RefreshCw,
+  RotateCcw,
   ShieldCheck,
   Sparkles,
   Trash2,
@@ -39,6 +39,7 @@ import {
   getAdminStatus,
   loginAdminPasscode,
   parseSubscribersExcelFile,
+  resetCodePinAdmin,
   restoreAdminBackup,
   toggleAccessCodeAdmin,
   toggleStationAiVerificationAdmin,
@@ -48,18 +49,12 @@ import {
 import {
   FIREBASE_DATABASE_ID,
   FIREBASE_PROJECT_ID,
-  formatAuthError,
   formatFirestoreUserMessage,
-  isAuthorizedAdminUser,
-  sendDeveloperVerificationEmail,
-  signInWithGooglePopup,
-  signOutUser,
-  subscribeToAuth,
 } from '../lib/firebase';
 import {
-  CLOUD_ADMIN_TOKEN,
   isCloudAdminToken,
 } from '../lib/cloudAdminStore';
+import { saveDeveloperSession } from '../lib/devicePinAuth';
 import {
   loadAdminStoreFromFirestore,
   saveAdminStoreToFirestore,
@@ -102,13 +97,13 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const [confirmDeleteCode, setConfirmDeleteCode] = useState<string | null>(null);
   const [deletingCode, setDeletingCode] = useState<string | null>(null);
+  const [resettingPinCode, setResettingPinCode] = useState<string | null>(null);
   const [confirmDeleteStationId, setConfirmDeleteStationId] = useState<string | null>(null);
   const [deletingStationId, setDeletingStationId] = useState<string | null>(null);
   const [togglingAiStationId, setTogglingAiStationId] = useState<string | null>(null);
   const [brochureOpen, setBrochureOpen] = useState(false);
 
-  // Firebase Auth & Cloud Firestore Vault State
-  const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
+  // Cloud Firestore Vault State
   const [cloudBusy, setCloudBusy] = useState(false);
   const [cloudStatus, setCloudStatus] = useState<string | null>(null);
   const [cloudLastSyncAt, setCloudLastSyncAt] = useState<string | null>(null);
@@ -184,15 +179,8 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     };
   }, [adminToken]);
 
-  useEffect(() => {
-    const unsub = subscribeToAuth((u) => {
-      setFirebaseUser(u);
-    });
-    return () => unsub();
-  }, []);
-
   const syncBackupToFirestoreSilently = useCallback(async () => {
-    if (!adminToken || !firebaseUser) return;
+    if (!adminToken) return;
     if (isCloudAdminToken(adminToken)) {
       setCloudLastSyncAt(new Date().toISOString());
       setCloudStatus(
@@ -206,12 +194,12 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
       if (res.skippedEmptyOverwrite) return;
       setCloudLastSyncAt(res.updatedAtIso);
       setCloudStatus(
-        `المزامنة السحابية التلقائية فعّالة في مشروع electricity-station-f5a90 (${res.stationCount} محطة · ${res.codeCount} كود · ${res.subscriberCount} مشترك).`,
+        `المزامنة السحابية التلقائية فعّالة في مشروع ${FIREBASE_PROJECT_ID} (${res.stationCount} محطة · ${res.codeCount} كود · ${res.subscriberCount} مشترك).`,
       );
     } catch {
       // ignore silent background errors; manual button surfaces details
     }
-  }, [adminToken, firebaseUser]);
+  }, [adminToken]);
 
   const loadAdminData = useCallback(async () => {
     if (!adminToken) return;
@@ -302,7 +290,6 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     if (
       !adminToken ||
       isCloudAdminToken(adminToken) ||
-      !firebaseUser ||
       loading ||
       autoRestoredRef.current ||
       stations.length > 0 ||
@@ -330,7 +317,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
         // non-blocking auto-restore check
       }
     })();
-  }, [adminToken, firebaseUser, loading, stations.length, codes.length, loadAdminData]);
+  }, [adminToken, loading, stations.length, codes.length, loadAdminData]);
 
   const handlePasscodeSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -341,6 +328,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
       const res = configured
         ? await loginAdminPasscode(passcodeInput.trim())
         : await claimAdminPasscode(passcodeInput.trim());
+      await saveDeveloperSession({ token: res.token, name: res.name });
       setPasscodeInput('');
       onAdminAuthenticated(res.token);
     } catch (err) {
@@ -463,10 +451,35 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     if (!adminToken) return;
     try {
       await toggleAccessCodeAdmin(adminToken, rec.code, { active: !rec.active });
+      setFeedback(
+        rec.active
+          ? `تم إلغاء تفعيل الكود ${rec.code} (${rec.name}).`
+          : `تم إعادة تفعيل الكود ${rec.code} (${rec.name}).`,
+      );
       await loadAdminData();
       void syncBackupToFirestoreSilently();
     } catch (err) {
       setFeedback(err instanceof Error ? err.message : 'تعذر تحديث حالة الكود.');
+    }
+  };
+
+  const handleResetCodePin = async (rec: AccessCodeRecord) => {
+    if (!adminToken) return;
+    setResettingPinCode(rec.code);
+    setFeedback(null);
+    try {
+      await resetCodePinAdmin(adminToken, rec.code);
+      setFeedback(
+        `تمت إعادة تعيين رمز PIN للكود ${rec.code} (${rec.name}). سيُطلب منه إنشاء PIN جديد من 4 أرقام عند فتح التطبيق.`,
+      );
+      await loadAdminData();
+      void syncBackupToFirestoreSilently();
+    } catch (err) {
+      setFeedback(
+        err instanceof Error ? err.message : 'تعذر إعادة تعيين رمز PIN.',
+      );
+    } finally {
+      setResettingPinCode(null);
     }
   };
 
@@ -681,45 +694,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     }
   };
 
-  const handleConnectGoogleAdmin = async () => {
-    setCloudBusy(true);
-    setCloudStatus(null);
-    try {
-      await signInWithGooglePopup();
-      if (adminToken) {
-        const backup = await fetchAdminBackup(adminToken);
-        const serverHasData =
-          Object.keys(backup.stations ?? {}).length > 0 ||
-          Object.keys(backup.codes ?? {}).length > 0;
-        if (!serverHasData) {
-          const snap = await loadAdminStoreFromFirestore();
-          if (snap && (snap.stationCount > 0 || snap.codeCount > 0)) {
-            const restored = await restoreAdminBackup(adminToken, snap.backup, 'merge');
-            setCloudLastSyncAt(snap.updatedAtIso);
-            setCloudStatus(
-              `تم الربط والاستعادة التلقائية من ${FIREBASE_PROJECT_ID} (${restored.stationCount} محطة · ${restored.codeCount} كود · ${restored.subscriberCount} مشترك).`,
-            );
-            await loadAdminData();
-            return;
-          }
-        } else {
-          const saved = await saveAdminStoreToFirestore(backup);
-          if (!saved.skippedEmptyOverwrite) {
-            setCloudLastSyncAt(saved.updatedAtIso);
-            setCloudStatus(
-              `تم ربط الحساب ومزامنة البيانات تلقائياً في ${FIREBASE_PROJECT_ID} (${saved.stationCount} محطة · ${saved.codeCount} كود · ${saved.subscriberCount} مشترك).`,
-            );
-            return;
-          }
-        }
-      }
-      setCloudStatus(`تم ربط حساب Google بمشروع ${FIREBASE_PROJECT_ID} بنجاح — المزامنة التلقائية نشطة.`);
-    } catch (err) {
-      setCloudStatus(formatAuthError(err));
-    } finally {
-      setCloudBusy(false);
-    }
-  };
+
 
   const handleCloudBackupNow = async () => {
     if (!adminToken) return;
@@ -837,26 +812,6 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     }
   };
 
-  const handleGoogleAdminPanelUnlock = async () => {
-    setAuthSubmitting(true);
-    setAuthError(null);
-    try {
-      const user = await signInWithGooglePopup();
-      if (!isAuthorizedAdminUser(user)) {
-        await signOutUser();
-        setAuthError(
-          `الحساب (${user.email || 'غير معروف'}) غير مصرح له بدخول الأدمن المطور.`,
-        );
-        return;
-      }
-      onAdminAuthenticated(CLOUD_ADMIN_TOKEN);
-    } catch (err) {
-      setAuthError(formatAuthError(err));
-    } finally {
-      setAuthSubmitting(false);
-    }
-  };
-
   if (!adminToken) {
     return (
       <div className="max-w-md mx-auto py-10">
@@ -865,22 +820,18 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
             <h1 className="text-xl font-bold text-slate-900 flex items-center gap-2">
               <Lock className="w-5 h-5 text-teal-700" />
               {checkingStatus
-                ? 'جاري التحقق من لوحة الأدمن...'
-                : configured
-                  ? 'دخول الأدمن المطور'
-                  : 'تعيين كلمة مرور الأدمن المطور لأول مرة'}
+                ? 'جاري التحقق من لوحة المطور...'
+                : 'دخول المطور'}
             </h1>
             <p className="text-xs text-slate-600 leading-relaxed">
-              {configured
-                ? 'أدخل كلمة مرور الأدمن المطور أو سجّل الدخول بحساب Google المعتمد لإدارة المحطات والمشتركين والأكواد.'
-                : 'لم يتم حفظ كلمة مرور للأدمن بعد على الخادم. أدخل كلمة المرور المعتمدة الآن لتثبيتها بشكل دائم ومشفّر.'}
+              أدخل كلمة مرور المطور لإدارة المحطات والمشتركين والأكواد.
             </p>
           </div>
 
           <form onSubmit={handlePasscodeSubmit} className="space-y-4">
             <div>
               <label className="block text-xs font-medium text-slate-700 mb-1">
-                كلمة مرور الأدمن
+                كلمة مرور المطور
               </label>
               <input
                 type="password"
@@ -903,21 +854,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
               disabled={authSubmitting || checkingStatus}
               className="w-full min-h-[46px] py-2.5 px-4 bg-teal-700 hover:bg-teal-800 text-white text-sm font-bold rounded-lg transition-colors cursor-pointer"
             >
-              {authSubmitting
-                ? 'جاري التحقق...'
-                : configured
-                  ? 'دخول لوحة الأدمن المطور'
-                  : 'تثبيت كلمة المرور والدخول'}
-            </button>
-
-            <button
-              type="button"
-              disabled={authSubmitting || checkingStatus}
-              onClick={() => void handleGoogleAdminPanelUnlock()}
-              className="w-full min-h-[46px] py-2.5 px-4 bg-slate-900 hover:bg-slate-800 text-white text-sm font-bold rounded-lg inline-flex items-center justify-center gap-2 transition-colors cursor-pointer"
-            >
-              <ShieldCheck className="w-4 h-4 text-teal-400" />
-              دخول الأدمن المطور (Google)
+              {authSubmitting ? 'جاري التحقق...' : 'دخول لوحة المطور'}
             </button>
           </form>
         </div>
@@ -1020,50 +957,28 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            {firebaseUser ? (
-              <>
-                <span className="text-xs font-bold text-teal-900 bg-teal-50 border border-teal-200 px-3 py-1.5 rounded-lg inline-flex items-center gap-1.5">
-                  <Cloud className="w-4 h-4 text-teal-700" />
-                  <span dir="ltr">{firebaseUser.email}</span>
-                  <span className="text-[11px] font-medium text-emerald-700">· مزامنة تلقائية نشطة</span>
-                </span>
-                <button
-                  type="button"
-                  disabled={cloudBusy}
-                  onClick={() => void handleCloudBackupNow()}
-                  className="min-h-[40px] px-3.5 py-2 text-xs font-bold bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 text-white rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
-                >
-                  <CloudUpload className="w-4 h-4" />
-                  مزامنة فورية
-                </button>
-                <button
-                  type="button"
-                  disabled={cloudBusy}
-                  onClick={() => void handleCloudRestoreNow()}
-                  className="min-h-[40px] px-3.5 py-2 text-xs font-bold bg-white border border-teal-300 text-teal-900 hover:bg-teal-50 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
-                >
-                  <CloudDownload className="w-4 h-4" />
-                  جلب من السحابة
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void signOutUser()}
-                  className="min-h-[40px] px-3 py-2 text-xs font-medium bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg cursor-pointer"
-                >
-                  فصل حساب Google
-                </button>
-              </>
-            ) : (
-              <button
-                type="button"
-                disabled={cloudBusy}
-                onClick={() => void handleConnectGoogleAdmin()}
-                className="min-h-[42px] px-4 py-2 text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white rounded-lg inline-flex items-center gap-2 cursor-pointer"
-              >
-                <Cloud className="w-4 h-4 text-teal-400" />
-                تفعيل المزامنة السحابية التلقائية (Google)
-              </button>
-            )}
+            <span className="text-xs font-bold text-teal-900 bg-teal-50 border border-teal-200 px-3 py-1.5 rounded-lg inline-flex items-center gap-1.5">
+              <Cloud className="w-4 h-4 text-teal-700" />
+              <span className="text-[11px] font-bold text-emerald-700">مزامنة Firestore نشطة</span>
+            </span>
+            <button
+              type="button"
+              disabled={cloudBusy}
+              onClick={() => void handleCloudBackupNow()}
+              className="min-h-[40px] px-3.5 py-2 text-xs font-bold bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 text-white rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+            >
+              <CloudUpload className="w-4 h-4" />
+              مزامنة فورية
+            </button>
+            <button
+              type="button"
+              disabled={cloudBusy}
+              onClick={() => void handleCloudRestoreNow()}
+              className="min-h-[40px] px-3.5 py-2 text-xs font-bold bg-white border border-teal-300 text-teal-900 hover:bg-teal-50 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+            >
+              <CloudDownload className="w-4 h-4" />
+              جلب من السحابة
+            </button>
 
             <button
               type="button"
@@ -1100,32 +1015,6 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                 آخر مزامنة تلقائية: {new Date(cloudLastSyncAt).toLocaleString('ar-YE')}
               </span>
             )}
-          </div>
-        )}
-
-        {firebaseUser && !firebaseUser.emailVerified && (
-          <div className="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2">
-            <span>
-              حساب البريد الإلكتروني غير مؤكَّد بعد في Firebase. إذا ظهر تنبيه صلاحيات في Firestore اضغط تأكيد البريد.
-            </span>
-            <button
-              type="button"
-              disabled={cloudBusy}
-              onClick={async () => {
-                setCloudBusy(true);
-                try {
-                  await sendDeveloperVerificationEmail();
-                  setCloudStatus('تم إرسال رابط تأكيد البريد الإلكتروني إلى حساب المطور.');
-                } catch (err) {
-                  setCloudStatus(formatAuthError(err));
-                } finally {
-                  setCloudBusy(false);
-                }
-              }}
-              className="px-3 py-1.5 text-xs font-bold bg-amber-700 hover:bg-amber-800 text-white rounded-lg cursor-pointer"
-            >
-              إرسال رابط تأكيد البريد
-            </button>
           </div>
         )}
       </section>
@@ -1836,13 +1725,25 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                       <button
                         type="button"
                         onClick={() => void handleToggleCode(rec)}
-                        className={`px-3 py-1.5 text-xs font-medium rounded-lg border cursor-pointer ${
+                        className={`px-3 py-1.5 text-xs font-bold rounded-lg border cursor-pointer ${
                           rec.active
-                            ? 'border-amber-200 bg-amber-50 text-amber-900'
-                            : 'border-teal-200 bg-teal-50 text-teal-800'
+                            ? 'border-amber-200 bg-amber-50 hover:bg-amber-100 text-amber-900'
+                            : 'border-teal-200 bg-teal-50 hover:bg-teal-100 text-teal-800'
                         }`}
                       >
-                        {rec.active ? 'إيقاف' : 'تفعيل'}
+                        {rec.active ? 'إلغاء تفعيل كود' : 'تفعيل الكود'}
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={resettingPinCode === rec.code}
+                        onClick={() => void handleResetCodePin(rec)}
+                        className="px-3 py-1.5 text-xs font-bold rounded-lg border border-sky-200 bg-sky-50 hover:bg-sky-100 text-sky-900 inline-flex items-center gap-1 cursor-pointer"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" />
+                        {resettingPinCode === rec.code
+                          ? 'جاري...'
+                          : 'إعادة تعيين PIN'}
                       </button>
 
                       {confirmDeleteCode === rec.code ? (

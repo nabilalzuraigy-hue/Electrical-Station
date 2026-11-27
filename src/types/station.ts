@@ -27,6 +27,8 @@ export interface AccessCodeRecord {
   assignedZones: string[];
   permissions: CollectorPermissions;
   active: boolean;
+  createdBy?: string;
+  pinResetAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }

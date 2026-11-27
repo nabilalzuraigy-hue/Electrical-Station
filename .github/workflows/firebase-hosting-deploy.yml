@@ -119,3 +119,4 @@ jobs:
             fs.writeFileSync(process.argv[1], JSON.stringify(parsed), { mode: 0o600 });
           ' "$SA_FILE"
           GOOGLE_APPLICATION_CREDENTIALS="$SA_FILE" npx -y firebase-tools@15 deploy --only hosting --project electricity-station-f5a90 --non-interactive
+          GOOGLE_APPLICATION_CREDENTIALS="$SA_FILE" npx -y firebase-tools@15 deploy --only firestore:rules --project electricity-station-f5a90 --non-interactive || echo "Firestore rules deploy skipped"

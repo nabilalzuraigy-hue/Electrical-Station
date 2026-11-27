@@ -1,16 +1,20 @@
 import {
   Timestamp,
+  collection,
+  deleteDoc,
   doc,
   getDoc,
+  getDocFromServer,
+  getDocs,
   serverTimestamp,
   setDoc,
 } from 'firebase/firestore';
 import {
-  auth,
   computeStaffAccessHash,
   computeSubscriberPortalHash,
   db,
   handleFirestoreError,
+  normalizeCodeForHash,
   OperationType,
 } from './firebase';
 import type {
@@ -55,6 +59,7 @@ export interface StaffVaultPayload {
 
 const MAX_CHUNK_CHARS = 380000;
 const MAX_STAFF_VAULT_JSON_CHARS = 760000;
+const DEVELOPER_ACTOR_LABEL = 'developer_admin';
 
 function sanitizeVaultDocId(raw: string): string {
   return raw.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
@@ -137,7 +142,6 @@ function buildCompactStaffBucketJson(bucket: RawStationBucket): string {
   const full = JSON.stringify(bucket);
   if (full.length <= MAX_STAFF_VAULT_JSON_CHARS) return full;
 
-  // Trim oldest readings/receipts/alerts first while keeping all subscribers intact
   const sortedReadings = Object.entries(bucket.readings ?? {}).sort(([, a], [, b]) =>
     String(b.recordedAt ?? '').localeCompare(String(a.recordedAt ?? '')),
   );
@@ -158,16 +162,160 @@ function buildCompactStaffBucketJson(bucket: RawStationBucket): string {
   return json.slice(0, MAX_STAFF_VAULT_JSON_CHARS);
 }
 
+// ============================================================
+// Top-level Firestore `codes` Collection Operations
+// Fields: code, role ('manager'|'collector'), stationId, active, createdBy, ...
+// ============================================================
+
+function mapDocToAccessCodeRecord(
+  docId: string,
+  raw: Record<string, unknown>,
+): AccessCodeRecord | null {
+  const code = normalizeCodeForHash(String(raw.code ?? docId));
+  const role = raw.role === 'collector' ? 'collector' : raw.role === 'manager' ? 'manager' : null;
+  const stationId = String(raw.stationId ?? '').trim();
+  if (!code || !role || !stationId) return null;
+
+  const rawPerms = (raw.permissions ?? {}) as Record<string, unknown>;
+  const now = new Date().toISOString();
+
+  return {
+    code,
+    role,
+    stationId,
+    active: raw.active !== false,
+    createdBy: String(raw.createdBy ?? DEVELOPER_ACTOR_LABEL),
+    name: String(raw.name ?? (role === 'manager' ? 'مدير المحطة' : 'المحصّل')),
+    phone: String(raw.phone ?? ''),
+    stationName: String(raw.stationName ?? stationId),
+    assignedZones: Array.isArray(raw.assignedZones)
+      ? raw.assignedZones.map((z) => String(z)).filter(Boolean)
+      : [],
+    permissions:
+      role === 'manager'
+        ? {
+            canRecordReadings: true,
+            canCollectCash: true,
+            canSendInvoices: true,
+            canViewDebts: true,
+          }
+        : {
+            canRecordReadings: rawPerms.canRecordReadings !== false,
+            canCollectCash: rawPerms.canCollectCash !== false,
+            canSendInvoices: rawPerms.canSendInvoices !== false,
+            canViewDebts: rawPerms.canViewDebts !== false,
+          },
+    pinResetAt:
+      typeof raw.pinResetAt === 'string' && raw.pinResetAt
+        ? raw.pinResetAt
+        : null,
+    createdAt: typeof raw.createdAt === 'string' && raw.createdAt ? raw.createdAt : now,
+    updatedAt: typeof raw.updatedAt === 'string' && raw.updatedAt ? raw.updatedAt : now,
+  };
+}
+
+export async function saveAccessCodeToFirestore(
+  codeRec: AccessCodeRecord,
+): Promise<void> {
+  const code = normalizeCodeForHash(codeRec.code);
+  if (!code) return;
+  const payload = {
+    code,
+    role: codeRec.role,
+    stationId: codeRec.stationId,
+    active: Boolean(codeRec.active),
+    createdBy: codeRec.createdBy || DEVELOPER_ACTOR_LABEL,
+    name: (codeRec.name || '').slice(0, 120),
+    phone: (codeRec.phone || '').slice(0, 30),
+    stationName: (codeRec.stationName || '').slice(0, 120),
+    assignedZones: (codeRec.assignedZones ?? []).slice(0, 30),
+    permissions:
+      codeRec.role === 'manager'
+        ? {
+            canRecordReadings: true,
+            canCollectCash: true,
+            canSendInvoices: true,
+            canViewDebts: true,
+          }
+        : {
+            canRecordReadings: codeRec.permissions?.canRecordReadings !== false,
+            canCollectCash: codeRec.permissions?.canCollectCash !== false,
+            canSendInvoices: codeRec.permissions?.canSendInvoices !== false,
+            canViewDebts: codeRec.permissions?.canViewDebts !== false,
+          },
+    pinResetAt: codeRec.pinResetAt ?? null,
+    createdAt: codeRec.createdAt || new Date().toISOString(),
+    updatedAt: codeRec.updatedAt || new Date().toISOString(),
+  };
+
+  await setDoc(doc(db, 'codes', code), payload);
+}
+
+export async function loadAccessCodeFromFirestore(
+  codeInput: string,
+  preferServer = true,
+): Promise<AccessCodeRecord | null> {
+  const code = normalizeCodeForHash(codeInput);
+  if (code.length < 4) return null;
+  try {
+    const ref = doc(db, 'codes', code);
+    const snap = preferServer
+      ? await getDocFromServer(ref).catch(() => getDoc(ref))
+      : await getDoc(ref);
+    if (!snap.exists()) return null;
+    return mapDocToAccessCodeRecord(
+      snap.id,
+      snap.data() as Record<string, unknown>,
+    );
+  } catch {
+    return null;
+  }
+}
+
+export async function listAccessCodesFromFirestore(): Promise<AccessCodeRecord[]> {
+  try {
+    const snap = await getDocs(collection(db, 'codes'));
+    const list: AccessCodeRecord[] = [];
+    snap.forEach((d) => {
+      const mapped = mapDocToAccessCodeRecord(
+        d.id,
+        d.data() as Record<string, unknown>,
+      );
+      if (mapped) list.push(mapped);
+    });
+    return list;
+  } catch {
+    return [];
+  }
+}
+
+export async function deleteAccessCodeFromFirestore(
+  codeInput: string,
+): Promise<void> {
+  const code = normalizeCodeForHash(codeInput);
+  if (!code) return;
+  try {
+    await deleteDoc(doc(db, 'codes', code));
+  } catch {
+    // Non-blocking if already removed or offline
+  }
+}
+
 async function syncStaffAndPortalCachesToFirestore(
   backup: AdminStoreBackupPayload,
-  userEmail: string,
 ): Promise<void> {
   const stations = backup.stations ?? {};
   const codes = Object.values(backup.codes ?? {});
   const stationData = backup.stationData ?? {};
 
-  // 1. Sync per-code staffVault/{accessHash} docs so Managers & Collectors restore on any device
+  // 1. Sync per-code `codes/{code}` and `staffVault/{accessHash}` docs
   for (const codeRec of codes) {
+    try {
+      await saveAccessCodeToFirestore(codeRec);
+    } catch {
+      // Non-blocking
+    }
+
     const station = stations[codeRec.stationId];
     if (!station) continue;
     try {
@@ -187,11 +335,11 @@ async function syncStaffAndPortalCachesToFirestore(
         stationJson: JSON.stringify(station),
         collectorsJson: JSON.stringify(stationCollectors),
         stationDataJson: buildCompactStaffBucketJson(bucket),
-        updatedByEmail: userEmail,
+        updatedByEmail: DEVELOPER_ACTOR_LABEL,
         updatedAt: serverTimestamp(),
       });
     } catch {
-      // Non-blocking: adminVault already succeeded; staffVault awaits rules publish if needed
+      // Non-blocking
     }
   }
 
@@ -265,11 +413,6 @@ export async function saveAdminStoreToFirestore(
   updatedAtIso: string;
   skippedEmptyOverwrite?: boolean;
 }> {
-  const user = auth.currentUser;
-  if (!user || !user.email) {
-    throw new Error('يجب تسجيل الدخول بحساب الأدمن المطور في Google أولاً.');
-  }
-
   const stationIds = Object.keys(backup.stations ?? {});
   const stationCount = stationIds.length;
   const codeCount = Object.keys(backup.codes ?? {}).length;
@@ -330,7 +473,7 @@ export async function saveAdminStoreToFirestore(
           partIndex: i,
           totalParts: parts.length,
           payloadChunk: parts[i],
-          updatedByEmail: user.email,
+          updatedByEmail: DEVELOPER_ACTOR_LABEL,
           updatedAt: serverTimestamp(),
         });
       } catch (err) {
@@ -351,7 +494,7 @@ export async function saveAdminStoreToFirestore(
     stationCount,
     codeCount,
     subscriberCount,
-    updatedByEmail: user.email,
+    updatedByEmail: DEVELOPER_ACTOR_LABEL,
     clientUpdatedAt: nowIso,
     updatedAt: serverTimestamp(),
   };
@@ -362,8 +505,8 @@ export async function saveAdminStoreToFirestore(
     handleFirestoreError(err, OperationType.WRITE, 'adminVault/meta');
   }
 
-  // Also sync per-code staffVault & subscriberPortals in background (non-blocking)
-  void syncStaffAndPortalCachesToFirestore(backup, user.email);
+  // Sync top-level `codes` collection, `staffVault`, and `subscriberPortals`
+  await syncStaffAndPortalCachesToFirestore(backup);
 
   return {
     stationCount,
@@ -374,9 +517,6 @@ export async function saveAdminStoreToFirestore(
 }
 
 export async function loadAdminStoreFromFirestore(): Promise<FirestoreVaultSnapshot | null> {
-  const user = auth.currentUser;
-  if (!user) return null;
-
   let metaSnap;
   try {
     metaSnap = await getDoc(doc(db, 'adminVault', 'meta'));
@@ -384,8 +524,27 @@ export async function loadAdminStoreFromFirestore(): Promise<FirestoreVaultSnaps
     handleFirestoreError(err, OperationType.GET, 'adminVault/meta');
   }
 
+  const cloudCodes = await listAccessCodesFromFirestore();
+
   if (!metaSnap.exists()) {
-    return null;
+    if (cloudCodes.length === 0) return null;
+    const codesMap: Record<string, AccessCodeRecord> = {};
+    cloudCodes.forEach((c) => {
+      codesMap[c.code] = c;
+    });
+    return {
+      backup: {
+        stations: {},
+        codes: codesMap,
+        stationData: {},
+        exportedAt: new Date().toISOString(),
+      },
+      stationCount: 0,
+      codeCount: cloudCodes.length,
+      subscriberCount: 0,
+      updatedByEmail: DEVELOPER_ACTOR_LABEL,
+      updatedAtIso: new Date().toISOString(),
+    };
   }
 
   const meta = metaSnap.data() as {
@@ -409,6 +568,14 @@ export async function loadAdminStoreFromFirestore(): Promise<FirestoreVaultSnaps
     string,
     AccessCodeRecord
   >;
+
+  // Merge newer fields (e.g., active / pinResetAt) from top-level `codes` collection
+  for (const cc of cloudCodes) {
+    const existing = codes[cc.code];
+    if (!existing || String(cc.updatedAt) >= String(existing.updatedAt)) {
+      codes[cc.code] = cc;
+    }
+  }
 
   const partsByStation = new Map<
     string,
@@ -461,11 +628,11 @@ export async function loadAdminStoreFromFirestore(): Promise<FirestoreVaultSnaps
       stationData,
       exportedAt: updatedAtIso,
     },
-    stationCount: meta.stationCount ?? Object.keys(stations).length,
-    codeCount: meta.codeCount ?? Object.keys(codes).length,
+    stationCount: Object.keys(stations).length,
+    codeCount: Object.keys(codes).length,
     subscriberCount:
       meta.subscriberCount ?? countSubscribersInStationData(stationData),
-    updatedByEmail: meta.updatedByEmail || user.email || '',
+    updatedByEmail: meta.updatedByEmail || DEVELOPER_ACTOR_LABEL,
     updatedAtIso,
   };
 }
@@ -474,11 +641,42 @@ export async function loadStaffVaultFromFirestore(
   code: string,
 ): Promise<StaffVaultPayload | null> {
   try {
-    const accessHash = await computeStaffAccessHash(code);
-    const snap = await getDoc(doc(db, 'staffVault', accessHash));
-    if (!snap.exists()) return null;
+    const normalized = normalizeCodeForHash(code);
+    const accessHash = await computeStaffAccessHash(normalized);
+    const [vaultSnap, codeDoc] = await Promise.all([
+      getDoc(doc(db, 'staffVault', accessHash)),
+      loadAccessCodeFromFirestore(normalized, true),
+    ]);
 
-    const data = snap.data() as {
+    if (!vaultSnap.exists()) {
+      // Fallback: if code exists in `codes` collection without staffVault yet
+      if (!codeDoc) return null;
+      return {
+        access: codeDoc,
+        station: {
+          stationId: codeDoc.stationId,
+          stationName: codeDoc.stationName || 'المحطة',
+          kwhPriceYer: 450,
+          minimumFeeYer: 1000,
+          mainGeneratorKwh: 0,
+          licenseCode: codeDoc.code,
+          licenseStatus: 'active',
+          maxCollectors: 25,
+          maxSubscribers: 10000,
+          ownerUid: 'developer_admin',
+          updatedAt: codeDoc.updatedAt,
+        },
+        collectors: codeDoc.role === 'collector' ? [codeDoc] : [],
+        subscribers: [],
+        readings: [],
+        receipts: [],
+        alerts: [],
+        expenses: [],
+        collectorLocations: [],
+      };
+    }
+
+    const data = vaultSnap.data() as {
       accessJson?: string;
       stationJson?: string;
       collectorsJson?: string;
@@ -487,7 +685,16 @@ export async function loadStaffVaultFromFirestore(
 
     if (!data.accessJson || !data.stationJson) return null;
 
-    const access = JSON.parse(data.accessJson) as AccessCodeRecord;
+    const vaultAccess = JSON.parse(data.accessJson) as AccessCodeRecord;
+    const access: AccessCodeRecord = codeDoc
+      ? {
+          ...vaultAccess,
+          active: codeDoc.active,
+          pinResetAt: codeDoc.pinResetAt ?? vaultAccess.pinResetAt ?? null,
+          updatedAt: codeDoc.updatedAt || vaultAccess.updatedAt,
+        }
+      : vaultAccess;
+
     const station = JSON.parse(data.stationJson) as StationConfig;
     const collectors = JSON.parse(
       data.collectorsJson || '[]',
@@ -630,8 +837,6 @@ export async function saveCollectorReadingTextToFirestore(params: {
   stationId: string;
   reading: MeterReading;
 }): Promise<boolean> {
-  const user = auth.currentUser;
-  if (!user) return false;
   if (typeof navigator !== 'undefined' && navigator.onLine === false) {
     return false;
   }
@@ -642,8 +847,11 @@ export async function saveCollectorReadingTextToFirestore(params: {
     const recordedAtTs = Timestamp.fromDate(
       Number.isNaN(recordedDate.getTime()) ? new Date() : recordedDate,
     );
+    const collectorUid = sanitizeVaultDocId(
+      reading.collectorUid || 'collector',
+    );
     await setDoc(doc(db, 'stations', stationId, 'readings', reading.id), {
-      subscriberId: reading.subscriberId,
+      subscriberId: sanitizeVaultDocId(reading.subscriberId),
       meterNumber: reading.meterNumber,
       subscriberName: reading.subscriberName,
       previousReading: reading.previousReading,
@@ -656,7 +864,7 @@ export async function saveCollectorReadingTextToFirestore(params: {
       photoUrl: '',
       photoSizeKb: 0,
       hasLocalPhoto: Boolean(reading.hasLocalPhoto || reading.photoUrl),
-      collectorUid: user.uid,
+      collectorUid,
       collectorName: reading.collectorName,
       recordedAt: recordedAtTs,
       createdAt: serverTimestamp(),
@@ -666,4 +874,3 @@ export async function saveCollectorReadingTextToFirestore(params: {
     return false;
   }
 }
-

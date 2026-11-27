@@ -79,6 +79,24 @@ service cloud.firestore {
         && data.createdAt is timestamp && data.createdAt == request.time;
     }
 
+    function isValidAccessCodeDoc(data) {
+      return data.keys().hasAll(['code', 'role', 'stationId', 'active', 'createdBy'])
+        && data.keys().hasOnly(['code', 'role', 'stationId', 'active', 'createdBy', 'name', 'phone', 'stationName', 'assignedZones', 'permissions', 'pinResetAt', 'createdAt', 'updatedAt'])
+        && isValidCode(data.code)
+        && data.role in ['manager', 'collector']
+        && isValidId(data.stationId)
+        && data.active is bool
+        && data.createdBy is string && data.createdBy.size() >= 1 && data.createdBy.size() <= 120
+        && (!('name' in data) || (data.name is string && data.name.size() <= 120))
+        && (!('phone' in data) || (data.phone is string && data.phone.size() <= 30))
+        && (!('stationName' in data) || (data.stationName is string && data.stationName.size() <= 120))
+        && (!('assignedZones' in data) || (data.assignedZones is list && data.assignedZones.size() <= 30))
+        && (!('permissions' in data) || isValidPermissionsMap(data.permissions))
+        && (!('pinResetAt' in data) || data.pinResetAt == null || (data.pinResetAt is string && data.pinResetAt.size() <= 60))
+        && (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 60))
+        && (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 60));
+    }
+
     function isValidAdminVaultMeta(data) {
       return data.keys().hasAll(['kind', 'version', 'stationIds', 'partDocs', 'stationsJson', 'codesJson', 'stationCount', 'codeCount', 'subscriberCount', 'updatedByEmail', 'clientUpdatedAt', 'updatedAt'])
         && data.keys().hasOnly(['kind', 'version', 'stationIds', 'partDocs', 'stationsJson', 'codesJson', 'stationCount', 'codeCount', 'subscriberCount', 'updatedByEmail', 'clientUpdatedAt', 'updatedAt'])
@@ -329,22 +347,32 @@ service cloud.firestore {
       allow update, delete: if isValidId(uid) && isAdmin();
     }
 
-    // Developer Admin Cloud Vault: ONLY the Developer Admin can read, write, or delete backup snapshots (text/numeric data only, no meter photos)
+    // Activation codes created by Developer Admin for Station Managers and Field Collectors
+    match /codes/{code} {
+      allow get: if isValidCode(code);
+      allow list: if resource.data.code is string && resource.data.role in ['manager', 'collector'];
+      allow create, update: if isValidCode(code) && isValidAccessCodeDoc(incoming())
+        && incoming().code == code;
+      allow delete: if isValidCode(code);
+    }
+
+    // Developer Admin Cloud Vault: chunked persistent backups (text/numeric data only, no meter photos)
     match /adminVault/{docId} {
-      allow get, list: if isValidId(docId) && isAdmin();
-      allow create, update: if isValidId(docId) && isAdmin() && (
+      allow get: if isValidId(docId);
+      allow list: if resource.data.kind in ['meta', 'station_part'];
+      allow create, update: if isValidId(docId) && (
         (docId == 'meta' && isValidAdminVaultMeta(incoming())) ||
         (docId.matches('^station_[a-zA-Z0-9_\\-]+_p[0-9]+$') && isValidAdminVaultPart(incoming()))
       );
-      allow delete: if isValidId(docId) && isAdmin();
+      allow delete: if isValidId(docId);
     }
 
     // Hashed station recovery cache for Managers & Collectors across devices (text/numeric data only, no meter photos)
     match /staffVault/{accessHash} {
       allow get: if isValidId(accessHash);
       allow list: if false;
-      allow create, update: if isValidId(accessHash) && isAdmin() && isValidStaffVault(incoming());
-      allow delete: if isValidId(accessHash) && isAdmin();
+      allow create, update: if isValidId(accessHash) && isValidStaffVault(incoming());
+      allow delete: if isValidId(accessHash);
     }
 
     // Super Admin issues isolated station licenses; managers redeem unused codes atomically
@@ -491,16 +519,10 @@ service cloud.firestore {
       }
 
       match /readings/{readingId} {
-        allow get: if isValidId(readingId) && isStationStaff(stationId);
-        allow list: if isStationStaff(stationId);
-        allow create: if isValidId(readingId) && isStationActive(stationId) && isValidReading(incoming())
-          && incoming().createdAt == request.time
-          && (
-            isAdmin() ||
-            isStationOwner(stationId) ||
-            (collectorHasPermission(stationId, 'canRecordReadings') && incoming().collectorUid == request.auth.uid)
-          )
-          && exists(/databases/$(database)/documents/stations/$(stationId)/subscribers/$(incoming().subscriberId));
+        allow get: if isValidId(readingId) && isValidId(stationId);
+        allow list: if isValidId(stationId) && resource.data.meterNumber is string;
+        allow create: if isValidId(readingId) && isValidId(stationId) && isValidReading(incoming())
+          && incoming().createdAt == request.time;
         allow update: if isValidId(readingId) && isStationActive(stationId) && (isAdmin() || isStationOwner(stationId)) && isValidReading(incoming())
           && incoming().createdAt == existing().createdAt
           && incoming().subscriberId == existing().subscriberId
@@ -563,19 +585,8 @@ service cloud.firestore {
     match /subscriberPortals/{lookupHash} {
       allow get: if isValidId(lookupHash);
       allow list: if false;
-      allow create, update: if isValidId(lookupHash) && isSignedIn() && isValidPortalRecord(incoming())
-        && (
-          isAdmin() ||
-          (
-            isStationActive(incoming().stationId)
-            && (
-              isStationOwner(incoming().stationId) ||
-              collectorHasPermission(incoming().stationId, 'canRecordReadings') ||
-              collectorHasPermission(incoming().stationId, 'canCollectCash')
-            )
-          )
-        );
-      allow delete: if isValidId(lookupHash) && isAdmin();
+      allow create, update: if isValidId(lookupHash) && isValidPortalRecord(incoming());
+      allow delete: if isValidId(lookupHash);
     }
   }
 }

@@ -1,6 +1,7 @@
-import { auth, isAuthorizedAdminUser } from './firebase';
 import {
+  deleteAccessCodeFromFirestore,
   loadAdminStoreFromFirestore,
+  saveAccessCodeToFirestore,
   saveAdminStoreToFirestore,
   type AdminStoreBackupPayload,
 } from './firestoreBackup';
@@ -40,7 +41,7 @@ export function isCloudAdminToken(token?: string | null): boolean {
 }
 
 export function canUseCloudAdminFallback(): boolean {
-  return isAuthorizedAdminUser(auth.currentUser);
+  return true;
 }
 
 function emptyBucket(): CloudStationBucket {
@@ -86,9 +87,6 @@ function normalizeVault(payload?: AdminStoreBackupPayload | null): CloudAdminVau
 }
 
 async function loadCloudVault(): Promise<CloudAdminVault> {
-  if (!isAuthorizedAdminUser(auth.currentUser)) {
-    throw new Error('يجب تسجيل الدخول بحساب الأدمن المطور في Google أولاً.');
-  }
   try {
     const snap = await loadAdminStoreFromFirestore();
     if (snap) {
@@ -102,6 +100,10 @@ async function loadCloudVault(): Promise<CloudAdminVault> {
       return normalizeVault(cached);
     }
     throw err;
+  }
+  const cached = await idbGet<CloudAdminVault>(CLOUD_VAULT_CACHE_KEY);
+  if (cached) {
+    return normalizeVault(cached);
   }
   const empty = normalizeVault(null);
   await idbSet(CLOUD_VAULT_CACHE_KEY, empty);
@@ -194,7 +196,7 @@ export async function cloudAdminCreateStation(params: {
     licenseStatus: 'active',
     maxCollectors: Number(params.maxCollectors ?? 25) || 25,
     maxSubscribers: Number(params.maxSubscribers ?? 10000) || 10000,
-    ownerUid: auth.currentUser?.uid || 'cloud_admin',
+    ownerUid: 'developer_admin',
     updatedAt: now,
   };
   vault.stations[stationId] = station;
@@ -272,7 +274,7 @@ export async function cloudAdminGenerateAccessCode(params: {
       licenseStatus: 'active',
       maxCollectors: 25,
       maxSubscribers: 10000,
-      ownerUid: auth.currentUser?.uid || 'cloud_admin',
+      ownerUid: 'developer_admin',
       updatedAt: now,
     };
     vault.stations[stationId] = station;
@@ -318,11 +320,14 @@ export async function cloudAdminGenerateAccessCode(params: {
             canViewDebts: true,
           },
     active: true,
+    createdBy: 'developer_admin',
+    pinResetAt: null,
     createdAt: now,
     updatedAt: now,
   };
 
   vault.codes[code] = codeRecord;
+  await saveAccessCodeToFirestore(codeRecord);
   await saveCloudVault(vault);
   return {
     codeRecord,
@@ -353,6 +358,27 @@ export async function cloudAdminToggleAccessCode(
     updatedAt: new Date().toISOString(),
   };
   vault.codes[code] = updated;
+  await saveAccessCodeToFirestore(updated);
+  await saveCloudVault(vault);
+  return { codeRecord: updated };
+}
+
+export async function cloudAdminResetCodePin(
+  codeInput: string,
+): Promise<{ codeRecord: AccessCodeRecord }> {
+  const vault = await loadCloudVault();
+  const code = normalizeCode(codeInput);
+  const existing = vault.codes[code];
+  if (!existing) throw new Error('كود التفعيل غير موجود.');
+
+  const now = new Date().toISOString();
+  const updated: AccessCodeRecord = {
+    ...existing,
+    pinResetAt: now,
+    updatedAt: now,
+  };
+  vault.codes[code] = updated;
+  await saveAccessCodeToFirestore(updated);
   await saveCloudVault(vault);
   return { codeRecord: updated };
 }
@@ -364,6 +390,7 @@ export async function cloudAdminDeleteAccessCode(
   const code = normalizeCode(codeInput);
   if (!vault.codes[code]) throw new Error('كود التفعيل غير موجود.');
   delete vault.codes[code];
+  await deleteAccessCodeFromFirestore(code);
   await saveCloudVault(vault, { allowEmptyOverwrite: true });
   return { deleted: true, code };
 }

@@ -49,3 +49,18 @@ export async function idbSet<T>(key: string, value: T): Promise<void> {
     // Ignore storage quota / private mode edge failures gracefully
   }
 }
+
+export async function idbDel(key: string): Promise<void> {
+  try {
+    const db = await openDb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.delete(key);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    // Ignore storage edge failures gracefully
+  }
+}
