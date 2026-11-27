@@ -190,9 +190,10 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     try {
       const backup = await fetchAdminBackup(adminToken);
       const res = await saveAdminStoreToFirestore(backup);
+      if (res.skippedEmptyOverwrite) return;
       setCloudLastSyncAt(res.updatedAtIso);
       setCloudStatus(
-        `تم الحفظ التلقائي في سحابة Firebase Firestore (${res.stationCount} محطة · ${res.codeCount} كود · ${res.subscriberCount} مشترك).`,
+        `المزامنة السحابية التلقائية فعّالة في مشروع electricity-station-f5a90 (${res.stationCount} محطة · ${res.codeCount} كود · ${res.subscriberCount} مشترك).`,
       );
     } catch {
       // ignore silent background errors; manual button surfaces details
@@ -671,7 +672,34 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     setCloudStatus(null);
     try {
       await signInWithGooglePopup();
-      setCloudStatus('تم ربط حساب Google للأدمن المطور بنجاح.');
+      if (adminToken) {
+        const backup = await fetchAdminBackup(adminToken);
+        const serverHasData =
+          Object.keys(backup.stations ?? {}).length > 0 ||
+          Object.keys(backup.codes ?? {}).length > 0;
+        if (!serverHasData) {
+          const snap = await loadAdminStoreFromFirestore();
+          if (snap && (snap.stationCount > 0 || snap.codeCount > 0)) {
+            const restored = await restoreAdminBackup(adminToken, snap.backup, 'merge');
+            setCloudLastSyncAt(snap.updatedAtIso);
+            setCloudStatus(
+              `تم الربط والاستعادة التلقائية من ${FIREBASE_PROJECT_ID} (${restored.stationCount} محطة · ${restored.codeCount} كود · ${restored.subscriberCount} مشترك).`,
+            );
+            await loadAdminData();
+            return;
+          }
+        } else {
+          const saved = await saveAdminStoreToFirestore(backup);
+          if (!saved.skippedEmptyOverwrite) {
+            setCloudLastSyncAt(saved.updatedAtIso);
+            setCloudStatus(
+              `تم ربط الحساب ومزامنة البيانات تلقائياً في ${FIREBASE_PROJECT_ID} (${saved.stationCount} محطة · ${saved.codeCount} كود · ${saved.subscriberCount} مشترك).`,
+            );
+            return;
+          }
+        }
+      }
+      setCloudStatus(`تم ربط حساب Google بمشروع ${FIREBASE_PROJECT_ID} بنجاح — المزامنة التلقائية نشطة.`);
     } catch (err) {
       setCloudStatus(formatAuthError(err));
     } finally {
@@ -686,9 +714,27 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     try {
       const backup = await fetchAdminBackup(adminToken);
       const res = await saveAdminStoreToFirestore(backup);
+      if (res.skippedEmptyOverwrite) {
+        if (res.stationCount > 0 || res.codeCount > 0) {
+          const snap = await loadAdminStoreFromFirestore();
+          if (snap) {
+            const restored = await restoreAdminBackup(adminToken, snap.backup, 'merge');
+            setCloudLastSyncAt(snap.updatedAtIso);
+            setCloudStatus(
+              `تمت حماية بيانات السحابة واستعادتها تلقائياً (${restored.stationCount} محطة · ${restored.codeCount} كود · ${restored.subscriberCount} مشترك).`,
+            );
+            await loadAdminData();
+            if (manualSubStationId) await loadStationSubscribers(manualSubStationId);
+            if (inspectStationId) await loadStationDetails(inspectStationId);
+            return;
+          }
+        }
+        setCloudStatus('لا توجد محطات أو أكواد مسجلة حالياً للحفظ في السحابة.');
+        return;
+      }
       setCloudLastSyncAt(res.updatedAtIso);
       setCloudStatus(
-        `تم حفظ النسخة الاحتياطية في سحابة Firebase Firestore بنجاح (${res.stationCount} محطة، ${res.codeCount} كود، ${res.subscriberCount} مشترك).`,
+        `تمت المزامنة الفورية مع ${FIREBASE_PROJECT_ID} بنجاح (${res.stationCount} محطة، ${res.codeCount} كود، ${res.subscriberCount} مشترك).`,
       );
     } catch (err) {
       setCloudStatus(
@@ -912,20 +958,20 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
         </div>
       )}
 
-      {/* Permanent Cloud Firestore Vault & JSON Backup (Never lose codes or subscribers) */}
+      {/* Automatic Live Cloud Firestore Sync Vault (electricity-station-f5a90) */}
       <section className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-slate-200 pb-4">
           <div>
             <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
               <Database className="w-5 h-5 text-teal-700" />
-              خزنة حفظ واستعادة البيانات الدائمة (Firebase Firestore + نسخة احتياطية)
+              المزامنة السحابية التلقائية الدائمة (Firebase Firestore)
             </h2>
-            <p className="text-xs text-slate-600 mt-1">
+            <p className="text-xs text-slate-600 mt-1 leading-relaxed">
               مشروع Firebase المرتبط:{' '}
-              <span dir="ltr" className="font-mono-nums font-bold text-slate-800">
+              <span dir="ltr" className="font-mono-nums font-bold text-teal-800">
                 {FIREBASE_PROJECT_ID} / {FIREBASE_DATABASE_ID}
               </span>{' '}
-              — تحفظ الأكواد المفعلة والمشتركين ونصوص القراءات والأرقام والمتأخرات وسندات القبض في السحابة بشكل دائم لاستعادة التطبيق لحظياً عند فقدان الهاتف (دون رفع صور العدادات؛ الصور تبقى في ذاكرة هاتف المحصّل محلياً).
+              — جميع النصوص (المحطات، الأكواد المفعّلة، المشتركين، القراءات، المتأخرات، وسندات القبض) تتزامن تلقائياً وتُستعاد فوراً من أي جهاز بدون تذكير أو نسخ يدوي. صور العدادات تبقى محلياً في هاتف المحصّل مع إمكانية مشاركتها لمدير المحطة.
             </p>
           </div>
 
@@ -935,6 +981,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                 <span className="text-xs font-bold text-teal-900 bg-teal-50 border border-teal-200 px-3 py-1.5 rounded-lg inline-flex items-center gap-1.5">
                   <Cloud className="w-4 h-4 text-teal-700" />
                   <span dir="ltr">{firebaseUser.email}</span>
+                  <span className="text-[11px] font-medium text-emerald-700">· مزامنة تلقائية نشطة</span>
                 </span>
                 <button
                   type="button"
@@ -943,7 +990,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                   className="min-h-[40px] px-3.5 py-2 text-xs font-bold bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 text-white rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
                 >
                   <CloudUpload className="w-4 h-4" />
-                  حفظ في Firebase الآن
+                  مزامنة فورية
                 </button>
                 <button
                   type="button"
@@ -952,7 +999,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                   className="min-h-[40px] px-3.5 py-2 text-xs font-bold bg-white border border-teal-300 text-teal-900 hover:bg-teal-50 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
                 >
                   <CloudDownload className="w-4 h-4" />
-                  استعادة من Firebase
+                  جلب من السحابة
                 </button>
                 <button
                   type="button"
@@ -970,17 +1017,17 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                 className="min-h-[42px] px-4 py-2 text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white rounded-lg inline-flex items-center gap-2 cursor-pointer"
               >
                 <Cloud className="w-4 h-4 text-teal-400" />
-                ربط حساب Google لحفظ واستعادة بيانات السحابة تلقائياً
+                تفعيل المزامنة السحابية التلقائية (Google)
               </button>
             )}
 
             <button
               type="button"
               onClick={() => void handleDownloadJsonBackup()}
-              className="min-h-[40px] px-3.5 py-2 text-xs font-bold bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+              className="min-h-[40px] px-3.5 py-2 text-xs font-medium bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
             >
               <Download className="w-4 h-4 text-teal-700" />
-              تصدير نسخة JSON
+              تصدير JSON
             </button>
             <input
               ref={jsonBackupInputRef}
@@ -993,20 +1040,20 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
               type="button"
               disabled={cloudBusy}
               onClick={() => jsonBackupInputRef.current?.click()}
-              className="min-h-[40px] px-3.5 py-2 text-xs font-bold bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+              className="min-h-[40px] px-3.5 py-2 text-xs font-medium bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
             >
               <Upload className="w-4 h-4 text-teal-700" />
-              استعادة من ملف JSON
+              استيراد JSON
             </button>
           </div>
         </div>
 
         {(cloudStatus || cloudLastSyncAt) && (
           <div className="text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2">
-            <span>{cloudStatus || 'البيانات متصلة بخزنة السحابة.'}</span>
+            <span>{cloudStatus || 'المزامنة السحابية التلقائية متصلة بالسحابة.'}</span>
             {cloudLastSyncAt && (
               <span className="font-mono-nums text-[11px] text-slate-500">
-                آخر مزامنة: {new Date(cloudLastSyncAt).toLocaleString('ar-YE')}
+                آخر مزامنة تلقائية: {new Date(cloudLastSyncAt).toLocaleString('ar-YE')}
               </span>
             )}
           </div>

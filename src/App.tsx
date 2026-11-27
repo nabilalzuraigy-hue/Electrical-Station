@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { LogOut, Zap } from 'lucide-react';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { AdminLicensingPanel } from './components/AdminLicensingPanel';
@@ -9,8 +9,20 @@ import { SubscriberPortal } from './components/SubscriberPortal';
 import { FlutterCodeExplorer } from './components/FlutterCodeExplorer';
 import { PWAInstallPrompt } from './components/PWAInstallPrompt';
 import { OfflineIndicator } from './components/OfflineIndicator';
-import { testFirestoreConnection } from './lib/firebase';
 import {
+  auth,
+  getFirebaseAdminIdToken,
+  isAuthorizedAdminUser,
+  subscribeToAuth,
+  testFirestoreConnection,
+} from './lib/firebase';
+import {
+  loadAdminStoreFromFirestore,
+  saveAdminStoreToFirestore,
+} from './lib/firestoreBackup';
+import {
+  fetchCloudAutoBackup,
+  restoreCloudAutoBackup,
   saveStationLocalState,
   syncStationPendingBatches,
   type StationLocalState,
@@ -38,6 +50,66 @@ function StationWorkspace() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null);
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
+  const autoSyncLockRef = useRef(false);
+
+  const runSilentGlobalCloudSync = useCallback(async () => {
+    if (autoSyncLockRef.current) return;
+    const currentUser = auth.currentUser;
+    if (!isAuthorizedAdminUser(currentUser)) return;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+
+    autoSyncLockRef.current = true;
+    try {
+      const firebaseIdToken = await getFirebaseAdminIdToken(currentUser);
+      if (!firebaseIdToken && !adminToken) return;
+
+      const serverSnapshot = await fetchCloudAutoBackup({
+        adminToken,
+        firebaseIdToken,
+      });
+
+      if (!serverSnapshot.hasData) {
+        const cloudSnap = await loadAdminStoreFromFirestore();
+        if (
+          cloudSnap &&
+          (cloudSnap.stationCount > 0 || cloudSnap.codeCount > 0)
+        ) {
+          await restoreCloudAutoBackup({
+            adminToken,
+            firebaseIdToken,
+            backup: cloudSnap.backup,
+            mode: 'merge',
+          });
+        }
+      } else {
+        await saveAdminStoreToFirestore(serverSnapshot);
+      }
+    } catch {
+      // Non-blocking automatic sync
+    } finally {
+      autoSyncLockRef.current = false;
+    }
+  }, [adminToken]);
+
+  useEffect(() => {
+    let intervalId: ReturnType<typeof setInterval> | null = null;
+    const unsub = subscribeToAuth((user) => {
+      if (intervalId) {
+        clearInterval(intervalId);
+        intervalId = null;
+      }
+      if (isAuthorizedAdminUser(user)) {
+        void runSilentGlobalCloudSync();
+        intervalId = setInterval(() => {
+          void runSilentGlobalCloudSync();
+        }, 45000);
+      }
+    });
+    return () => {
+      unsub();
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [runSilentGlobalCloudSync]);
 
   const isLoggedIn = Boolean(
     adminToken || (staffToken && accessRecord) || subscriberResult,
@@ -64,6 +136,7 @@ function StationWorkspace() {
       setSyncNotice(
         `تمت المزامنة الآمنة لنسخة ${updatedState.station.stationName} (${syncedCount} سجل).`,
       );
+      void runSilentGlobalCloudSync();
       setTimeout(() => setSyncNotice(null), 4000);
     } catch (err) {
       setSyncNotice(

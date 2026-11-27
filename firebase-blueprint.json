@@ -173,6 +173,8 @@
         "totalDueYer": { "type": "number" },
         "lastReadingPhotoUrl": { "type": "string", "maxLength": 0 },
         "lastPaymentYer": { "type": "number" },
+        "readingsJson": { "type": "string", "maxLength": 150000 },
+        "receiptsJson": { "type": "string", "maxLength": 150000 },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["stationId", "stationName", "meterNumber", "subscriberName", "zoneStreet", "previousReading", "currentReading", "consumptionKwh", "currentBillYer", "previousDebtYer", "totalDueYer", "lastReadingPhotoUrl", "lastPaymentYer", "updatedAt"]
@@ -265,6 +267,22 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["kind", "stationId", "partIndex", "totalParts", "payloadChunk", "updatedByEmail", "updatedAt"]
+    },
+    "StaffVaultRecord": {
+      "title": "StaffVaultRecord",
+      "description": "Hashed single-document station recovery cache keyed by SHA-256 activation code hash (text/numeric data only, no meter photos).",
+      "type": "object",
+      "properties": {
+        "kind": { "type": "string", "enum": ["staff_vault"] },
+        "stationId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "accessJson": { "type": "string", "maxLength": 10000 },
+        "stationJson": { "type": "string", "maxLength": 50000 },
+        "collectorsJson": { "type": "string", "maxLength": 200000 },
+        "stationDataJson": { "type": "string", "maxLength": 900000 },
+        "updatedByEmail": { "type": "string", "minLength": 5, "maxLength": 150 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["kind", "stationId", "accessJson", "stationJson", "collectorsJson", "stationDataJson", "updatedByEmail", "updatedAt"]
     }
   },
   "firestore": {
@@ -275,6 +293,10 @@
     "/adminVault/{docId}": {
       "schema": { "$ref": "#/entities/AdminVaultMeta" },
       "description": "Developer Admin Cloud Vault storing chunked persistent backups of stations, activation codes, and subscribers."
+    },
+    "/staffVault/{accessHash}": {
+      "schema": { "$ref": "#/entities/StaffVaultRecord" },
+      "description": "Hashed single-document station recovery cache for Managers and Collectors across devices."
     },
     "/licenses/{licenseCode}": {
       "schema": { "$ref": "#/entities/LicenseRecord" },

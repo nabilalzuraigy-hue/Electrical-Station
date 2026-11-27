@@ -1,5 +1,10 @@
 import * as XLSX from 'xlsx';
 import { idbGet, idbSet } from './indexedDbCache';
+import {
+  loadStaffVaultFromFirestore,
+  loadSubscriberPortalFromFirestore,
+  type AdminStoreBackupPayload,
+} from './firestoreBackup';
 import type {
   AccessCodeRecord,
   CollectorLocationRecord,
@@ -350,6 +355,58 @@ export async function restoreAdminBackup(
   );
 }
 
+export async function fetchCloudAutoBackup(params: {
+  adminToken?: string | null;
+  firebaseIdToken?: string | null;
+}): Promise<
+  AdminStoreBackupPayload & {
+    counts: { stationCount: number; codeCount: number; subscriberCount: number };
+    hasData: boolean;
+  }
+> {
+  const headers: Record<string, string> = {};
+  if (params.firebaseIdToken) {
+    headers['X-Firebase-Id-Token'] = params.firebaseIdToken;
+  }
+  return apiRequest<
+    AdminStoreBackupPayload & {
+      counts: { stationCount: number; codeCount: number; subscriberCount: number };
+      hasData: boolean;
+    }
+  >('/api/admin/cloud-auto-backup', { headers }, params.adminToken);
+}
+
+export async function restoreCloudAutoBackup(params: {
+  adminToken?: string | null;
+  firebaseIdToken?: string | null;
+  backup: AdminStoreBackupPayload;
+  mode?: 'merge' | 'replace';
+}): Promise<{
+  ok: boolean;
+  stationCount: number;
+  codeCount: number;
+  subscriberCount: number;
+}> {
+  const headers: Record<string, string> = {};
+  if (params.firebaseIdToken) {
+    headers['X-Firebase-Id-Token'] = params.firebaseIdToken;
+  }
+  return apiRequest<{
+    ok: boolean;
+    stationCount: number;
+    codeCount: number;
+    subscriberCount: number;
+  }>(
+    '/api/admin/cloud-auto-restore',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ ...params.backup, mode: params.mode ?? 'merge' }),
+    },
+    params.adminToken,
+  );
+}
+
 export async function fetchStationDetailsAdmin(
   adminToken: string,
   stationId: string,
@@ -557,43 +614,101 @@ export async function loginUnified(
     throw new Error('يرجى إدخال اسم المستخدم أو كلمة المرور.');
   }
 
-  const res = await apiRequest<
-    | { kind: 'admin'; token: string; name: string }
-    | {
-        kind: 'staff';
-        token: string;
-        access: AccessCodeRecord;
-        state: {
-          station: StationConfig;
-          collectors?: AccessCodeRecord[];
-          subscribers?: Subscriber[];
-          readings?: MeterReading[];
-          receipts?: PaymentReceipt[];
-          alerts?: ManagerAlert[];
-          expenses?: DieselExpenseEntry[];
-          collectorLocations?: CollectorLocationRecord[];
+  try {
+    const res = await apiRequest<
+      | { kind: 'admin'; token: string; name: string }
+      | {
+          kind: 'staff';
+          token: string;
+          access: AccessCodeRecord;
+          state: {
+            station: StationConfig;
+            collectors?: AccessCodeRecord[];
+            subscribers?: Subscriber[];
+            readings?: MeterReading[];
+            receipts?: PaymentReceipt[];
+            alerts?: ManagerAlert[];
+            expenses?: DieselExpenseEntry[];
+            collectorLocations?: CollectorLocationRecord[];
+          };
+        }
+      | { kind: 'subscriber'; result: SubscriberLookupResult }
+    >('/api/auth/unified', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+
+    if (res.kind === 'staff') {
+      const cloudState = mapServerState(res.state);
+      const local = await loadStationLocalState(cloudState.station.stationId);
+      const merged = mergeLocalPendingWithCloud(local, cloudState);
+      await saveStationLocalState(merged);
+      return {
+        kind: 'staff',
+        token: res.token,
+        access: res.access,
+        state: merged,
+      };
+    }
+
+    return res;
+  } catch (primaryErr) {
+    // Cloud Firestore SDK fallback (supports multi-device restore & static Firebase Hosting)
+    const candidates = Array.from(
+      new Set(
+        [
+          'password' in payload ? payload.password : '',
+          payload.credential ?? '',
+          'username' in payload ? payload.username : '',
+        ].filter((v): v is string => typeof v === 'string' && v.trim().length > 0),
+      ),
+    );
+
+    for (const cand of candidates) {
+      const codeCand = normalizeActivationCode(cand);
+      if (codeCand.length < 4) continue;
+      const staffVault = await loadStaffVaultFromFirestore(codeCand);
+      if (staffVault) {
+        if (!staffVault.access.active) {
+          throw new Error('هذا الكود موقوف حالياً من الإدارة.');
+        }
+        if (staffVault.station.licenseStatus !== 'active') {
+          throw new Error('تم إيقاف ترخيص هذه المحطة من قِبل الإدارة.');
+        }
+        const cloudState = mapServerState({
+          station: staffVault.station,
+          collectors: staffVault.collectors,
+          subscribers: staffVault.subscribers,
+          readings: staffVault.readings,
+          receipts: staffVault.receipts,
+          alerts: staffVault.alerts,
+          expenses: staffVault.expenses,
+          collectorLocations: staffVault.collectorLocations,
+        });
+        const local = await loadStationLocalState(cloudState.station.stationId);
+        const merged = mergeLocalPendingWithCloud(local, cloudState);
+        await saveStationLocalState(merged);
+        return {
+          kind: 'staff',
+          token: `cloud_${codeCand}`,
+          access: staffVault.access,
+          state: merged,
         };
       }
-    | { kind: 'subscriber'; result: SubscriberLookupResult }
-  >('/api/auth/unified', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  });
+    }
 
-  if (res.kind === 'staff') {
-    const cloudState = mapServerState(res.state);
-    const local = await loadStationLocalState(cloudState.station.stationId);
-    const merged = mergeLocalPendingWithCloud(local, cloudState);
-    await saveStationLocalState(merged);
-    return {
-      kind: 'staff',
-      token: res.token,
-      access: res.access,
-      state: merged,
-    };
+    if ('username' in payload && payload.username && payload.password) {
+      const portalRes = await loadSubscriberPortalFromFirestore(
+        payload.username,
+        payload.password,
+      );
+      if (portalRes) {
+        return { kind: 'subscriber', result: portalRes };
+      }
+    }
+
+    throw primaryErr;
   }
-
-  return res;
 }
 
 export async function loginWithAccessCode(codeInput: string): Promise<{
@@ -1123,10 +1238,19 @@ export async function lookupSubscriberPublic(params: {
   subscriberName: string;
   phone: string;
 }): Promise<SubscriberLookupResult> {
-  return apiRequest<SubscriberLookupResult>('/api/subscriber/lookup', {
-    method: 'POST',
-    body: JSON.stringify(params),
-  });
+  try {
+    return await apiRequest<SubscriberLookupResult>('/api/subscriber/lookup', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    });
+  } catch (err) {
+    const cloudPortal = await loadSubscriberPortalFromFirestore(
+      params.subscriberName,
+      params.phone,
+    );
+    if (cloudPortal) return cloudPortal;
+    throw err;
+  }
 }
 
 // ============================================================

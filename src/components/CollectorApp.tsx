@@ -19,6 +19,7 @@ import {
   RotateCcw,
   ScanLine,
   Search,
+  Share2,
   ShieldAlert,
   Upload,
   User,
@@ -439,6 +440,20 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     return r + rc + s + al;
   }, [state]);
 
+  const latestSubscriberLocalPhotoReading = useMemo(() => {
+    if (!selectedSubscriber) return null;
+    return (
+      state.readings
+        .filter(
+          (r) =>
+            (r.subscriberId === selectedSubscriber.id ||
+              r.meterNumber === selectedSubscriber.meterNumber) &&
+            Boolean(r.photoUrl),
+        )
+        .sort((a, b) => b.recordedAt.localeCompare(a.recordedAt))[0] ?? null
+    );
+  }, [selectedSubscriber, state.readings]);
+
   if (!collectorActive) {
     return (
       <div className="bg-white border border-rose-200 rounded-xl p-8 text-center space-y-3">
@@ -629,6 +644,75 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     } finally {
       event.target.value = '';
     }
+  };
+
+  const shareMeterPhotoToManager = async (
+    photoDataUrl: string,
+    readingValue?: number,
+  ) => {
+    if (!photoDataUrl || !selectedSubscriber) return;
+    const safeMeter = selectedSubscriber.meterNumber.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const filename = `meter_${safeMeter || 'photo'}.jpg`;
+    const caption = [
+      `صورة عداد المشترك: ${selectedSubscriber.subscriberName}`,
+      `رقم العداد: ${selectedSubscriber.meterNumber}`,
+      readingValue !== undefined ? `القراءة: ${readingValue}` : null,
+      `المحصّل: ${resolvedCollectorName}`,
+    ]
+      .filter(Boolean)
+      .join(' — ');
+
+    try {
+      const response = await fetch(photoDataUrl);
+      const blob = await response.blob();
+      const file = new File([blob], filename, {
+        type: blob.type || 'image/jpeg',
+      });
+
+      if (
+        typeof navigator !== 'undefined' &&
+        typeof navigator.share === 'function' &&
+        (!navigator.canShare || navigator.canShare({ files: [file] }))
+      ) {
+        try {
+          await navigator.share({
+            files: [file],
+            title: 'صورة عداد الكهرباء',
+            text: caption,
+          });
+          setPhotoStatus('تم فتح قائمة المشاركة لإرسال صورة العداد إلى مدير المحطة.');
+          return;
+        } catch (shareErr) {
+          if (
+            shareErr instanceof Error &&
+            shareErr.name === 'AbortError'
+          ) {
+            return;
+          }
+        }
+      }
+    } catch {
+      // Fallback cleanly to local file download + clipboard caption
+    }
+
+    const link = document.createElement('a');
+    link.href = photoDataUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(caption);
+      } catch {
+        // Clipboard access optional
+      }
+    }
+
+    setPhotoStatus(
+      'تم حفظ صورة العداد في جهازك ونسخ بيانات المشترك لإرسالها لمدير المحطة عبر واتساب أو تيليجرام.',
+    );
   };
 
   const handleNewMeterPhotoUpload = async (
@@ -1702,12 +1786,68 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                               : 'تكبير الأرقام'}
                           </button>
                         )}
+
+                        {proofPhotoUrl && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void shareMeterPhotoToManager(
+                                proofPhotoUrl,
+                                ocrResult?.reading ?? undefined,
+                              )
+                            }
+                            className="min-h-[44px] px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                          >
+                            <Share2 className="w-4 h-4" />
+                            مشاركة صورة العداد لمدير المحطة
+                          </button>
+                        )}
                       </div>
 
                       {photoStatus && (
                         <p className="text-xs text-teal-900 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2 font-medium">
                           {photoStatus}
                         </p>
+                      )}
+
+                      {!proofPhotoUrl && latestSubscriberLocalPhotoReading?.photoUrl && (
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-50 border border-slate-200 rounded-xl p-3">
+                          <div className="flex items-center gap-3">
+                            <img
+                              src={latestSubscriberLocalPhotoReading.photoUrl}
+                              alt={`آخر صورة محفوظة للعداد ${selectedSubscriber.meterNumber}`}
+                              className="w-14 h-14 rounded-lg object-cover border border-slate-300 shrink-0"
+                            />
+                            <div className="space-y-1">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="text-[11px] font-bold bg-teal-100 text-teal-900 px-2 py-0.5 rounded">
+                                  محفوظة محلياً بهاتفك فقط
+                                </span>
+                                <span className="text-xs font-mono-nums font-bold text-slate-800">
+                                  القراءة: {latestSubscriberLocalPhotoReading.currentReading}
+                                </span>
+                              </div>
+                              <div className="text-[11px] text-slate-500">
+                                {new Date(
+                                  latestSubscriberLocalPhotoReading.recordedAt,
+                                ).toLocaleString('ar-YE')}
+                              </div>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void shareMeterPhotoToManager(
+                                latestSubscriberLocalPhotoReading.photoUrl,
+                                latestSubscriberLocalPhotoReading.currentReading,
+                              )
+                            }
+                            className="min-h-[40px] px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold rounded-lg inline-flex items-center justify-center gap-1.5 shrink-0 cursor-pointer"
+                          >
+                            <Share2 className="w-4 h-4" />
+                            مشاركة صورة العداد لمدير المحطة
+                          </button>
+                        </div>
                       )}
 
                       {ocrResult && !ocrResult.accepted && reviewChoice !== 'manual_edit' && (

@@ -425,6 +425,96 @@ function stripPhotosFromBucket(bucket: StationDataBucket): StationDataBucket {
   };
 }
 
+const FIREBASE_PROJECT_ID = 'electricity-station-f5a90';
+const ADMIN_GOOGLE_EMAIL = 'nabilalzuraigy@gmail.com';
+const FIREBASE_CERTS_URL =
+  'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com';
+
+let cachedFirebaseCerts: { certs: Record<string, string>; expiresAt: number } | null = null;
+
+async function getFirebasePublicCerts(): Promise<Record<string, string>> {
+  const now = Date.now();
+  if (cachedFirebaseCerts && now < cachedFirebaseCerts.expiresAt) {
+    return cachedFirebaseCerts.certs;
+  }
+  const resp = await fetch(FIREBASE_CERTS_URL);
+  if (!resp.ok) {
+    throw new Error('Failed to fetch Firebase public certificates');
+  }
+  const certs = (await resp.json()) as Record<string, string>;
+  const cacheControl = resp.headers.get('cache-control') || '';
+  const maxAgeMatch = cacheControl.match(/max-age=(\d+)/i);
+  const ttlMs = maxAgeMatch ? Math.max(60, Number(maxAgeMatch[1])) * 1000 : 3600 * 1000;
+  cachedFirebaseCerts = { certs, expiresAt: now + ttlMs };
+  return certs;
+}
+
+async function verifyFirebaseAdminToken(
+  idToken: string,
+): Promise<{ uid: string; email: string } | null> {
+  try {
+    const parts = idToken.split('.');
+    if (parts.length !== 3) return null;
+    const [headerB64, payloadB64, sigB64] = parts;
+    const header = JSON.parse(
+      Buffer.from(headerB64, 'base64url').toString('utf8'),
+    ) as { alg?: string; kid?: string };
+    const payload = JSON.parse(
+      Buffer.from(payloadB64, 'base64url').toString('utf8'),
+    ) as {
+      aud?: string;
+      iss?: string;
+      sub?: string;
+      exp?: number;
+      iat?: number;
+      auth_time?: number;
+      email?: string;
+      email_verified?: boolean;
+    };
+
+    if (header.alg !== 'RS256' || !header.kid) return null;
+    const certs = await getFirebasePublicCerts();
+    const cert = certs[header.kid];
+    if (!cert) return null;
+
+    const verifier = crypto.createVerify('RSA-SHA256');
+    verifier.update(`${headerB64}.${payloadB64}`);
+    verifier.end();
+    const sigValid = verifier.verify(cert, Buffer.from(sigB64, 'base64url'));
+    if (!sigValid) return null;
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (
+      payload.aud !== FIREBASE_PROJECT_ID ||
+      payload.iss !== `https://securetoken.google.com/${FIREBASE_PROJECT_ID}` ||
+      typeof payload.sub !== 'string' ||
+      !payload.sub ||
+      typeof payload.exp !== 'number' ||
+      payload.exp <= nowSec ||
+      typeof payload.iat !== 'number' ||
+      payload.iat > nowSec + 300
+    ) {
+      return null;
+    }
+
+    if (
+      !payload.email ||
+      payload.email.trim().toLowerCase() !== ADMIN_GOOGLE_EMAIL.toLowerCase() ||
+      payload.email_verified !== true
+    ) {
+      return null;
+    }
+
+    return { uid: payload.sub, email: payload.email };
+  } catch {
+    return null;
+  }
+}
+
+function sha256Hex(raw: string): string {
+  return crypto.createHash('sha256').update(raw, 'utf8').digest('hex');
+}
+
 function extractBearer(req: Request): SessionPayload | null {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
@@ -445,6 +535,36 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
   }
   (req as Request & { session: SessionPayload }).session = session;
   next();
+}
+
+async function requireAdminOrFirebaseAdmin(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const session = extractBearer(req);
+  if (session?.role === 'admin') {
+    (req as Request & { session: SessionPayload }).session = session;
+    next();
+    return;
+  }
+
+  const fbHeader = req.headers['x-firebase-id-token'];
+  const idToken = typeof fbHeader === 'string' ? fbHeader.trim() : '';
+  if (idToken) {
+    const verified = await verifyFirebaseAdminToken(idToken);
+    if (verified) {
+      (req as Request & { session: SessionPayload }).session = {
+        role: 'admin',
+        name: 'الأدمن المطور',
+        exp: Date.now() + 60 * 60 * 1000,
+      };
+      next();
+      return;
+    }
+  }
+
+  res.status(401).json({ error: 'جلسة الأدمن المطور مطلوبة.' });
 }
 
 function requireStaff(req: Request, res: Response, next: NextFunction): void {
@@ -615,6 +735,181 @@ function buildStationStatePayload(
     expenses: allExpenses,
     collectorLocations: allLocations,
   };
+}
+
+interface FirestoreRestValue {
+  stringValue?: string;
+  integerValue?: string;
+  doubleValue?: number;
+  booleanValue?: boolean;
+  timestampValue?: string;
+}
+
+function mergeBucketDataIntoStore(
+  stationId: string,
+  bucketIn: Partial<StationDataBucket>,
+): void {
+  const cleanBucket = stripPhotosFromBucket({
+    subscribers: bucketIn.subscribers ?? {},
+    readings: bucketIn.readings ?? {},
+    receipts: bucketIn.receipts ?? {},
+    alerts: bucketIn.alerts ?? {},
+    expenses: bucketIn.expenses ?? {},
+    collectorLocations: bucketIn.collectorLocations ?? {},
+  });
+  const target = getBucket(stationId);
+  Object.assign(target.subscribers, cleanBucket.subscribers);
+  Object.assign(target.readings, cleanBucket.readings);
+  Object.assign(target.receipts, cleanBucket.receipts);
+  Object.assign(target.alerts, cleanBucket.alerts);
+  Object.assign(target.expenses ?? {}, cleanBucket.expenses ?? {});
+  Object.assign(
+    target.collectorLocations ?? {},
+    cleanBucket.collectorLocations ?? {},
+  );
+}
+
+async function tryHydrateStaffCodeFromFirestore(
+  rawCode: string,
+): Promise<boolean> {
+  const normalized = normalizeCode(rawCode);
+  if (normalized.length < 4) return false;
+  try {
+    const accessHash = sha256Hex(`staff:${normalized}`);
+    const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/staffVault/${accessHash}`;
+    const resp = await fetch(url);
+    if (!resp.ok) return false;
+    const docData = (await resp.json()) as {
+      fields?: Record<string, FirestoreRestValue>;
+    };
+    const fields = docData.fields;
+    if (!fields?.accessJson?.stringValue || !fields?.stationJson?.stringValue) {
+      return false;
+    }
+
+    const access = JSON.parse(
+      fields.accessJson.stringValue,
+    ) as AccessCodeRecord;
+    const station = JSON.parse(
+      fields.stationJson.stringValue,
+    ) as StationRecord;
+    if (
+      !access?.code ||
+      normalizeCode(access.code) !== normalized ||
+      !station?.stationId ||
+      access.stationId !== station.stationId
+    ) {
+      return false;
+    }
+
+    if (!store.stations[station.stationId]) {
+      store.stations[station.stationId] = station;
+    }
+    store.codes[normalized] = access;
+
+    if (fields.collectorsJson?.stringValue) {
+      const collectors = JSON.parse(
+        fields.collectorsJson.stringValue,
+      ) as AccessCodeRecord[];
+      if (Array.isArray(collectors)) {
+        for (const col of collectors) {
+          if (col?.code && col.stationId === station.stationId) {
+            const cKey = normalizeCode(col.code);
+            if (!store.codes[cKey]) {
+              store.codes[cKey] = col;
+            }
+          }
+        }
+      }
+    }
+
+    if (fields.stationDataJson?.stringValue) {
+      const bucketIn = JSON.parse(
+        fields.stationDataJson.stringValue,
+      ) as Partial<StationDataBucket>;
+      mergeBucketDataIntoStore(station.stationId, bucketIn);
+    } else {
+      getBucket(station.stationId);
+    }
+
+    saveStore(store);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function tryLookupSubscriberPortalFromFirestore(
+  rawIdentifier: string,
+  rawPhone: string,
+): Promise<{
+  stationName: string;
+  subscriber: SubscriberRecord;
+  readings: MeterReadingRecord[];
+  receipts: PaymentReceiptRecord[];
+} | null> {
+  try {
+    const normPhone = normalizePhone(
+      rawPhone.replace(/[٠-٩]/g, (d) => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d))),
+    );
+    const normName = normalizeArabicName(rawIdentifier);
+    if (!normPhone || !normName) return null;
+
+    const hashes = [
+      sha256Hex(`sub_name:${normName}:${normPhone}`),
+      sha256Hex(`sub_meter:${rawIdentifier.trim().toLowerCase()}:${normPhone}`),
+    ];
+
+    for (const h of hashes) {
+      const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/subscriberPortals/${h}`;
+      const resp = await fetch(url);
+      if (!resp.ok) continue;
+      const docData = (await resp.json()) as {
+        fields?: Record<string, FirestoreRestValue>;
+      };
+      const f = docData.fields;
+      if (!f?.meterNumber?.stringValue || !f?.subscriberName?.stringValue) {
+        continue;
+      }
+
+      const numVal = (v?: FirestoreRestValue): number =>
+        v?.doubleValue !== undefined
+          ? Number(v.doubleValue)
+          : v?.integerValue !== undefined
+            ? Number(v.integerValue)
+            : 0;
+
+      const meterNumber = f.meterNumber.stringValue;
+      const subscriberName = f.subscriberName.stringValue;
+      const stationName = f.stationName?.stringValue || 'المحطة';
+      const updatedAt = f.updatedAt?.timestampValue || new Date().toISOString();
+
+      const readings: MeterReadingRecord[] = f.readingsJson?.stringValue
+        ? (JSON.parse(f.readingsJson.stringValue) as MeterReadingRecord[])
+        : [];
+      const receipts: PaymentReceiptRecord[] = f.receiptsJson?.stringValue
+        ? (JSON.parse(f.receiptsJson.stringValue) as PaymentReceiptRecord[])
+        : [];
+
+      const subscriber: SubscriberRecord = {
+        id: `sub_${meterNumber}`,
+        meterNumber,
+        subscriberName,
+        phone: rawPhone,
+        previousReading: numVal(f.previousReading),
+        currentReading: numVal(f.currentReading),
+        previousDebtYer: numVal(f.previousDebtYer),
+        zoneStreet: f.zoneStreet?.stringValue || 'عام',
+        sequenceOrder: 1,
+        updatedAt,
+      };
+
+      return { stationName, subscriber, readings, receipts };
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 async function startServer() {
@@ -1125,37 +1420,83 @@ async function startServer() {
     });
   });
 
-  app.post('/api/admin/restore', requireAdmin, (req, res) => {
+  app.get(
+    '/api/admin/cloud-auto-backup',
+    requireAdminOrFirebaseAdmin,
+    (_req, res) => {
+      const textOnlyStationData: Record<string, StationDataBucket> = {};
+      for (const [stId, bucket] of Object.entries(store.stationData)) {
+        textOnlyStationData[stId] = stripPhotosFromBucket(bucket);
+      }
+      const stationCount = Object.keys(store.stations).length;
+      const codeCount = Object.keys(store.codes).length;
+      const subscriberCount = Object.values(store.stationData).reduce(
+        (sum, b) => sum + Object.keys(b?.subscribers ?? {}).length,
+        0,
+      );
+      res.json({
+        stations: store.stations,
+        codes: store.codes,
+        stationData: textOnlyStationData,
+        counts: { stationCount, codeCount, subscriberCount },
+        hasData: stationCount > 0 || codeCount > 0,
+        exportedAt: new Date().toISOString(),
+      });
+    },
+  );
+
+  function applyRestorePayload(
+    body: Record<string, unknown>,
+  ): { ok: true; stationCount: number; codeCount: number; subscriberCount: number } | { error: string; status: number } {
     const incomingStations =
-      req.body?.stations &&
-      typeof req.body.stations === 'object' &&
-      !Array.isArray(req.body.stations)
-        ? (req.body.stations as Record<string, StationRecord>)
+      body?.stations &&
+      typeof body.stations === 'object' &&
+      !Array.isArray(body.stations)
+        ? (body.stations as Record<string, StationRecord>)
         : null;
     const incomingCodes =
-      req.body?.codes &&
-      typeof req.body.codes === 'object' &&
-      !Array.isArray(req.body.codes)
-        ? (req.body.codes as Record<string, AccessCodeRecord>)
+      body?.codes &&
+      typeof body.codes === 'object' &&
+      !Array.isArray(body.codes)
+        ? (body.codes as Record<string, AccessCodeRecord>)
         : null;
     const incomingStationData =
-      req.body?.stationData &&
-      typeof req.body.stationData === 'object' &&
-      !Array.isArray(req.body.stationData)
-        ? (req.body.stationData as Record<string, StationDataBucket>)
+      body?.stationData &&
+      typeof body.stationData === 'object' &&
+      !Array.isArray(body.stationData)
+        ? (body.stationData as Record<string, StationDataBucket>)
         : null;
 
     if (!incomingStations && !incomingCodes && !incomingStationData) {
-      res.status(400).json({ error: 'ملف أو نسخة الاستعادة غير صالحة.' });
-      return;
+      return { error: 'ملف أو نسخة الاستعادة غير صالحة.', status: 400 };
     }
 
-    const mode = req.body?.mode === 'replace' ? 'replace' : 'merge';
+    const mode = body?.mode === 'replace' ? 'replace' : 'merge';
+    const incomingEmpty =
+      Object.keys(incomingStations ?? {}).length === 0 &&
+      Object.keys(incomingCodes ?? {}).length === 0;
+    const currentNonEmpty =
+      Object.keys(store.stations).length > 0 ||
+      Object.keys(store.codes).length > 0;
+
+    if (mode === 'replace' && incomingEmpty && currentNonEmpty) {
+      return {
+        error: 'لا يمكن استبدال بيانات المحطات والأكواد الحالية بنسخة فارغة.',
+        status: 400,
+      };
+    }
 
     if (mode === 'replace') {
       store.stations = incomingStations ?? {};
       store.codes = incomingCodes ?? {};
-      store.stationData = incomingStationData ?? {};
+      store.stationData = {};
+      if (incomingStationData) {
+        for (const [stId, bucketIn] of Object.entries(incomingStationData)) {
+          if (bucketIn && typeof bucketIn === 'object') {
+            store.stationData[stId] = stripPhotosFromBucket(bucketIn);
+          }
+        }
+      }
     } else {
       if (incomingStations) {
         for (const [k, v] of Object.entries(incomingStations)) {
@@ -1174,16 +1515,7 @@ async function startServer() {
       if (incomingStationData) {
         for (const [stId, bucketIn] of Object.entries(incomingStationData)) {
           if (!bucketIn || typeof bucketIn !== 'object') continue;
-          const target = getBucket(stId);
-          Object.assign(target.subscribers, bucketIn.subscribers ?? {});
-          Object.assign(target.readings, bucketIn.readings ?? {});
-          Object.assign(target.receipts, bucketIn.receipts ?? {});
-          Object.assign(target.alerts, bucketIn.alerts ?? {});
-          Object.assign(target.expenses ?? {}, bucketIn.expenses ?? {});
-          Object.assign(
-            target.collectorLocations ?? {},
-            bucketIn.collectorLocations ?? {},
-          );
+          mergeBucketDataIntoStore(stId, bucketIn);
         }
       }
     }
@@ -1197,12 +1529,38 @@ async function startServer() {
       (sum, b) => sum + Object.keys(b?.subscribers ?? {}).length,
       0,
     );
-    res.json({
+    return {
       ok: true,
       stationCount: Object.keys(store.stations).length,
       codeCount: Object.keys(store.codes).length,
       subscriberCount,
-    });
+    };
+  }
+
+  app.post(
+    '/api/admin/cloud-auto-restore',
+    requireAdminOrFirebaseAdmin,
+    (req, res) => {
+      const result = applyRestorePayload(
+        (req.body ?? {}) as Record<string, unknown>,
+      );
+      if ('error' in result) {
+        res.status(result.status).json({ error: result.error });
+        return;
+      }
+      res.json(result);
+    },
+  );
+
+  app.post('/api/admin/restore', requireAdmin, (req, res) => {
+    const result = applyRestorePayload(
+      (req.body ?? {}) as Record<string, unknown>,
+    );
+    if ('error' in result) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json(result);
   });
 
   app.get('/api/admin/stations/:stationId/details', requireAdmin, (req, res) => {
@@ -1334,7 +1692,17 @@ async function startServer() {
   // Unified Public Login (Admin Passcode / Manager or Collector Code / Subscriber Name+Phone)
   // ============================================================
 
-  app.post('/api/auth/unified', (req, res) => {
+  app.post('/api/auth/hydrate-from-cloud', async (req, res) => {
+    const code = normalizeCode(req.body?.code);
+    if (!code || code.length < 4) {
+      res.status(400).json({ error: 'كود التفعيل غير صالح.' });
+      return;
+    }
+    const hydrated = await tryHydrateStaffCodeFromFirestore(code);
+    res.json({ ok: true, hydrated });
+  });
+
+  app.post('/api/auth/unified', async (req, res) => {
     const rawUsername = String(req.body?.username ?? '').trim();
     const rawPassword = String(req.body?.password ?? '').trim();
     const rawCredential = String(
@@ -1370,9 +1738,12 @@ async function startServer() {
       return;
     }
 
-    // 2. Check Manager / Collector Code
+    // 2. Check Manager / Collector Code (with automatic Firestore staffVault hydration if missing)
     for (const cand of candidates) {
       const normalizedCode = normalizeCode(cand);
+      if (normalizedCode.length >= 4 && !store.codes[normalizedCode]) {
+        await tryHydrateStaffCodeFromFirestore(normalizedCode);
+      }
       if (normalizedCode.length >= 4 && store.codes[normalizedCode]) {
         const rec = store.codes[normalizedCode];
         if (!rec.active) {
@@ -1484,6 +1855,15 @@ async function startServer() {
           return;
         }
       }
+
+      const cloudPortal = await tryLookupSubscriberPortalFromFirestore(
+        subRawNamePart || rawUsername,
+        subTargetPhone,
+      );
+      if (cloudPortal) {
+        res.json({ kind: 'subscriber', result: cloudPortal });
+        return;
+      }
     }
 
     res.status(401).json({ error: 'بيانات الدخول غير صحيحة.' });
@@ -1493,11 +1873,15 @@ async function startServer() {
   // Public Code Login (Manager or Collector Code)
   // ============================================================
 
-  app.post('/api/auth/code', (req, res) => {
+  app.post('/api/auth/code', async (req, res) => {
     const code = normalizeCode(req.body?.code);
     if (!code || code.length < 4) {
       res.status(400).json({ error: 'يرجى إدخال كود الدخول الصحيح.' });
       return;
+    }
+
+    if (!store.codes[code]) {
+      await tryHydrateStaffCodeFromFirestore(code);
     }
 
     const rec = store.codes[code];
@@ -2670,7 +3054,7 @@ Inspect the attached electric meter photo carefully:
   // Public Subscriber Lookup (Name + Phone from uploaded Excel)
   // ============================================================
 
-  app.post('/api/subscriber/lookup', (req, res) => {
+  app.post('/api/subscriber/lookup', async (req, res) => {
     const rawIdentifier = String(
       req.body?.subscriberName ?? req.body?.meterNumber ?? '',
     ).trim();
@@ -2721,6 +3105,15 @@ Inspect the attached electric meter photo carefully:
         });
         return;
       }
+    }
+
+    const cloudPortal = await tryLookupSubscriberPortalFromFirestore(
+      rawIdentifier,
+      rawPhone,
+    );
+    if (cloudPortal) {
+      res.json(cloudPortal);
+      return;
     }
 
     res.status(404).json({

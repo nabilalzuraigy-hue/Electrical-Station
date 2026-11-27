@@ -107,6 +107,19 @@ service cloud.firestore {
         && data.updatedAt is timestamp && data.updatedAt == request.time;
     }
 
+    function isValidStaffVault(data) {
+      return data.keys().hasAll(['kind', 'stationId', 'accessJson', 'stationJson', 'collectorsJson', 'stationDataJson', 'updatedByEmail', 'updatedAt'])
+        && data.keys().hasOnly(['kind', 'stationId', 'accessJson', 'stationJson', 'collectorsJson', 'stationDataJson', 'updatedByEmail', 'updatedAt'])
+        && data.kind == 'staff_vault'
+        && isValidId(data.stationId)
+        && data.accessJson is string && data.accessJson.size() >= 2 && data.accessJson.size() <= 10000
+        && data.stationJson is string && data.stationJson.size() >= 2 && data.stationJson.size() <= 50000
+        && data.collectorsJson is string && data.collectorsJson.size() >= 2 && data.collectorsJson.size() <= 200000
+        && data.stationDataJson is string && data.stationDataJson.size() >= 2 && data.stationDataJson.size() <= 900000
+        && data.updatedByEmail is string && data.updatedByEmail.size() >= 5 && data.updatedByEmail.size() <= 150
+        && data.updatedAt is timestamp && data.updatedAt == request.time;
+    }
+
     function isValidLicense(data) {
       return data.keys().hasAll(['code', 'stationId', 'stationName', 'maxCollectors', 'maxSubscribers', 'status', 'expiresAt', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['code', 'stationId', 'stationName', 'maxCollectors', 'maxSubscribers', 'status', 'activatedByUid', 'activatedByEmail', 'activatedAt', 'expiresAt', 'createdAt', 'updatedAt'])
@@ -242,20 +255,22 @@ service cloud.firestore {
 
     function isValidPortalRecord(data) {
       return data.keys().hasAll(['stationId', 'stationName', 'meterNumber', 'subscriberName', 'zoneStreet', 'previousReading', 'currentReading', 'consumptionKwh', 'currentBillYer', 'previousDebtYer', 'totalDueYer', 'lastReadingPhotoUrl', 'lastPaymentYer', 'updatedAt'])
-        && data.keys().hasOnly(['stationId', 'stationName', 'meterNumber', 'subscriberName', 'zoneStreet', 'previousReading', 'currentReading', 'consumptionKwh', 'currentBillYer', 'previousDebtYer', 'totalDueYer', 'lastReadingPhotoUrl', 'lastPaymentYer', 'updatedAt'])
+        && data.keys().hasOnly(['stationId', 'stationName', 'meterNumber', 'subscriberName', 'zoneStreet', 'previousReading', 'currentReading', 'consumptionKwh', 'currentBillYer', 'previousDebtYer', 'totalDueYer', 'lastReadingPhotoUrl', 'lastPaymentYer', 'readingsJson', 'receiptsJson', 'updatedAt'])
         && isValidId(data.stationId)
         && data.stationName is string && data.stationName.size() >= 2 && data.stationName.size() <= 120
         && data.meterNumber is string && data.meterNumber.size() >= 2 && data.meterNumber.size() <= 40
         && data.subscriberName is string && data.subscriberName.size() >= 2 && data.subscriberName.size() <= 120
         && data.zoneStreet is string && data.zoneStreet.size() >= 1 && data.zoneStreet.size() <= 120
         && data.previousReading is number && data.previousReading >= 0
-        && data.currentReading is number && data.currentReading >= data.previousReading
+        && data.currentReading is number && data.currentReading >= 0
         && data.consumptionKwh is number && data.consumptionKwh >= 0
         && data.currentBillYer is number && data.currentBillYer >= 0
         && data.previousDebtYer is number && data.previousDebtYer >= 0
         && data.totalDueYer is number && data.totalDueYer >= 0
         && data.lastReadingPhotoUrl is string && data.lastReadingPhotoUrl.size() == 0
         && data.lastPaymentYer is number && data.lastPaymentYer >= 0
+        && (!('readingsJson' in data) || (data.readingsJson is string && data.readingsJson.size() <= 150000))
+        && (!('receiptsJson' in data) || (data.receiptsJson is string && data.receiptsJson.size() <= 150000))
         && data.updatedAt is timestamp && data.updatedAt == request.time;
     }
 
@@ -319,6 +334,14 @@ service cloud.firestore {
         (docId.matches('^station_[a-zA-Z0-9_\\-]+_p[0-9]+$') && isValidAdminVaultPart(incoming()))
       );
       allow delete: if isValidId(docId) && isAdmin();
+    }
+
+    // Hashed station recovery cache for Managers & Collectors across devices (text/numeric data only, no meter photos)
+    match /staffVault/{accessHash} {
+      allow get: if isValidId(accessHash);
+      allow list: if false;
+      allow create, update: if isValidId(accessHash) && isAdmin() && isValidStaffVault(incoming());
+      allow delete: if isValidId(accessHash) && isAdmin();
     }
 
     // Super Admin issues isolated station licenses; managers redeem unused codes atomically
@@ -538,8 +561,17 @@ service cloud.firestore {
       allow get: if isValidId(lookupHash);
       allow list: if false;
       allow create, update: if isValidId(lookupHash) && isSignedIn() && isValidPortalRecord(incoming())
-        && isStationActive(incoming().stationId)
-        && (isAdmin() || isStationOwner(incoming().stationId) || collectorHasPermission(incoming().stationId, 'canRecordReadings') || collectorHasPermission(incoming().stationId, 'canCollectCash'));
+        && (
+          isAdmin() ||
+          (
+            isStationActive(incoming().stationId)
+            && (
+              isStationOwner(incoming().stationId) ||
+              collectorHasPermission(incoming().stationId, 'canRecordReadings') ||
+              collectorHasPermission(incoming().stationId, 'canCollectCash')
+            )
+          )
+        );
       allow delete: if isValidId(lookupHash) && isAdmin();
     }
   }
