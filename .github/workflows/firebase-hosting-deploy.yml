@@ -11,9 +11,36 @@ jobs:
         with:
           node-version: '22'
       - run: npm install --legacy-peer-deps && npm run build
-      - uses: FirebaseExtended/action-hosting-deploy@v0
-        with:
-          repoToken: '${{ secrets.GITHUB_TOKEN }}'
-          firebaseServiceAccount: '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}'
-          channelId: live
-          projectId: electricity-station-f5a90
+      - name: Validate Service Account & Deploy to Firebase Hosting
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          set -e
+          SA_FILE="$RUNNER_TEMP/firebase-sa.json"
+          trap 'rm -f "$SA_FILE"' EXIT
+          node -e '
+            const raw = (process.env.FIREBASE_SERVICE_ACCOUNT || "").trim();
+            if (!raw) {
+              console.error("ERROR: FIREBASE_SERVICE_ACCOUNT secret is empty.");
+              process.exit(1);
+            }
+            let parsed;
+            try {
+              parsed = JSON.parse(raw);
+            } catch {
+              console.error("ERROR: FIREBASE_SERVICE_ACCOUNT is NOT valid Service Account JSON.");
+              process.exit(1);
+            }
+            if (parsed.type !== "service_account" || !parsed.private_key || !parsed.client_email) {
+              console.error("ERROR: JSON is missing type=service_account, client_email, or private_key.");
+              process.exit(1);
+            }
+            console.log("Service account project_id:", parsed.project_id, "client_email:", parsed.client_email);
+            if (parsed.project_id !== "electricity-station-f5a90") {
+              console.error("ERROR: Wrong project_id in FIREBASE_SERVICE_ACCOUNT:", parsed.project_id);
+              process.exit(1);
+            }
+            const fs = require("node:fs");
+            fs.writeFileSync(process.argv[1], JSON.stringify(parsed), { mode: 0o600 });
+          ' "$SA_FILE"
+          GOOGLE_APPLICATION_CREDENTIALS="$SA_FILE" npx -y firebase-tools@15 deploy --only hosting --project electricity-station-f5a90 --non-interactive
