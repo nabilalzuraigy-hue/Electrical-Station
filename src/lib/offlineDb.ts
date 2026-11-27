@@ -3,6 +3,7 @@ import { idbGet, idbSet } from './indexedDbCache';
 import {
   loadStaffVaultFromFirestore,
   loadSubscriberPortalFromFirestore,
+  saveCollectorReadingTextToFirestore,
   type AdminStoreBackupPayload,
 } from './firestoreBackup';
 import {
@@ -1397,44 +1398,81 @@ export async function syncStationPendingBatches(params: {
       photoUrl: '',
       hasLocalPhoto: Boolean(r.photoUrl || r.hasLocalPhoto),
     }));
-    await apiRequest(
-      `/api/stations/${encodeURIComponent(stationId)}/sync-batch`,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          subscribers: [],
-          readings: payloadReadings,
-          receipts: [],
-        }),
-      },
-      params.staffToken,
-    );
+    let batchSynced = false;
+    if (!params.staffToken.startsWith('cloud_')) {
+      try {
+        await apiRequest(
+          `/api/stations/${encodeURIComponent(stationId)}/sync-batch`,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              subscribers: [],
+              readings: payloadReadings,
+              receipts: [],
+            }),
+          },
+          params.staffToken,
+        );
+        batchSynced = true;
+      } catch (err) {
+        if (!(err instanceof StaticHostingNoBackendError)) {
+          throw err;
+        }
+      }
+    }
+
+    if (!batchSynced) {
+      const firestoreResults = await Promise.all(
+        payloadReadings.map((rd) =>
+          saveCollectorReadingTextToFirestore({ stationId, reading: rd }),
+        ),
+      );
+      batchSynced = firestoreResults.some(Boolean);
+    } else {
+      // Best-effort Firestore mirror when authenticated
+      void Promise.all(
+        payloadReadings.map((rd) =>
+          saveCollectorReadingTextToFirestore({ stationId, reading: rd }),
+        ),
+      );
+    }
+
     const verifiedById = new Map(verifiedBatch.map((v) => [v.id, v]));
     working = {
       ...working,
       readings: working.readings.map((r) => verifiedById.get(r.id) ?? r),
     };
-    const ids = new Set(batch.map((b) => b.id));
+    const ids = batchSynced ? new Set(batch.map((b) => b.id)) : new Set<string>();
     await commitLocalProgress(new Set(), ids, new Set(), new Set());
     completed += batch.length;
-    syncedCount += batch.length;
+    if (batchSynced) {
+      syncedCount += batch.length;
+    }
     params.onProgress?.({ completed, total: totalItems, currentBatch, totalBatches });
   }
 
   for (const batch of receiptBatches) {
     currentBatch++;
-    await apiRequest(
-      `/api/stations/${encodeURIComponent(stationId)}/sync-batch`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ subscribers: [], readings: [], receipts: batch }),
-      },
-      params.staffToken,
-    );
-    const ids = new Set(batch.map((b) => b.id));
-    await commitLocalProgress(new Set(), new Set(), ids, new Set());
+    if (!params.staffToken.startsWith('cloud_')) {
+      try {
+        await apiRequest(
+          `/api/stations/${encodeURIComponent(stationId)}/sync-batch`,
+          {
+            method: 'POST',
+            body: JSON.stringify({ subscribers: [], readings: [], receipts: batch }),
+          },
+          params.staffToken,
+        );
+        const ids = new Set(batch.map((b) => b.id));
+        await commitLocalProgress(new Set(), new Set(), ids, new Set());
+        syncedCount += batch.length;
+      } catch (err) {
+        if (!(err instanceof StaticHostingNoBackendError)) {
+          throw err;
+        }
+      }
+    }
     completed += batch.length;
-    syncedCount += batch.length;
     params.onProgress?.({ completed, total: totalItems, currentBatch, totalBatches });
   }
 
@@ -1443,29 +1481,88 @@ export async function syncStationPendingBatches(params: {
     const textOnlyAlerts = batch
       .filter((al) => al.alertType !== 'manual_edit')
       .map((al) => ({ ...al, photoUrl: '' }));
-    if (textOnlyAlerts.length > 0) {
-      await apiRequest(
-        `/api/stations/${encodeURIComponent(stationId)}/sync-batch`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            subscribers: [],
-            readings: [],
-            receipts: [],
-            alerts: textOnlyAlerts,
-          }),
-        },
-        params.staffToken,
-      );
+    if (textOnlyAlerts.length > 0 && !params.staffToken.startsWith('cloud_')) {
+      try {
+        await apiRequest(
+          `/api/stations/${encodeURIComponent(stationId)}/sync-batch`,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              subscribers: [],
+              readings: [],
+              receipts: [],
+              alerts: textOnlyAlerts,
+            }),
+          },
+          params.staffToken,
+        );
+        const ids = new Set(batch.map((b) => b.id));
+        await commitLocalProgress(new Set(), new Set(), new Set(), ids);
+        syncedCount += batch.length;
+      } catch (err) {
+        if (!(err instanceof StaticHostingNoBackendError)) {
+          throw err;
+        }
+      }
     }
-    const ids = new Set(batch.map((b) => b.id));
-    await commitLocalProgress(new Set(), new Set(), new Set(), ids);
     completed += batch.length;
-    syncedCount += batch.length;
     params.onProgress?.({ completed, total: totalItems, currentBatch, totalBatches });
   }
 
   return { updatedState: working, syncedCount };
+}
+
+/**
+ * Sends an approved reading (number + meterNumber + recordedAt ONLY, zero photo)
+ * to Firestore and backend in the background immediately upon collector approval.
+ */
+export async function dispatchReadingToCloudBackground(params: {
+  stationId: string;
+  staffToken: string;
+  reading: MeterReading;
+  subscriber?: Subscriber;
+  receipt?: PaymentReceipt;
+  alerts?: ManagerAlert[];
+}): Promise<boolean> {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return false;
+  }
+
+  const textOnlyReading: MeterReading = {
+    ...params.reading,
+    photoUrl: '',
+    hasLocalPhoto: Boolean(params.reading.photoUrl || params.reading.hasLocalPhoto),
+  };
+
+  let synced = false;
+
+  if (params.staffToken && !params.staffToken.startsWith('cloud_')) {
+    try {
+      await apiRequest(
+        `/api/stations/${encodeURIComponent(params.stationId)}/sync-batch`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            subscribers: params.subscriber ? [params.subscriber] : [],
+            readings: [textOnlyReading],
+            receipts: params.receipt ? [params.receipt] : [],
+            alerts: (params.alerts ?? []).map((a) => ({ ...a, photoUrl: '' })),
+          }),
+        },
+        params.staffToken,
+      );
+      synced = true;
+    } catch {
+      // Keep local pending status if offline or API unreachable
+    }
+  }
+
+  const firestoreOk = await saveCollectorReadingTextToFirestore({
+    stationId: params.stationId,
+    reading: textOnlyReading,
+  });
+
+  return synced || firestoreOk;
 }
 
 // ============================================================

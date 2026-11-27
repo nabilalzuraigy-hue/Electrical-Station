@@ -2,15 +2,12 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Camera,
-  Check,
   CheckCircle2,
   CloudUpload,
   Copy,
   Download,
-  Edit3,
   Eye,
   FileSpreadsheet,
-  Flashlight,
   Lock,
   MapPin,
   MessageCircle,
@@ -19,9 +16,9 @@ import {
   RotateCcw,
   ScanLine,
   Search,
+  Send,
   Share2,
   ShieldAlert,
-  Upload,
   User,
   Wifi,
   WifiOff,
@@ -29,6 +26,7 @@ import {
 } from 'lucide-react';
 import {
   computeSubscriber3MonthAvgKwh,
+  dispatchReadingToCloudBackground,
   exportCollectorReadingsExcel,
   parseSubscribersExcelFile,
   refreshStationState,
@@ -40,9 +38,15 @@ import {
 } from '../lib/offlineDb';
 import {
   extractMeterReadingFromImage,
-  measureVideoLuminance,
   type MeterOcrResult,
 } from '../lib/meterOcr';
+import {
+  loadLocalMeterPhotos,
+  markLocalMeterPhotosSent,
+  saveLocalMeterPhoto,
+  updateLocalMeterPhotoReading,
+  type LocalMeterPhotoEntry,
+} from '../lib/localMeterPhotos';
 import {
   buildArabicInvoiceMessage,
   compressImageUnder150Kb,
@@ -138,7 +142,6 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const newMeterCameraInputRef = useRef<HTMLInputElement>(null);
   const localExcelInputRef = useRef<HTMLInputElement>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
 
   const [isOnline, setIsOnline] = useState<boolean>(
     typeof navigator !== 'undefined' ? navigator.onLine : true,
@@ -149,24 +152,19 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     state.subscribers[0]?.id ?? '',
   );
 
-  // Ultra-sensitive OCR & Camera State
+  // OCR & Native Camera Capture State
   const [ocrResult, setOcrResult] = useState<MeterOcrResult | null>(null);
   const [extractingReading, setExtractingReading] = useState(false);
-  const [reviewChoice, setReviewChoice] = useState<
-    'pending' | 'confirmed' | 'manual_edit'
-  >('pending');
-  const [manualEditInput, setManualEditInput] = useState('');
+  const [finalReadingInput, setFinalReadingInput] = useState('');
   const [showEnhancedPreview, setShowEnhancedPreview] = useState(false);
 
-  // Auto-Flash & Low-Light Telemetry
-  const [cameraStreamActive, setCameraStreamActive] = useState(false);
-  const [torchActive, setTorchActive] = useState(false);
-  const [torchSupported, setTorchSupported] = useState(false);
-  const [liveLowLight, setLiveLowLight] = useState(false);
-
-  // Proof photo & Billing
+  // Proof photo (IndexedDB local memory) & Billing
   const [proofPhotoUrl, setProofPhotoUrl] = useState<string>('');
   const [proofSizeKb, setProofSizeKb] = useState<number>(0);
+  const [currentPhotoEntryId, setCurrentPhotoEntryId] = useState<string | null>(
+    null,
+  );
+  const [localPhotos, setLocalPhotos] = useState<LocalMeterPhotoEntry[]>([]);
   const [photoStatus, setPhotoStatus] = useState<string | null>(null);
   const [cashPaidInput, setCashPaidInput] = useState('');
   const [validationError, setValidationError] = useState<string | null>(null);
@@ -190,6 +188,9 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
 
   const onUpdateStateRef = useRef(onUpdateState);
   onUpdateStateRef.current = onUpdateState;
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const autoReconnectSyncTriggeredRef = useRef(false);
 
   // Lower-than-previous modal state
   const [lowerModalOpen, setLowerModalOpen] = useState(false);
@@ -202,8 +203,14 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   const [lowerModalError, setLowerModalError] = useState<string | null>(null);
 
   useEffect(() => {
-    const handleOnline = () => setIsOnline(true);
-    const handleOffline = () => setIsOnline(false);
+    const handleOnline = () => {
+      setIsOnline(true);
+      autoReconnectSyncTriggeredRef.current = false;
+    };
+    const handleOffline = () => {
+      setIsOnline(false);
+      autoReconnectSyncTriggeredRef.current = false;
+    };
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
     return () => {
@@ -211,6 +218,17 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       window.removeEventListener('offline', handleOffline);
     };
   }, []);
+
+  // Load saved local meter photos from IndexedDB on station mount
+  useEffect(() => {
+    let active = true;
+    void loadLocalMeterPhotos(state.station.stationId).then((entries) => {
+      if (active) setLocalPhotos(entries);
+    });
+    return () => {
+      active = false;
+    };
+  }, [state.station.stationId]);
 
   // Auto-refresh subscribers and collector assignment from server on mount & every 15s
   useEffect(() => {
@@ -267,36 +285,6 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     }
   };
 
-  // Monitor live video brightness and auto-enable torch in dim environments
-  useEffect(() => {
-    if (!cameraStreamActive) return;
-    const interval = window.setInterval(() => {
-      const video = videoRef.current;
-      if (!video) return;
-      const luma = measureVideoLuminance(video);
-      const isDim = luma < 80;
-      setLiveLowLight(isDim);
-
-      const stream = video.srcObject as MediaStream | null;
-      const track = stream?.getVideoTracks()?.[0];
-      if (!track) return;
-      const caps = track.getCapabilities?.() as
-        | (MediaTrackCapabilities & { torch?: boolean })
-        | undefined;
-      if (caps?.torch) {
-        setTorchSupported(true);
-        if (isDim && !torchActive) {
-          void track
-            .applyConstraints({
-              advanced: [{ torch: true } as MediaTrackConstraintSet],
-            })
-            .then(() => setTorchActive(true))
-            .catch(() => {});
-        }
-      }
-    }, 700);
-    return () => window.clearInterval(interval);
-  }, [cameraStreamActive, torchActive]);
 
   const resolvedCollectorName =
     activeCollector?.name ||
@@ -440,6 +428,44 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     return r + rc + s + al;
   }, [state]);
 
+  // Auto-sync offline pending readings as soon as internet connectivity returns
+  useEffect(() => {
+    if (
+      isOnline &&
+      pendingCount > 0 &&
+      !isSyncing &&
+      !isManagerPreview &&
+      staffToken &&
+      !autoReconnectSyncTriggeredRef.current
+    ) {
+      autoReconnectSyncTriggeredRef.current = true;
+      void onSyncNow().catch(() => {
+        autoReconnectSyncTriggeredRef.current = false;
+      });
+    }
+    if (pendingCount === 0) {
+      autoReconnectSyncTriggeredRef.current = false;
+    }
+  }, [isOnline, pendingCount, isSyncing, isManagerPreview, staffToken, onSyncNow]);
+
+  const currentLocalPhotoEntry = useMemo(() => {
+    if (currentPhotoEntryId) {
+      return localPhotos.find((p) => p.id === currentPhotoEntryId) ?? null;
+    }
+    return null;
+  }, [currentPhotoEntryId, localPhotos]);
+
+  const subscriberSavedPhotos = useMemo(() => {
+    if (!selectedSubscriber) return [];
+    return localPhotos.filter(
+      (p) =>
+        p.subscriberId === selectedSubscriber.id ||
+        p.meterNumber === selectedSubscriber.meterNumber,
+    );
+  }, [localPhotos, selectedSubscriber]);
+
+  const latestSubscriberLocalPhoto = subscriberSavedPhotos[0] ?? null;
+
   const latestSubscriberLocalPhotoReading = useMemo(() => {
     if (!selectedSubscriber) return null;
     return (
@@ -472,12 +498,12 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   const resetReadingWorkspace = () => {
     setOcrResult(null);
     setExtractingReading(false);
-    setReviewChoice('pending');
-    setManualEditInput('');
+    setFinalReadingInput('');
     setShowEnhancedPreview(false);
     setCashPaidInput('');
     setProofPhotoUrl('');
     setProofSizeKb(0);
+    setCurrentPhotoEntryId(null);
     setPhotoStatus(null);
     setValidationError(null);
     setSaveSuccessNotice(null);
@@ -497,6 +523,20 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     resetReadingWorkspace();
   };
 
+  const handleRecapture = () => {
+    setOcrResult(null);
+    setExtractingReading(false);
+    setFinalReadingInput('');
+    setShowEnhancedPreview(false);
+    setProofPhotoUrl('');
+    setProofSizeKb(0);
+    setCurrentPhotoEntryId(null);
+    setPhotoStatus(null);
+    setValidationError(null);
+    setSaveSuccessNotice(null);
+    cameraInputRef.current?.click();
+  };
+
   const avg3MonthsKwh = selectedSubscriber
     ? computeSubscriber3MonthAvgKwh(selectedSubscriber, state.readings)
     : 0;
@@ -508,11 +548,10 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   ) => {
     setExtractingReading(true);
     setOcrResult(null);
-    setReviewChoice('pending');
-    setManualEditInput('');
+    setFinalReadingInput('');
     setValidationError(null);
     setSaveSuccessNotice(null);
-    setPhotoStatus('جاري قراءة العداد...');
+    setPhotoStatus('جاري قص شاشة العداد وتحسين التباين وقراءة الأرقام...');
 
     const result = await extractMeterReadingFromImage({
       imageDataUrl: dataUrl,
@@ -526,101 +565,15 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     setOcrResult(result);
 
     if (!result.accepted || result.reading === null) {
+      setFinalReadingInput('');
       setPhotoStatus(null);
-      setValidationError(
-        result.message || 'لم يتم رصد أرقام عداد واضحة — أعد التصوير أو أدخل القراءة يدوياً.',
-      );
+      setValidationError('تعذرت القراءة الدقيقة، اكتب القراءة يدوياً');
       return;
     }
 
-    setManualEditInput(String(result.reading));
-    setPhotoStatus(`تمت قراءة العداد: ${result.reading}`);
-  };
-
-  const startLiveCamera = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: 'environment',
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-        },
-      });
-      setCameraStreamActive(true);
-      setTorchActive(false);
-      setLiveLowLight(false);
-      setTimeout(() => {
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          void videoRef.current.play();
-        }
-        const track = stream.getVideoTracks()?.[0];
-        const caps = track?.getCapabilities?.() as
-          | (MediaTrackCapabilities & { torch?: boolean })
-          | undefined;
-        setTorchSupported(Boolean(caps?.torch));
-      }, 80);
-    } catch {
-      setPhotoStatus(
-        'تعذر فتح الكاميرا المباشرة في المتصفح — استخدم زر "التقاط / اختيار صورة عداد".',
-      );
-    }
-  };
-
-  const toggleManualTorch = async () => {
-    const stream = videoRef.current?.srcObject as MediaStream | null;
-    const track = stream?.getVideoTracks()?.[0];
-    if (!track || !torchSupported) return;
-    const next = !torchActive;
-    try {
-      await track.applyConstraints({
-        advanced: [{ torch: next } as MediaTrackConstraintSet],
-      });
-      setTorchActive(next);
-    } catch {
-      // ignore unsupported constraint failures
-    }
-  };
-
-  const stopLiveCamera = () => {
-    const stream = videoRef.current?.srcObject as MediaStream | null;
-    stream?.getTracks().forEach((t) => t.stop());
-    setCameraStreamActive(false);
-    setTorchActive(false);
-  };
-
-  const captureFromLiveCamera = async () => {
-    const video = videoRef.current;
-    if (!video || !selectedSubscriber) return;
-
-    const vw = video.videoWidth || 1280;
-    const vh = video.videoHeight || 720;
-    const maxW = 800;
-    const scale = vw > maxW ? maxW / vw : 1;
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.round(vw * scale);
-    canvas.height = Math.round(vh * scale);
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-    let quality = 0.74;
-    let dataUrl = canvas.toDataURL('image/jpeg', quality);
-    let byteLength = Math.round((dataUrl.length * 3) / 4);
-    while (byteLength > 145 * 1024 && quality > 0.3) {
-      quality -= 0.12;
-      dataUrl = canvas.toDataURL('image/jpeg', quality);
-      byteLength = Math.round((dataUrl.length * 3) / 4);
-    }
-    const sizeKb = Number((byteLength / 1024).toFixed(1));
-
-    setProofPhotoUrl(dataUrl);
-    setProofSizeKb(sizeKb);
-    stopLiveCamera();
-    await runAutoMeterExtraction(
-      dataUrl,
-      sizeKb,
-      selectedSubscriber.previousReading,
+    setFinalReadingInput(String(result.reading));
+    setPhotoStatus(
+      `تمت قراءة الأرقام المقترحة: ${result.reading} (نسبة الثقة ${result.confidence}%) — يمكنك التعديل أو الضغط على اعتماد القراءة`,
     );
   };
 
@@ -629,18 +582,36 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   ) => {
     const file = event.target.files?.[0];
     if (!file || !selectedSubscriber) return;
-    setPhotoStatus('جاري قراءة العداد...');
+    setPhotoStatus('جاري حفظ الصورة محلياً وقص منطقة العداد...');
+    setShowEnhancedPreview(false);
     try {
       const compressed = await compressImageUnder150Kb(file);
       setProofPhotoUrl(compressed.dataUrl);
       setProofSizeKb(compressed.sizeKb);
+
+      const photoId = `ph_${Date.now()}_${selectedSubscriber.meterNumber.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+      const updatedPhotos = await saveLocalMeterPhoto({
+        id: photoId,
+        stationId: state.station.stationId,
+        subscriberId: selectedSubscriber.id,
+        subscriberName: selectedSubscriber.subscriberName,
+        meterNumber: selectedSubscriber.meterNumber,
+        collectorName: resolvedCollectorName,
+        capturedAt: new Date().toISOString(),
+        dataUrl: compressed.dataUrl,
+        sizeKb: compressed.sizeKb,
+        sentToManager: false,
+      });
+      setLocalPhotos(updatedPhotos);
+      setCurrentPhotoEntryId(photoId);
+
       await runAutoMeterExtraction(
         compressed.dataUrl,
         compressed.sizeKb,
         selectedSubscriber.previousReading,
       );
     } catch {
-      setPhotoStatus('تعذر قراءة الصورة المختارة.');
+      setPhotoStatus('تعذرت القراءة الدقيقة، اكتب القراءة يدوياً');
     } finally {
       event.target.value = '';
     }
@@ -649,13 +620,18 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   const shareMeterPhotoToManager = async (
     photoDataUrl: string,
     readingValue?: number,
+    photoEntryId?: string | null,
+    meterNumOverride?: string,
+    subNameOverride?: string,
   ) => {
-    if (!photoDataUrl || !selectedSubscriber) return;
-    const safeMeter = selectedSubscriber.meterNumber.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const targetMeter = meterNumOverride || selectedSubscriber?.meterNumber || 'photo';
+    const targetName = subNameOverride || selectedSubscriber?.subscriberName || 'مشترك';
+    if (!photoDataUrl) return;
+    const safeMeter = targetMeter.replace(/[^a-zA-Z0-9_-]/g, '_');
     const filename = `meter_${safeMeter || 'photo'}.jpg`;
     const caption = [
-      `صورة عداد المشترك: ${selectedSubscriber.subscriberName}`,
-      `رقم العداد: ${selectedSubscriber.meterNumber}`,
+      `صورة عداد المشترك: ${targetName}`,
+      `رقم العداد: ${targetMeter}`,
       readingValue !== undefined ? `القراءة: ${readingValue}` : null,
       `المحصّل: ${resolvedCollectorName}`,
     ]
@@ -680,7 +656,14 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
             title: 'صورة عداد الكهرباء',
             text: caption,
           });
-          setPhotoStatus('تم فتح قائمة المشاركة لإرسال صورة العداد إلى مدير المحطة.');
+          if (photoEntryId) {
+            const updated = await markLocalMeterPhotosSent(
+              state.station.stationId,
+              [photoEntryId],
+            );
+            setLocalPhotos(updated);
+          }
+          setPhotoStatus('تم إرسال هذه الصورة لمدير المحطة.');
           return;
         } catch (shareErr) {
           if (
@@ -710,8 +693,103 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       }
     }
 
+    if (photoEntryId) {
+      const updated = await markLocalMeterPhotosSent(state.station.stationId, [
+        photoEntryId,
+      ]);
+      setLocalPhotos(updated);
+    }
+
     setPhotoStatus(
-      'تم حفظ صورة العداد في جهازك ونسخ بيانات المشترك لإرسالها لمدير المحطة عبر واتساب أو تيليجرام.',
+      'تم تجهيز الصورة ونسخ بيانات المشترك لإرسالها للمدير عبر واتساب أو تيليجرام.',
+    );
+  };
+
+  const shareAllSavedPhotosToManager = async () => {
+    const unsent = localPhotos.filter((p) => !p.sentToManager);
+    const targets = unsent.length > 0 ? unsent : localPhotos;
+    if (targets.length === 0) {
+      setPhotoStatus('لا توجد صور محفوظة في الهاتف حالياً.');
+      return;
+    }
+
+    const files: File[] = [];
+    for (const item of targets) {
+      try {
+        const res = await fetch(item.dataUrl);
+        const blob = await res.blob();
+        const safeMeter = item.meterNumber.replace(/[^a-zA-Z0-9_-]/g, '_');
+        files.push(
+          new File([blob], `meter_${safeMeter}_${item.id.slice(-4)}.jpg`, {
+            type: blob.type || 'image/jpeg',
+          }),
+        );
+      } catch {
+        // Skip unreadable entry
+      }
+    }
+
+    const summaryLines = targets
+      .map(
+        (t) =>
+          `• ${t.subscriberName} (عداد ${t.meterNumber})${t.readingValue !== undefined ? `: ${t.readingValue}` : ''}`,
+      )
+      .join('\n');
+    const summaryText = `صور العدادات المحفوظة (${targets.length} صورة) — المحصّل: ${resolvedCollectorName}\n${summaryLines}`;
+
+    if (
+      files.length > 0 &&
+      typeof navigator !== 'undefined' &&
+      typeof navigator.share === 'function' &&
+      (!navigator.canShare || navigator.canShare({ files }))
+    ) {
+      try {
+        await navigator.share({
+          files,
+          title: `صور العدادات (${files.length})`,
+          text: summaryText,
+        });
+        const updated = await markLocalMeterPhotosSent(
+          state.station.stationId,
+          targets.map((t) => t.id),
+        );
+        setLocalPhotos(updated);
+        setPhotoStatus(`تم إرسال ${targets.length} صورة محفوظة للمدير دفعة واحدة.`);
+        return;
+      } catch (shareErr) {
+        if (shareErr instanceof Error && shareErr.name === 'AbortError') {
+          return;
+        }
+      }
+    }
+
+    // Fallback: download each saved photo & copy batch summary
+    for (let i = 0; i < targets.length; i++) {
+      const item = targets[i];
+      const safeMeter = item.meterNumber.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const link = document.createElement('a');
+      link.href = item.dataUrl;
+      link.download = `meter_${safeMeter}_${i + 1}.jpg`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(summaryText);
+      } catch {
+        // Clipboard optional
+      }
+    }
+
+    const updated = await markLocalMeterPhotosSent(
+      state.station.stationId,
+      targets.map((t) => t.id),
+    );
+    setLocalPhotos(updated);
+    setPhotoStatus(
+      `تم تجهيز ${targets.length} صورة محفوظة ونسخ الكشف لإرسالها للمدير دفعة واحدة.`,
     );
   };
 
@@ -788,20 +866,16 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
 
   const prevReading = selectedSubscriber?.previousReading ?? 0;
   const ocrOriginalReading = ocrResult?.accepted ? ocrResult.reading : null;
-  const parsedManualEdit = Number(manualEditInput);
+  const parsedFinalInput = Number(finalReadingInput);
 
   const activeFinalReading: number | null =
-    reviewChoice === 'confirmed'
-      ? ocrOriginalReading
-      : reviewChoice === 'manual_edit' &&
-          manualEditInput.trim() !== '' &&
-          Number.isFinite(parsedManualEdit) &&
-          parsedManualEdit >= 0
-        ? Math.round(parsedManualEdit * 100) / 100
-        : null;
+    finalReadingInput.trim() !== '' &&
+    Number.isFinite(parsedFinalInput) &&
+    parsedFinalInput >= 0
+      ? Math.round(parsedFinalInput * 100) / 100
+      : null;
 
   const isManuallyEdited =
-    reviewChoice === 'manual_edit' &&
     ocrOriginalReading !== null &&
     activeFinalReading !== null &&
     activeFinalReading !== ocrOriginalReading;
@@ -919,7 +993,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       activeCollector?.id ?? collectorAccess?.code ?? state.station.ownerUid;
 
     const isManualWithoutOcr =
-      reviewChoice === 'manual_edit' && ocrOriginalReading === null;
+      ocrOriginalReading === null && activeFinalReading !== null;
     const effectivePhoto = options?.overridePhotoUrl || proofPhotoUrl;
     const effectiveKb = options?.overridePhotoKb || proofSizeKb;
 
@@ -1137,8 +1211,9 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       ? debtAfterCashOnly
       : remainingBalanceYer;
 
+    let createdReceipt: PaymentReceipt | undefined;
     if (cashPaidYer > 0 && permissions.canCollectCash) {
-      const newReceipt: PaymentReceipt = {
+      createdReceipt = {
         id: sanitizeFirestoreId(`rc_${Date.now()}`),
         subscriberId: selectedSubscriber.id,
         meterNumber: selectedSubscriber.meterNumber,
@@ -1151,7 +1226,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         paidAt: now,
         syncStatus: 'pending',
       };
-      nextReceipts.unshift(newReceipt);
+      nextReceipts.unshift(createdReceipt);
     }
 
     const updatedSubscribers = state.subscribers.map((s) => {
@@ -1177,12 +1252,58 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       };
     });
 
-    onUpdateState({
+    const updatedSubRecord = updatedSubscribers.find(
+      (s) => s.id === selectedSubscriber.id,
+    );
+
+    const nextLocalState: StationLocalState = {
       ...state,
       subscribers: updatedSubscribers,
       readings: [newReading, ...state.readings],
       receipts: nextReceipts,
       alerts: [...syncedAlerts, ...(state.alerts ?? [])],
+    };
+
+    onUpdateState(nextLocalState);
+
+    // Keep meter photo permanently in IndexedDB and attach the approved reading value
+    if (currentPhotoEntryId) {
+      void updateLocalMeterPhotoReading(
+        state.station.stationId,
+        currentPhotoEntryId,
+        activeFinalReading,
+      ).then(setLocalPhotos);
+    }
+
+    // Immediate non-blocking background dispatch (number + meterNumber + recordedAt ONLY, zero photo)
+    void dispatchReadingToCloudBackground({
+      stationId: state.station.stationId,
+      staffToken,
+      reading: newReading,
+      subscriber: updatedSubRecord,
+      receipt: createdReceipt,
+      alerts: syncedAlerts,
+    }).then((didSync) => {
+      if (!didSync) return;
+      const latest = stateRef.current;
+      onUpdateStateRef.current({
+        ...latest,
+        readings: latest.readings.map((r) =>
+          r.id === readingId ? { ...r, syncStatus: 'synced' as const } : r,
+        ),
+        subscribers: latest.subscribers.map((s) =>
+          s.id === selectedSubscriber.id
+            ? { ...s, syncStatus: 'synced' as const }
+            : s,
+        ),
+        receipts: createdReceipt
+          ? latest.receipts.map((rc) =>
+              rc.id === createdReceipt.id
+                ? { ...rc, syncStatus: 'synced' as const }
+                : rc,
+            )
+          : latest.receipts,
+      });
     });
 
     setCashPaidInput('');
@@ -1193,7 +1314,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
           ? ` وتم تسجيل وخصم سند القبض (${formatYer(cashPaidYer)}).`
           : '';
       setSaveSuccessNotice(
-        'تم حفظ القراءة محلياً وإرسال تنبيه أحمر فوري لمدير المحطة لعدم تطابق الصورة مع الرقم.' +
+        'تم اعتماد القراءة محلياً وإرسال تنبيه أحمر فوري لمدير المحطة لعدم تطابق الصورة مع الرقم.' +
           cashNote,
       );
       setSavedInvoiceText(null);
@@ -1215,15 +1336,15 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     }
 
     setSaveSuccessNotice(
-      isClosedHouseZero
-        ? 'تم حفظ القراءة بنجاح (بيت مغلق) — الصورة محفوظة بهاتفك والنصوص متزامنة.'
-        : isHighConsumptionWarning
-          ? 'تم حفظ القراءة وإرسال تنبيه للمدير بسبب ارتفاع الاستهلاك.'
-          : cashPaidYer > 0
-            ? `تم حفظ القراءة وسند القبض (${formatYer(cashPaidYer)}). المتبقي: ${formatYer(remainingBalanceYer)}.`
-            : aiVerificationStatus === 'matched'
-              ? 'تم التحقق بالذكاء الاصطناعي (Gemini Vision-AI) وحفظ القراءة بنجاح.'
-              : 'تم حفظ القراءة بنجاح (الصورة محفوظة بذاكرة الهاتف فقط).',
+      isOnline
+        ? isClosedHouseZero
+          ? 'تم اعتماد القراءة (بيت مغلق) وإرسال الأرقام في الخلفية — الصورة محفوظة بهاتفك.'
+          : isHighConsumptionWarning
+            ? 'تم اعتماد القراءة وإرسال الأرقام وتنبيه ارتفاع الاستهلاك للمدير.'
+            : cashPaidYer > 0
+              ? `تم اعتماد القراءة وسند القبض (${formatYer(cashPaidYer)}) وإرسال الأرقام في الخلفية. المتبقي: ${formatYer(remainingBalanceYer)}.`
+              : 'تم اعتماد القراءة وإرسالها إلى السحابة في الخلفية — الصورة محفوظة في هاتفك.'
+        : 'تم حفظ القراءة والصورة محلياً في الهاتف — ستُرسل القراءة تلقائياً فور عودة الإنترنت.',
     );
 
     if (permissions.canSendInvoices) {
@@ -1267,21 +1388,15 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     if (!permissions.canRecordReadings) return;
 
     if (!proofPhotoUrl) {
-      setValidationError('يرجى تصوير العداد أو إرفاق صورة العداد أولاً.');
+      setValidationError('يرجى التقاط صورة العداد أولاً.');
       return;
     }
     if (extractingReading) {
       setValidationError('يرجى الانتظار حتى تكتمل قراءة العداد.');
       return;
     }
-    if (reviewChoice === 'pending') {
-      setValidationError(
-        'يرجى تأكيد القراءة أو اختيار الإدخال اليدوي قبل الحفظ.',
-      );
-      return;
-    }
     if (activeFinalReading === null) {
-      setValidationError('يرجى إدخال قيمة رقمية صحيحة للقراءة.');
+      setValidationError('تعذرت القراءة الدقيقة، اكتب القراءة يدوياً');
       return;
     }
     setValidationError(null);
@@ -1676,17 +1791,15 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                   {permissions.canRecordReadings && (
                     <div className="space-y-3">
                       <div className="relative h-56 rounded-xl bg-slate-900 overflow-hidden flex items-center justify-center border border-slate-800">
-                        {cameraStreamActive ? (
-                          <video
-                            ref={videoRef}
-                            playsInline
-                            muted
-                            className="w-full h-full object-cover"
-                          />
-                        ) : showEnhancedPreview && ocrResult?.zoomedBwPreviewUrl ? (
+                        {showEnhancedPreview &&
+                        (ocrResult?.enhancedPreviewUrl ||
+                          ocrResult?.zoomedBwPreviewUrl) ? (
                           <img
-                            src={ocrResult.zoomedBwPreviewUrl}
-                            alt="معاينة الصورة المكبّرة"
+                            src={
+                              ocrResult.enhancedPreviewUrl ||
+                              ocrResult.zoomedBwPreviewUrl
+                            }
+                            alt="منطقة شاشة العداد المقصوصة والمحسّنة"
                             referrerPolicy="no-referrer"
                             className="w-full h-full object-contain bg-white"
                           />
@@ -1701,108 +1814,85 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                           <div className="text-center px-4 space-y-2">
                             <ScanLine className="w-8 h-8 text-teal-400 mx-auto" />
                             <p className="text-xs text-slate-200 font-medium">
-                              التقط صورة العداد أو افتح الكاميرا المباشرة
+                              التقط صورة العداد كاملة كما هي لقراءة الأرقام تلقائياً
                             </p>
                           </div>
                         )}
 
-                        {cameraStreamActive && (
-                          <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-                            <div className="w-64 h-24 border-2 border-teal-400 rounded-lg shadow-[0_0_0_9999px_rgba(15,23,42,0.38)]" />
-                          </div>
-                        )}
-
-                        {cameraStreamActive && liveLowLight && (
-                          <div className="absolute top-3 right-3 bg-amber-500/95 text-slate-950 text-[11px] font-bold px-2.5 py-1 rounded-md inline-flex items-center gap-1.5">
-                            <Flashlight className="w-3.5 h-3.5" />
-                            {torchActive ? 'الفلاش مُفعّل' : 'إضاءة منخفضة'}
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="flex flex-wrap items-center gap-2.5">
-                        {!cameraStreamActive ? (
-                          <button
-                            type="button"
-                            onClick={startLiveCamera}
-                            className="min-h-[44px] px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium rounded-lg inline-flex items-center gap-2 cursor-pointer"
+                        {proofPhotoUrl && (
+                          <div
+                            className={`absolute top-2.5 right-2.5 px-2.5 py-1 rounded-md text-[11px] font-bold shadow-sm ${
+                              currentLocalPhotoEntry?.sentToManager
+                                ? 'bg-emerald-600 text-white'
+                                : 'bg-amber-400 text-slate-950'
+                            }`}
                           >
-                            <Camera className="w-4 h-4" />
-                            فتح الكاميرا المباشرة
-                          </button>
-                        ) : (
-                          <>
+                            {currentLocalPhotoEntry?.sentToManager
+                              ? 'تم إرسالها للمدير'
+                              : 'محفوظة في الهاتف'}
+                          </div>
+                        )}
+
+                        {proofPhotoUrl &&
+                          (ocrResult?.enhancedPreviewUrl ||
+                            ocrResult?.zoomedBwPreviewUrl) && (
                             <button
                               type="button"
-                              onClick={captureFromLiveCamera}
-                              className="min-h-[44px] px-4 py-2 bg-teal-700 hover:bg-teal-800 text-white text-xs font-medium rounded-lg inline-flex items-center gap-2 cursor-pointer"
+                              onClick={() => setShowEnhancedPreview((v) => !v)}
+                              className="absolute bottom-2.5 left-2.5 px-2.5 py-1 rounded-md bg-slate-950/80 hover:bg-slate-900 text-white text-[11px] font-medium inline-flex items-center gap-1 cursor-pointer"
                             >
-                              <Camera className="w-4 h-4" />
-                              التقاط وقراءة الرقم
+                              <Eye className="w-3.5 h-3.5 text-teal-300" />
+                              {showEnhancedPreview
+                                ? 'الصورة الأصلية'
+                                : 'المنطقة المقصوصة'}
                             </button>
-                            {torchSupported && (
-                              <button
-                                type="button"
-                                onClick={() => void toggleManualTorch()}
-                                className={`min-h-[44px] px-3.5 py-2 text-xs font-medium rounded-lg border inline-flex items-center gap-1.5 cursor-pointer ${
-                                  torchActive
-                                    ? 'bg-amber-100 border-amber-400 text-amber-900'
-                                    : 'bg-white border-slate-300 text-slate-700'
-                                }`}
-                              >
-                                <Flashlight className="w-4 h-4" />
-                                {torchActive ? 'إطفاء الفلاش' : 'تشغيل الفلاش'}
-                              </button>
-                            )}
-                          </>
-                        )}
+                          )}
+                      </div>
 
-                        <input
-                          ref={cameraInputRef}
-                          type="file"
-                          accept="image/*"
-                          capture="environment"
-                          onChange={handlePhotoUpload}
-                          className="hidden"
-                        />
+                      <input
+                        ref={cameraInputRef}
+                        type="file"
+                        accept="image/*"
+                        capture="environment"
+                        onChange={handlePhotoUpload}
+                        className="hidden"
+                      />
+
+                      {!proofPhotoUrl ? (
                         <button
                           type="button"
                           onClick={() => cameraInputRef.current?.click()}
-                          className="min-h-[44px] px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 text-xs font-medium rounded-lg inline-flex items-center gap-2 cursor-pointer"
+                          className="w-full min-h-[46px] px-4 py-2.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-lg inline-flex items-center justify-center gap-2 cursor-pointer"
                         >
-                          <Upload className="w-4 h-4" />
-                          التقاط / اختيار صورة عداد
+                          <Camera className="w-4 h-4" />
+                          التقط صورة العداد
                         </button>
-
-                        {ocrResult?.zoomedBwPreviewUrl && (
-                          <button
-                            type="button"
-                            onClick={() => setShowEnhancedPreview((v) => !v)}
-                            className="min-h-[44px] px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
-                          >
-                            <Eye className="w-4 h-4 text-teal-700" />
-                            {showEnhancedPreview
-                              ? 'الصورة الأصلية'
-                              : 'تكبير الأرقام'}
-                          </button>
-                        )}
-
-                        {proofPhotoUrl && (
+                      ) : (
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                           <button
                             type="button"
                             onClick={() =>
                               void shareMeterPhotoToManager(
                                 proofPhotoUrl,
-                                ocrResult?.reading ?? undefined,
+                                activeFinalReading ?? undefined,
+                                currentPhotoEntryId,
                               )
                             }
-                            className="min-h-[44px] px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                            className="min-h-[44px] px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
                           >
-                            <Share2 className="w-4 h-4" />
-                            مشاركة صورة العداد لمدير المحطة
+                            <Share2 className="w-4 h-4 shrink-0" />
+                            إرسال هذه الصورة للمدير
                           </button>
-                        )}
-                      </div>
+                          <button
+                            type="button"
+                            onClick={() => void shareAllSavedPhotosToManager()}
+                            className="min-h-[44px] px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                          >
+                            <Send className="w-4 h-4 shrink-0" />
+                            إرسال كل الصور المحفوظة دفعة واحدة
+                          </button>
+                        </div>
+                      )}
 
                       {photoStatus && (
                         <p className="text-xs text-teal-900 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2 font-medium">
@@ -1810,183 +1900,167 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                         </p>
                       )}
 
-                      {!proofPhotoUrl && latestSubscriberLocalPhotoReading?.photoUrl && (
-                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-50 border border-slate-200 rounded-xl p-3">
+                      {!proofPhotoUrl && latestSubscriberLocalPhoto && (
+                        <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2.5">
                           <div className="flex items-center gap-3">
                             <img
-                              src={latestSubscriberLocalPhotoReading.photoUrl}
+                              src={latestSubscriberLocalPhoto.dataUrl}
                               alt={`آخر صورة محفوظة للعداد ${selectedSubscriber.meterNumber}`}
                               className="w-14 h-14 rounded-lg object-cover border border-slate-300 shrink-0"
                             />
-                            <div className="space-y-1">
+                            <div className="space-y-1 min-w-0">
                               <div className="flex flex-wrap items-center gap-2">
-                                <span className="text-[11px] font-bold bg-teal-100 text-teal-900 px-2 py-0.5 rounded">
-                                  محفوظة محلياً بهاتفك فقط
+                                <span
+                                  className={`text-[11px] font-bold px-2 py-0.5 rounded ${
+                                    latestSubscriberLocalPhoto.sentToManager
+                                      ? 'bg-emerald-100 text-emerald-900'
+                                      : 'bg-amber-100 text-amber-900'
+                                  }`}
+                                >
+                                  {latestSubscriberLocalPhoto.sentToManager
+                                    ? 'تم إرسالها للمدير'
+                                    : 'محفوظة في الهاتف'}
                                 </span>
-                                <span className="text-xs font-mono-nums font-bold text-slate-800">
-                                  القراءة: {latestSubscriberLocalPhotoReading.currentReading}
-                                </span>
+                                {latestSubscriberLocalPhoto.readingValue !==
+                                  undefined && (
+                                  <span className="text-xs font-mono-nums font-bold text-slate-800">
+                                    القراءة:{' '}
+                                    {latestSubscriberLocalPhoto.readingValue}
+                                  </span>
+                                )}
                               </div>
-                              <div className="text-[11px] text-slate-500">
+                              <div className="text-[11px] text-slate-500 truncate">
                                 {new Date(
-                                  latestSubscriberLocalPhotoReading.recordedAt,
-                                ).toLocaleString('ar-YE')}
+                                  latestSubscriberLocalPhoto.capturedAt,
+                                ).toLocaleString('ar-YE')}{' '}
+                                · {latestSubscriberLocalPhoto.collectorName}
                               </div>
                             </div>
                           </div>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              void shareMeterPhotoToManager(
-                                latestSubscriberLocalPhotoReading.photoUrl,
-                                latestSubscriberLocalPhotoReading.currentReading,
-                              )
-                            }
-                            className="min-h-[40px] px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold rounded-lg inline-flex items-center justify-center gap-1.5 shrink-0 cursor-pointer"
-                          >
-                            <Share2 className="w-4 h-4" />
-                            مشاركة صورة العداد لمدير المحطة
-                          </button>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void shareMeterPhotoToManager(
+                                  latestSubscriberLocalPhoto.dataUrl,
+                                  latestSubscriberLocalPhoto.readingValue,
+                                  latestSubscriberLocalPhoto.id,
+                                  latestSubscriberLocalPhoto.meterNumber,
+                                  latestSubscriberLocalPhoto.subscriberName,
+                                )
+                              }
+                              className="min-h-[40px] px-3 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                            >
+                              <Share2 className="w-3.5 h-3.5 shrink-0" />
+                              إرسال هذه الصورة للمدير
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void shareAllSavedPhotosToManager()}
+                              className="min-h-[40px] px-3 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                            >
+                              <Send className="w-3.5 h-3.5 shrink-0" />
+                              إرسال كل الصور المحفوظة دفعة واحدة
+                            </button>
+                          </div>
                         </div>
                       )}
 
-                      {ocrResult && !ocrResult.accepted && reviewChoice !== 'manual_edit' && (
-                        <div className="flex flex-wrap items-center justify-between gap-2 bg-rose-50 border border-rose-200 rounded-lg p-3">
-                          <span className="text-xs text-rose-800 font-medium">
-                            {ocrResult.message || 'لم يتم رصد أرقام عداد واضحة في الصورة.'}
-                          </span>
-                          <div className="flex items-center gap-2">
-                            <button
-                              type="button"
-                              onClick={() => cameraInputRef.current?.click()}
-                              className="px-3 py-1.5 text-xs font-bold bg-rose-700 hover:bg-rose-800 text-white rounded-md inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
-                            >
-                              <RotateCcw className="w-3.5 h-3.5" />
-                              إعادة التصوير
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setReviewChoice('manual_edit');
-                                setManualEditInput('');
-                                setValidationError(null);
-                              }}
-                              className="px-3 py-1.5 text-xs font-bold bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 rounded-md inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
-                            >
-                              <Edit3 className="w-3.5 h-3.5" />
-                              إدخال يدوي
-                            </button>
+                      {!proofPhotoUrl &&
+                        !latestSubscriberLocalPhoto &&
+                        latestSubscriberLocalPhotoReading?.photoUrl && (
+                          <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2.5">
+                            <div className="flex items-center gap-3">
+                              <img
+                                src={latestSubscriberLocalPhotoReading.photoUrl}
+                                alt={`آخر صورة محفوظة للعداد ${selectedSubscriber.meterNumber}`}
+                                className="w-14 h-14 rounded-lg object-cover border border-slate-300 shrink-0"
+                              />
+                              <div className="space-y-1">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="text-[11px] font-bold bg-amber-100 text-amber-900 px-2 py-0.5 rounded">
+                                    محفوظة في الهاتف
+                                  </span>
+                                  <span className="text-xs font-mono-nums font-bold text-slate-800">
+                                    القراءة:{' '}
+                                    {
+                                      latestSubscriberLocalPhotoReading.currentReading
+                                    }
+                                  </span>
+                                </div>
+                                <div className="text-[11px] text-slate-500">
+                                  {new Date(
+                                    latestSubscriberLocalPhotoReading.recordedAt,
+                                  ).toLocaleString('ar-YE')}
+                                </div>
+                              </div>
+                            </div>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void shareMeterPhotoToManager(
+                                    latestSubscriberLocalPhotoReading.photoUrl,
+                                    latestSubscriberLocalPhotoReading.currentReading,
+                                  )
+                                }
+                                className="min-h-[40px] px-3 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                              >
+                                <Share2 className="w-3.5 h-3.5 shrink-0" />
+                                إرسال هذه الصورة للمدير
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void shareAllSavedPhotosToManager()
+                                }
+                                className="min-h-[40px] px-3 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                              >
+                                <Send className="w-3.5 h-3.5 shrink-0" />
+                                إرسال كل الصور المحفوظة دفعة واحدة
+                              </button>
+                            </div>
                           </div>
+                        )}
+
+                      {ocrResult && !ocrResult.accepted && (
+                        <div className="bg-rose-50 border border-rose-200 rounded-lg px-3.5 py-2.5 text-xs text-rose-800 font-bold">
+                          تعذرت القراءة الدقيقة، اكتب القراءة يدوياً
                         </div>
                       )}
                     </div>
                   )}
 
-                  {/* OCR Review, Confirm or Manual Edit + Cash Receipt Form */}
+                  {/* Editable Final Reading + Cash Receipt Form */}
                   <form onSubmit={handleSaveFormSubmit} className="space-y-4">
-                    {((ocrResult?.accepted && ocrOriginalReading !== null) ||
-                      (proofPhotoUrl && reviewChoice === 'manual_edit')) && (
-                      <div className="border border-teal-200 bg-teal-50/50 rounded-xl p-4 space-y-3">
-                        {ocrResult?.accepted && ocrOriginalReading !== null && (
-                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                            <div>
-                              <div className="text-xs font-medium text-slate-600">
-                                الرقم المقروء من العداد
-                              </div>
-                              <div className="text-2xl font-bold font-mono-nums text-slate-900 mt-0.5">
-                                {ocrOriginalReading}
-                              </div>
-                            </div>
-                            <div className="flex flex-wrap items-center gap-2">
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setReviewChoice('confirmed');
-                                  setValidationError(null);
-                                }}
-                                className={`min-h-[42px] px-4 py-2 text-xs font-bold rounded-lg inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
-                                  reviewChoice === 'confirmed'
-                                    ? 'bg-teal-700 text-white'
-                                    : 'bg-white border border-teal-300 text-teal-900 hover:bg-teal-50'
-                                }`}
-                              >
-                                <Check className="w-4 h-4" />
-                                تأكيد القراءة
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setReviewChoice('manual_edit');
-                                  setManualEditInput(String(ocrOriginalReading));
-                                  setValidationError(null);
-                                }}
-                                className={`min-h-[42px] px-4 py-2 text-xs font-bold rounded-lg inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
-                                  reviewChoice === 'manual_edit'
-                                    ? 'bg-amber-600 text-white'
-                                    : 'bg-white border border-amber-300 text-amber-900 hover:bg-amber-50'
-                                }`}
-                              >
-                                <Edit3 className="w-4 h-4" />
-                                تعديل يدوي
-                              </button>
-                            </div>
-                          </div>
-                        )}
-
-                        {reviewChoice === 'manual_edit' && (
-                          <div className="bg-white border border-amber-300 rounded-lg p-3 space-y-2">
-                            <label className="block text-xs font-bold text-amber-900">
-                              {ocrOriginalReading !== null
-                                ? 'أدخل القراءة المعدلة يدوياً:'
-                                : 'أدخل قراءة العداد يدوياً:'}
-                            </label>
-                            <input
-                              type="number"
-                              step="0.01"
-                              min={0}
-                              value={manualEditInput}
-                              onChange={(e) =>
-                                setManualEditInput(e.target.value)
-                              }
-                              placeholder="أدخل رقم القراءة"
-                              className="w-full min-h-[48px] px-3.5 py-2.5 text-lg sm:text-xl font-bold font-mono-nums border border-amber-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-500"
-                            />
-                            {isManuallyEdited && activeFinalReading !== null && (
-                              <p className="text-[11px] text-slate-600 font-medium">
-                                الأصلي ({ocrOriginalReading}) ← المدخل ({activeFinalReading})
-                              </p>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    )}
-
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                       {permissions.canRecordReadings && (
                         <div>
-                          <label className="flex items-center gap-1.5 text-xs font-medium text-slate-700 mb-1">
-                            <Lock className="w-3.5 h-3.5 text-teal-700" />
+                          <label className="block text-xs font-medium text-slate-700 mb-1">
                             القراءة النهائية المعتمدة
                           </label>
-                          <div className="w-full min-h-[46px] px-3 py-2 text-base font-bold font-mono-nums border border-slate-300 bg-slate-100 text-slate-900 rounded-lg flex items-center justify-between">
-                            <span>
-                              {extractingReading
-                                ? 'جاري القراءة...'
-                                : activeFinalReading !== null
-                                  ? activeFinalReading
-                                  : ocrResult?.accepted
-                                    ? 'اختر تأكيد أو تعديل أعلاه'
-                                    : '—'}
-                            </span>
-                            {(reviewChoice === 'confirmed' ||
-                              reviewChoice === 'manual_edit') && (
-                              <span className="text-[11px] font-sans font-medium text-teal-800">
-                                {reviewChoice === 'manual_edit'
-                                  ? 'إدخال يدوي'
-                                  : 'مؤكدة'}
-                              </span>
-                            )}
-                          </div>
+                          <input
+                            type="number"
+                            inputMode="numeric"
+                            step="any"
+                            min={0}
+                            value={finalReadingInput}
+                            onChange={(e) =>
+                              setFinalReadingInput(e.target.value)
+                            }
+                            disabled={extractingReading}
+                            placeholder={
+                              extractingReading
+                                ? 'جاري قراءة العداد...'
+                                : 'اكتب أو عدّل القراءة يدوياً'
+                            }
+                            className="w-full min-h-[48px] px-3.5 py-2.5 text-lg sm:text-xl font-bold font-mono-nums placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg bg-white text-slate-900 focus:outline-none focus:ring-2 focus:ring-teal-600 disabled:bg-slate-100"
+                          />
+                          {isManuallyEdited && activeFinalReading !== null && (
+                            <p className="text-[11px] text-slate-600 font-medium mt-1">
+                              المقروء آلياً ({ocrOriginalReading}) ← المعتمد حالياً ({activeFinalReading})
+                            </p>
+                          )}
                         </div>
                       )}
 
@@ -2119,37 +2193,47 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                       )}
                     </div>
 
-                    <button
-                      type="submit"
-                      disabled={
-                        extractingReading ||
-                        verifyingWithAi ||
-                        !(
-                          (permissions.canCollectCash &&
-                            cashPaidYer > 0 &&
-                            !proofPhotoUrl &&
-                            activeFinalReading === null) ||
-                          (permissions.canRecordReadings &&
-                            Boolean(proofPhotoUrl) &&
-                            reviewChoice !== 'pending' &&
-                            activeFinalReading !== null)
-                        )
-                      }
-                      className="w-full min-h-[48px] py-3 px-4 bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 disabled:text-slate-600 text-white text-sm font-bold rounded-lg transition-colors cursor-pointer"
-                    >
-                      {extractingReading
-                        ? 'جاري قراءة العداد...'
-                        : verifyingWithAi
-                          ? 'جاري مطابقة الصورة عبر Gemini Vision-AI...'
-                          : permissions.canCollectCash &&
-                              cashPaidYer > 0 &&
-                              !proofPhotoUrl &&
-                              activeFinalReading === null
-                            ? `حفظ سند القبض وخصمه (${formatCompactYer(cashPaidYer)})`
-                            : isLowerThanPrev
-                              ? 'متابعة وتحديد سبب نقص القراءة'
-                              : `حفظ القراءة ${cashPaidYer > 0 && permissions.canCollectCash ? 'وسند القبض ' : ''}أوفلاين`}
-                    </button>
+                    {permissions.canCollectCash &&
+                    cashPaidYer > 0 &&
+                    !proofPhotoUrl &&
+                    activeFinalReading === null ? (
+                      <button
+                        type="submit"
+                        disabled={extractingReading || verifyingWithAi}
+                        className="w-full min-h-[48px] py-3 px-4 bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 disabled:text-slate-600 text-white text-sm font-bold rounded-lg transition-colors cursor-pointer"
+                      >
+                        {`حفظ سند القبض وخصمه (${formatCompactYer(cashPaidYer)})`}
+                      </button>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-3">
+                        <button
+                          type="button"
+                          onClick={handleRecapture}
+                          disabled={extractingReading || verifyingWithAi}
+                          className="min-h-[48px] py-3 px-4 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-50 text-slate-800 text-sm font-bold rounded-lg transition-colors inline-flex items-center justify-center gap-2 cursor-pointer"
+                        >
+                          <RotateCcw className="w-4 h-4" />
+                          إعادة التقاط
+                        </button>
+                        <button
+                          type="submit"
+                          disabled={
+                            extractingReading ||
+                            verifyingWithAi ||
+                            !permissions.canRecordReadings ||
+                            !proofPhotoUrl ||
+                            activeFinalReading === null
+                          }
+                          className="min-h-[48px] py-3 px-4 bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 disabled:text-slate-600 text-white text-sm font-bold rounded-lg transition-colors inline-flex items-center justify-center gap-2 cursor-pointer"
+                        >
+                          {extractingReading
+                            ? 'جاري القراءة...'
+                            : verifyingWithAi
+                              ? 'جاري المطابقة...'
+                              : 'اعتماد القراءة'}
+                        </button>
+                      </div>
+                    )}
                   </form>
 
                   {savedInvoiceText && permissions.canSendInvoices && (

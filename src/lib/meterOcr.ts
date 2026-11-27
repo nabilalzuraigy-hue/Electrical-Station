@@ -38,7 +38,7 @@ async function getOfflineOcrWorker(): Promise<Worker> {
     workerPromise = (async () => {
       const worker = await createWorker('eng');
       await worker.setParameters({
-        tessedit_char_whitelist: '0123456789.',
+        tessedit_char_whitelist: '0123456789',
         tessedit_pageseg_mode: PSM.SINGLE_LINE,
       });
       cachedWorker = worker;
@@ -46,26 +46,6 @@ async function getOfflineOcrWorker(): Promise<Worker> {
     })();
   }
   return workerPromise;
-}
-
-/**
- * Measures average luminance (0..255) from a live video stream frame
- * so the collector camera can automatically trigger the torch in dim light.
- */
-export function measureVideoLuminance(video: HTMLVideoElement): number {
-  if (!video.videoWidth || !video.videoHeight) return 128;
-  const canvas = document.createElement('canvas');
-  canvas.width = 48;
-  canvas.height = 36;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) return 128;
-  ctx.drawImage(video, 0, 0, 48, 36);
-  const { data } = ctx.getImageData(0, 0, 48, 36);
-  let sum = 0;
-  for (let i = 0; i < data.length; i += 4) {
-    sum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-  }
-  return Math.round(sum / (data.length / 4));
 }
 
 function applyFastContrastAndSharpen(
@@ -280,18 +260,19 @@ export async function preprocessMeterImageVariants(
   const enhancedFullCanvas = grayBufferToCanvas(enhancedGray, w, h);
   const enhancedFullDataUrl = enhancedFullCanvas.toDataURL('image/jpeg', 0.85);
 
-  const cropX = Math.round(w * 0.08);
-  const cropY = Math.round(h * 0.2);
-  const cropW = Math.max(60, Math.round(w * 0.84));
-  const cropH = Math.max(40, Math.round(h * 0.6));
-  const zoomW = Math.min(760, Math.round(cropW * 1.5));
-  const zoomH = Math.min(480, Math.round(cropH * 1.5));
+  const cropX = Math.round(w * 0.12);
+  const cropY = Math.round(h * 0.24);
+  const cropW = Math.max(64, Math.round(w * 0.76));
+  const cropH = Math.max(44, Math.round(h * 0.52));
+  const zoomW = Math.min(920, Math.round(cropW * 2));
+  const zoomH = Math.min(560, Math.round(cropH * 2));
 
   const zoomedGrayCanvas = document.createElement('canvas');
   zoomedGrayCanvas.width = zoomW;
   zoomedGrayCanvas.height = zoomH;
   const zCtx = zoomedGrayCanvas.getContext('2d', { willReadFrequently: true });
   let zoomedBwCanvas = zoomedGrayCanvas;
+  let enhancedCroppedDataUrl = enhancedFullDataUrl;
   if (zCtx) {
     zCtx.imageSmoothingEnabled = true;
     zCtx.drawImage(
@@ -306,18 +287,23 @@ export async function preprocessMeterImageVariants(
       zoomH,
     );
     const zPixels = zCtx.getImageData(0, 0, zoomW, zoomH).data;
-    const zGray = new Uint8ClampedArray(zoomW * zoomH);
-    for (let i = 0; i < zGray.length; i++) {
-      zGray[i] = zPixels[i * 4];
+    const zGrayRaw = new Uint8ClampedArray(zoomW * zoomH);
+    for (let i = 0; i < zGrayRaw.length; i++) {
+      zGrayRaw[i] = zPixels[i * 4];
     }
-    const zBw = computeAdaptiveBinary(zGray, zoomW, zoomH, 0.14);
+    const zGrayEnhanced = applyFastContrastAndSharpen(zGrayRaw, zoomW, zoomH);
+    const zEnhancedCanvas = grayBufferToCanvas(zGrayEnhanced, zoomW, zoomH);
+    enhancedCroppedDataUrl = zEnhancedCanvas.toDataURL('image/jpeg', 0.88);
+    zCtx.drawImage(zEnhancedCanvas, 0, 0);
+
+    const zBw = computeAdaptiveBinary(zGrayEnhanced, zoomW, zoomH, 0.14);
     zoomedBwCanvas = grayBufferToCanvas(zBw, zoomW, zoomH);
   }
-  const zoomedBwDataUrl = zoomedBwCanvas.toDataURL('image/jpeg', 0.86);
+  const zoomedBwDataUrl = zoomedBwCanvas.toDataURL('image/jpeg', 0.88);
 
   return {
     enhancedFullCanvas,
-    enhancedFullDataUrl,
+    enhancedFullDataUrl: enhancedCroppedDataUrl,
     zoomedGrayCanvas,
     zoomedBwCanvas,
     zoomedBwDataUrl,
@@ -329,14 +315,16 @@ function selectBestMeterNumber(
   rawText: string,
   previousReading: number,
 ): number | null {
+  // Digits 0-9 only: strip any words/letters like kWh or company labels
   const normalized = rawText
     .replace(/[٠-٩]/g, (d) => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)))
-    .replace(/,/g, '.')
-    .replace(/\s+/g, ' ');
+    .replace(/[^\d\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 
-  const matches = normalized.match(/\d{2,7}(?:\.\d{1,2})?/g) ?? [];
+  const matches = normalized.match(/\d{2,7}/g) ?? [];
   const nums = matches
-    .map((m) => Number(m))
+    .map((m) => Number.parseInt(m, 10))
     .filter((n) => Number.isFinite(n) && n >= 0);
 
   if (nums.length === 0) return null;
@@ -347,11 +335,11 @@ function selectBestMeterNumber(
       (previousReading === 0 || n <= previousReading + 50000),
   );
   if (plausible.length > 0) {
-    return Math.round(plausible[0] * 100) / 100;
+    return plausible[0];
   }
 
   const sorted = [...nums].sort((a, b) => b - a);
-  return Math.round(sorted[0] * 100) / 100;
+  return sorted[0];
 }
 
 async function runSingleTesseractPass(
@@ -364,16 +352,19 @@ async function runSingleTesseractPass(
   try {
     const worker = await getOfflineOcrWorker();
     await worker.setParameters({
-      tessedit_char_whitelist: '0123456789.',
+      tessedit_char_whitelist: '0123456789',
       tessedit_pageseg_mode: psm,
     });
     const { data } = await worker.recognize(canvas);
     const extracted = selectBestMeterNumber(data.text || '', previousReading);
+    const digitsOnlyRaw = (data.text || '')
+      .replace(/[٠-٩]/g, (d) => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)))
+      .replace(/[^\d]/g, '');
     return {
       engine,
       label,
       reading: extracted,
-      rawDigits: (data.text || '').trim(),
+      rawDigits: digitsOnlyRaw,
       confidence: extracted !== null ? Math.round(data.confidence || 0) : 0,
     };
   } catch {
@@ -444,13 +435,13 @@ function evaluateConsensus(params: {
       lowLightDetected: params.lowLightDetected,
       rejectedReason: 'unreadable',
       engine: params.engineMode,
-      message: 'لم يتم التعرف على أرقام عداد في الصورة.',
+      message: 'تعذرت القراءة الدقيقة، اكتب القراءة يدوياً',
     };
   }
 
   const groups = new Map<string, Array<OcrPassDetail & { reading: number }>>();
   for (const p of validPasses) {
-    const key = p.reading.toFixed(2);
+    const key = String(Math.round(p.reading));
     const list = groups.get(key) ?? [];
     list.push(p);
     groups.set(key, list);
@@ -478,13 +469,13 @@ function evaluateConsensus(params: {
       : 0;
 
   const highSingleConfidence =
-    validPasses.length === 1 && avgConfidence >= 88;
+    validPasses.length === 1 && avgConfidence >= 85;
   const hasConsensus = agreementCount >= 2 || highSingleConfidence;
 
   if (consensusReading === null || !hasConsensus) {
     return {
       accepted: false,
-      reading: consensusReading,
+      reading: null,
       rawDigits: bestGroup[0]?.rawDigits || '',
       confidence: avgConfidence,
       agreementCount,
@@ -495,15 +486,15 @@ function evaluateConsensus(params: {
       lowLightDetected: params.lowLightDetected,
       rejectedReason: 'no_consensus',
       engine: params.engineMode,
-      message: 'الصورة غير واضحة لقراءة الرقم — أعد التصوير أو أدخل القراءة يدوياً.',
+      message: 'تعذرت القراءة الدقيقة، اكتب القراءة يدوياً',
     };
   }
 
-  if (avgConfidence < 82) {
+  if (avgConfidence < 85) {
     return {
       accepted: false,
-      reading: consensusReading,
-      rawDigits: bestGroup[0]?.rawDigits || String(consensusReading),
+      reading: null,
+      rawDigits: bestGroup[0]?.rawDigits || '',
       confidence: avgConfidence,
       agreementCount,
       totalPasses: params.passes.length,
@@ -513,7 +504,7 @@ function evaluateConsensus(params: {
       lowLightDetected: params.lowLightDetected,
       rejectedReason: 'low_confidence',
       engine: params.engineMode,
-      message: 'الأرقام غير واضحة بما يكفي — أعد التصوير أو أدخل القراءة يدوياً.',
+      message: 'تعذرت القراءة الدقيقة، اكتب القراءة يدوياً',
     };
   }
 
@@ -526,7 +517,7 @@ function evaluateConsensus(params: {
   if (jumpCheck.illogical) {
     return {
       accepted: false,
-      reading: consensusReading,
+      reading: null,
       rawDigits: bestGroup[0]?.rawDigits || String(consensusReading),
       confidence: avgConfidence,
       agreementCount,
@@ -538,7 +529,7 @@ function evaluateConsensus(params: {
       illogicalJump: true,
       rejectedReason: 'illogical_jump',
       engine: params.engineMode,
-      message: jumpCheck.reason,
+      message: 'تعذرت القراءة الدقيقة، اكتب القراءة يدوياً',
     };
   }
 
@@ -596,13 +587,24 @@ export async function extractMeterReadingFromImage(params: {
           }>;
         };
 
-        const cloudPasses: OcrPassDetail[] = (data.passes ?? []).map((p, i) => ({
-          engine: p.engine,
-          label: i === 0 ? 'قراءة 1' : 'قراءة 2',
-          reading: p.reading,
-          rawDigits: p.rawDigits,
-          confidence: p.confidence,
-        }));
+        const cloudPasses: OcrPassDetail[] = (data.passes ?? []).map((p, i) => {
+          const digitsOnly = String(p.rawDigits ?? '')
+            .replace(/[٠-٩]/g, (d) => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)))
+            .replace(/[^\d]/g, '');
+          const integerReading =
+            digitsOnly.length >= 2
+              ? Number.parseInt(digitsOnly, 10)
+              : p.reading !== null && Number.isFinite(p.reading)
+                ? Math.floor(p.reading)
+                : null;
+          return {
+            engine: p.engine,
+            label: i === 0 ? 'قراءة 1' : 'قراءة 2',
+            reading: integerReading,
+            rawDigits: digitsOnly,
+            confidence: integerReading !== null ? p.confidence : 0,
+          };
+        });
 
         const validCloud = cloudPasses.filter((p) => p.reading !== null);
         // Fast fail when there is no meter in the image at all

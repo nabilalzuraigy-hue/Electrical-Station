@@ -2230,10 +2230,10 @@ async function startServer() {
                 text: `You are reading an electric kilowatt-hour (kWh) meter display under difficult field conditions (shadows, dust, glare, low contrast).
 ${focusHint}
 Previous recorded reading for context: ${previousReading}.
-Extract the exact cumulative kWh meter reading shown on the main digital LCD or mechanical digit drums.
-Preserve the decimal fraction only if a clear decimal separator or distinct red tenths drum is part of the kWh register; do not guess or invent digits. Ignore meter serial numbers, barcodes, voltage/ampere ratings (e.g. 220V, 50Hz, 10(40)A), or timestamps.
+Extract ONLY the numeric integer digits (0-9) shown on the main cumulative kWh meter display.
+Ignore all words, letters, units like "kWh", manufacturer/company names, serial numbers, barcodes, voltage/ampere ratings (e.g. 220V, 50Hz, 10(40)A), or timestamps.
 Be conservative with confidence: only report confidence >= 85 when every single digit is crisp and unambiguous.
-If no clear electric meter kWh reading is visible in the image, set isClearMeter to false, detectedReading to -1, and confidence to 0.`,
+If no clear electric meter reading is visible in the image, set isClearMeter to false, detectedReading to -1, and confidence to 0.`,
               },
             ],
           },

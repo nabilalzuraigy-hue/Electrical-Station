@@ -1,9 +1,9 @@
 import {
+  Timestamp,
   doc,
   getDoc,
   serverTimestamp,
   setDoc,
-  type Timestamp,
 } from 'firebase/firestore';
 import {
   auth,
@@ -625,3 +625,45 @@ export async function loadSubscriberPortalFromFirestore(
     return null;
   }
 }
+
+export async function saveCollectorReadingTextToFirestore(params: {
+  stationId: string;
+  reading: MeterReading;
+}): Promise<boolean> {
+  const user = auth.currentUser;
+  if (!user) return false;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return false;
+  }
+
+  try {
+    const { reading, stationId } = params;
+    const recordedDate = new Date(reading.recordedAt);
+    const recordedAtTs = Timestamp.fromDate(
+      Number.isNaN(recordedDate.getTime()) ? new Date() : recordedDate,
+    );
+    await setDoc(doc(db, 'stations', stationId, 'readings', reading.id), {
+      subscriberId: reading.subscriberId,
+      meterNumber: reading.meterNumber,
+      subscriberName: reading.subscriberName,
+      previousReading: reading.previousReading,
+      currentReading: Math.max(reading.previousReading, reading.currentReading),
+      consumptionKwh: reading.consumptionKwh,
+      kwhPriceYer: reading.kwhPriceYer,
+      currentBillYer: reading.currentBillYer,
+      previousDebtYer: reading.previousDebtYer,
+      totalDueYer: reading.totalDueYer,
+      photoUrl: '',
+      photoSizeKb: 0,
+      hasLocalPhoto: Boolean(reading.hasLocalPhoto || reading.photoUrl),
+      collectorUid: user.uid,
+      collectorName: reading.collectorName,
+      recordedAt: recordedAtTs,
+      createdAt: serverTimestamp(),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
