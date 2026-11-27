@@ -50,10 +50,15 @@ import {
   FIREBASE_PROJECT_ID,
   formatAuthError,
   formatFirestoreUserMessage,
+  isAuthorizedAdminUser,
   signInWithGooglePopup,
   signOutUser,
   subscribeToAuth,
 } from '../lib/firebase';
+import {
+  CLOUD_ADMIN_TOKEN,
+  isCloudAdminToken,
+} from '../lib/cloudAdminStore';
 import {
   loadAdminStoreFromFirestore,
   saveAdminStoreToFirestore,
@@ -187,6 +192,13 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
 
   const syncBackupToFirestoreSilently = useCallback(async () => {
     if (!adminToken || !firebaseUser) return;
+    if (isCloudAdminToken(adminToken)) {
+      setCloudLastSyncAt(new Date().toISOString());
+      setCloudStatus(
+        `المزامنة السحابية التلقائية فعّالة مباشرة في مشروع ${FIREBASE_PROJECT_ID}.`,
+      );
+      return;
+    }
     try {
       const backup = await fetchAdminBackup(adminToken);
       const res = await saveAdminStoreToFirestore(backup);
@@ -288,6 +300,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
   useEffect(() => {
     if (
       !adminToken ||
+      isCloudAdminToken(adminToken) ||
       !firebaseUser ||
       loading ||
       autoRestoredRef.current ||
@@ -823,6 +836,26 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     }
   };
 
+  const handleGoogleAdminPanelUnlock = async () => {
+    setAuthSubmitting(true);
+    setAuthError(null);
+    try {
+      const user = await signInWithGooglePopup();
+      if (!isAuthorizedAdminUser(user)) {
+        await signOutUser();
+        setAuthError(
+          `الحساب (${user.email || 'غير معروف'}) غير مصرح له بدخول الأدمن المطور.`,
+        );
+        return;
+      }
+      onAdminAuthenticated(CLOUD_ADMIN_TOKEN);
+    } catch (err) {
+      setAuthError(formatAuthError(err));
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
   if (!adminToken) {
     return (
       <div className="max-w-md mx-auto py-10">
@@ -838,7 +871,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
             </h1>
             <p className="text-xs text-slate-600 leading-relaxed">
               {configured
-                ? 'أدخل كلمة مرور الأدمن المطور لإدارة المحطات، رفع كشوفات Excel للمشتركين، وتوليد أكواد مديري المحطات والمحصّلين.'
+                ? 'أدخل كلمة مرور الأدمن المطور أو سجّل الدخول بحساب Google المعتمد لإدارة المحطات والمشتركين والأكواد.'
                 : 'لم يتم حفظ كلمة مرور للأدمن بعد على الخادم. أدخل كلمة المرور المعتمدة الآن لتثبيتها بشكل دائم ومشفّر.'}
             </p>
           </div>
@@ -874,6 +907,16 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                 : configured
                   ? 'دخول لوحة الأدمن المطور'
                   : 'تثبيت كلمة المرور والدخول'}
+            </button>
+
+            <button
+              type="button"
+              disabled={authSubmitting || checkingStatus}
+              onClick={() => void handleGoogleAdminPanelUnlock()}
+              className="w-full min-h-[46px] py-2.5 px-4 bg-slate-900 hover:bg-slate-800 text-white text-sm font-bold rounded-lg inline-flex items-center justify-center gap-2 transition-colors cursor-pointer"
+            >
+              <ShieldCheck className="w-4 h-4 text-teal-400" />
+              دخول الأدمن المطور (Google)
             </button>
           </form>
         </div>

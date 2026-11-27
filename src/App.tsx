@@ -13,9 +13,11 @@ import {
   auth,
   getFirebaseAdminIdToken,
   isAuthorizedAdminUser,
+  signOutUser,
   subscribeToAuth,
   testFirestoreConnection,
 } from './lib/firebase';
+import { isCloudAdminToken } from './lib/cloudAdminStore';
 import {
   loadAdminStoreFromFirestore,
   saveAdminStoreToFirestore,
@@ -54,6 +56,7 @@ function StationWorkspace() {
 
   const runSilentGlobalCloudSync = useCallback(async () => {
     if (autoSyncLockRef.current) return;
+    if (isCloudAdminToken(adminToken)) return;
     const currentUser = auth.currentUser;
     if (!isAuthorizedAdminUser(currentUser)) return;
     if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
@@ -166,6 +169,9 @@ function StationWorkspace() {
   };
 
   const handleLogout = () => {
+    if (isCloudAdminToken(adminToken)) {
+      void signOutUser();
+    }
     setAdminToken(null);
     setStaffToken(null);
     setAccessRecord(null);

@@ -1,5 +1,13 @@
 import React, { useState } from 'react';
-import { Eye, EyeOff, Lock, ShieldAlert, User } from 'lucide-react';
+import { Eye, EyeOff, Lock, ShieldAlert, ShieldCheck, User } from 'lucide-react';
+import { CLOUD_ADMIN_TOKEN } from '../lib/cloudAdminStore';
+import {
+  auth,
+  formatAuthError,
+  isAuthorizedAdminUser,
+  signInWithGooglePopup,
+  signOutUser,
+} from '../lib/firebase';
 import { loginUnified, type UnifiedLoginResult } from '../lib/offlineDb';
 import { PWAInstallPrompt } from './PWAInstallPrompt';
 
@@ -14,6 +22,7 @@ export const ActivationGate: React.FC<ActivationGateProps> = ({
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [googleSubmitting, setGoogleSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -34,6 +43,38 @@ export const ActivationGate: React.FC<ActivationGateProps> = ({
       );
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleGoogleAdminLogin = async () => {
+    setGoogleSubmitting(true);
+    setError(null);
+    try {
+      if (isAuthorizedAdminUser(auth.currentUser)) {
+        onAuthenticated({
+          kind: 'admin',
+          token: CLOUD_ADMIN_TOKEN,
+          name: 'الأدمن المطور',
+        });
+        return;
+      }
+      const user = await signInWithGooglePopup();
+      if (!isAuthorizedAdminUser(user)) {
+        await signOutUser();
+        setError(
+          `الحساب (${user.email || 'غير معروف'}) غير مصرح له بدخول الأدمن المطور.`,
+        );
+        return;
+      }
+      onAuthenticated({
+        kind: 'admin',
+        token: CLOUD_ADMIN_TOKEN,
+        name: 'الأدمن المطور',
+      });
+    } catch (err) {
+      setError(formatAuthError(err));
+    } finally {
+      setGoogleSubmitting(false);
     }
   };
 
@@ -151,11 +192,31 @@ export const ActivationGate: React.FC<ActivationGateProps> = ({
 
             <button
               type="submit"
-              disabled={submitting}
+              disabled={submitting || googleSubmitting}
               className="btn-shine w-full min-h-[56px] py-3.5 px-6 rounded-2xl bg-gradient-to-l from-emerald-600 via-emerald-500 to-teal-600 hover:from-emerald-500 hover:via-emerald-500 hover:to-teal-500 active:scale-[0.985] disabled:opacity-60 text-white text-lg sm:text-xl font-bold shadow-lg shadow-emerald-600/30 transition-all duration-150 cursor-pointer"
             >
               {submitting ? 'جاري التحقق...' : 'دخول'}
             </button>
+
+            <div className="pt-1 space-y-2.5">
+              <div className="relative flex items-center justify-center">
+                <div className="w-full border-t border-slate-200" />
+                <span className="bg-white px-3 text-xs font-medium text-slate-400">
+                  أو
+                </span>
+              </div>
+              <button
+                type="button"
+                disabled={submitting || googleSubmitting}
+                onClick={() => void handleGoogleAdminLogin()}
+                className="w-full min-h-[48px] py-2.5 px-4 rounded-2xl bg-slate-900 hover:bg-slate-800 active:scale-[0.985] disabled:opacity-60 text-white text-sm sm:text-base font-bold inline-flex items-center justify-center gap-2 transition-all cursor-pointer"
+              >
+                <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                {googleSubmitting
+                  ? 'جاري التحقق عبر Google...'
+                  : 'دخول الأدمن المطور (Google)'}
+              </button>
+            </div>
 
             <p className="text-xs sm:text-sm text-slate-500 text-center pt-1">
               الدخول مخصص للموظفين والمحصلين فقط

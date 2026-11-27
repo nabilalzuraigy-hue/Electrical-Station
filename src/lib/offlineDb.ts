@@ -5,6 +5,28 @@ import {
   loadSubscriberPortalFromFirestore,
   type AdminStoreBackupPayload,
 } from './firestoreBackup';
+import {
+  CLOUD_ADMIN_TOKEN,
+  canUseCloudAdminFallback,
+  cloudAdminCreateManualSubscriber,
+  cloudAdminCreateStation,
+  cloudAdminDeleteAccessCode,
+  cloudAdminDeleteRecord,
+  cloudAdminDeleteStation,
+  cloudAdminDeleteSubscriber,
+  cloudAdminFetchBackup,
+  cloudAdminFetchStationDetails,
+  cloudAdminFetchStationSubscribers,
+  cloudAdminGenerateAccessCode,
+  cloudAdminOverview,
+  cloudAdminRestoreBackup,
+  cloudAdminToggleAccessCode,
+  cloudAdminToggleAiVerification,
+  cloudAdminToggleStationStatus,
+  cloudAdminUploadSubscribersChunked,
+  isCloudAdminToken,
+} from './cloudAdminStore';
+export { CLOUD_ADMIN_TOKEN, isCloudAdminToken };
 import type {
   AccessCodeRecord,
   CollectorLocationRecord,
@@ -55,6 +77,13 @@ export async function saveStationLocalState(
   await idbSet(`${IDB_KEY_PREFIX}${state.station.stationId}`, state);
 }
 
+export class StaticHostingNoBackendError extends Error {
+  constructor() {
+    super('لا يوجد خادم API خلفي متاح على هذه الاستضافة الثابتة.');
+    this.name = 'StaticHostingNoBackendError';
+  }
+}
+
 async function apiRequest<T>(
   url: string,
   options: RequestInit = {},
@@ -68,47 +97,104 @@ async function apiRequest<T>(
     headers.Authorization = `Bearer ${bearerToken}`;
   }
   const res = await fetch(url, { ...options, headers });
-  const data = (await res.json().catch(() => ({}))) as T & { error?: string };
+  const contentType = res.headers.get('content-type')?.toLowerCase() ?? '';
+  if (!contentType.includes('application/json')) {
+    throw new StaticHostingNoBackendError();
+  }
+  let data: T & { error?: string };
+  try {
+    data = (await res.json()) as T & { error?: string };
+  } catch {
+    throw new StaticHostingNoBackendError();
+  }
   if (!res.ok) {
     throw new Error(data.error || `خطأ في الاتصال بالخادم (${res.status})`);
   }
   return data;
 }
 
+async function withCloudAdmin<T>(
+  adminToken: string | null | undefined,
+  cloudFn: () => Promise<T>,
+  apiFn: () => Promise<T>,
+): Promise<T> {
+  if (isCloudAdminToken(adminToken)) {
+    return cloudFn();
+  }
+  try {
+    return await apiFn();
+  } catch (err) {
+    if (err instanceof StaticHostingNoBackendError && canUseCloudAdminFallback()) {
+      return cloudFn();
+    }
+    throw err;
+  }
+}
+
 // ============================================================
-// Developer Admin API (Server-verified scrypt / env passcode)
+// Developer Admin API (Server-verified scrypt / Cloud Firestore Admin)
 // ============================================================
 
 export async function getAdminStatus(): Promise<{ configured: boolean }> {
-  return apiRequest<{ configured: boolean }>('/api/admin/status');
+  try {
+    return await apiRequest<{ configured: boolean }>('/api/admin/status');
+  } catch (err) {
+    if (err instanceof StaticHostingNoBackendError) {
+      return { configured: true };
+    }
+    throw err;
+  }
 }
 
 export async function claimAdminPasscode(
   passcode: string,
 ): Promise<{ token: string; name: string }> {
-  return apiRequest<{ token: string; name: string }>('/api/admin/claim', {
-    method: 'POST',
-    body: JSON.stringify({ passcode }),
-  });
+  try {
+    return await apiRequest<{ token: string; name: string }>('/api/admin/claim', {
+      method: 'POST',
+      body: JSON.stringify({ passcode }),
+    });
+  } catch (err) {
+    if (err instanceof StaticHostingNoBackendError) {
+      throw new Error(
+        'على استضافة Firebase المباشرة، استخدم زر «دخول الأدمن المطور (Google)» للتحقق السحابي الآمن.',
+      );
+    }
+    throw err;
+  }
 }
 
 export async function loginAdminPasscode(
   passcode: string,
 ): Promise<{ token: string; name: string }> {
-  return apiRequest<{ token: string; name: string }>('/api/admin/login', {
-    method: 'POST',
-    body: JSON.stringify({ passcode }),
-  });
+  try {
+    return await apiRequest<{ token: string; name: string }>('/api/admin/login', {
+      method: 'POST',
+      body: JSON.stringify({ passcode }),
+    });
+  } catch (err) {
+    if (err instanceof StaticHostingNoBackendError) {
+      throw new Error(
+        'على استضافة Firebase المباشرة، استخدم زر «دخول الأدمن المطور (Google)» للتحقق السحابي الآمن.',
+      );
+    }
+    throw err;
+  }
 }
 
 export async function fetchAdminOverview(adminToken: string): Promise<{
   stations: StationConfig[];
   codes: AccessCodeRecord[];
 }> {
-  return apiRequest<{
-    stations: StationConfig[];
-    codes: AccessCodeRecord[];
-  }>('/api/admin/overview', {}, adminToken);
+  return withCloudAdmin(
+    adminToken,
+    () => cloudAdminOverview(),
+    () =>
+      apiRequest<{
+        stations: StationConfig[];
+        codes: AccessCodeRecord[];
+      }>('/api/admin/overview', {}, adminToken),
+  );
 }
 
 export async function createStationAdmin(
@@ -120,13 +206,18 @@ export async function createStationAdmin(
     maxSubscribers?: number;
   },
 ): Promise<{ station: StationConfig }> {
-  return apiRequest<{ station: StationConfig }>(
-    '/api/admin/stations',
-    {
-      method: 'POST',
-      body: JSON.stringify(params),
-    },
+  return withCloudAdmin(
     adminToken,
+    () => cloudAdminCreateStation(params),
+    () =>
+      apiRequest<{ station: StationConfig }>(
+        '/api/admin/stations',
+        {
+          method: 'POST',
+          body: JSON.stringify(params),
+        },
+        adminToken,
+      ),
   );
 }
 
@@ -135,13 +226,18 @@ export async function toggleStationStatusAdmin(
   stationId: string,
   licenseStatus: 'active' | 'suspended',
 ): Promise<{ station: StationConfig }> {
-  return apiRequest<{ station: StationConfig }>(
-    `/api/admin/stations/${encodeURIComponent(stationId)}/status`,
-    {
-      method: 'POST',
-      body: JSON.stringify({ licenseStatus }),
-    },
+  return withCloudAdmin(
     adminToken,
+    () => cloudAdminToggleStationStatus(stationId, licenseStatus),
+    () =>
+      apiRequest<{ station: StationConfig }>(
+        `/api/admin/stations/${encodeURIComponent(stationId)}/status`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ licenseStatus }),
+        },
+        adminToken,
+      ),
   );
 }
 
@@ -150,13 +246,18 @@ export async function toggleStationAiVerificationAdmin(
   stationId: string,
   enabled: boolean,
 ): Promise<{ station: StationConfig }> {
-  return apiRequest<{ station: StationConfig }>(
-    `/api/admin/stations/${encodeURIComponent(stationId)}/ai-verification`,
-    {
-      method: 'POST',
-      body: JSON.stringify({ enabled }),
-    },
+  return withCloudAdmin(
     adminToken,
+    () => cloudAdminToggleAiVerification(stationId, enabled),
+    () =>
+      apiRequest<{ station: StationConfig }>(
+        `/api/admin/stations/${encodeURIComponent(stationId)}/ai-verification`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ enabled }),
+        },
+        adminToken,
+      ),
   );
 }
 
@@ -173,13 +274,18 @@ export async function generateAccessCodeAdmin(
     customCode?: string;
   },
 ): Promise<{ codeRecord: AccessCodeRecord; station: StationConfig }> {
-  return apiRequest<{ codeRecord: AccessCodeRecord; station: StationConfig }>(
-    '/api/admin/codes',
-    {
-      method: 'POST',
-      body: JSON.stringify(params),
-    },
+  return withCloudAdmin(
     adminToken,
+    () => cloudAdminGenerateAccessCode(params),
+    () =>
+      apiRequest<{ codeRecord: AccessCodeRecord; station: StationConfig }>(
+        '/api/admin/codes',
+        {
+          method: 'POST',
+          body: JSON.stringify(params),
+        },
+        adminToken,
+      ),
   );
 }
 
@@ -192,13 +298,18 @@ export async function toggleAccessCodeAdmin(
     assignedZones?: string[];
   },
 ): Promise<{ codeRecord: AccessCodeRecord }> {
-  return apiRequest<{ codeRecord: AccessCodeRecord }>(
-    `/api/admin/codes/${encodeURIComponent(code)}/toggle`,
-    {
-      method: 'POST',
-      body: JSON.stringify(updates),
-    },
+  return withCloudAdmin(
     adminToken,
+    () => cloudAdminToggleAccessCode(code, updates),
+    () =>
+      apiRequest<{ codeRecord: AccessCodeRecord }>(
+        `/api/admin/codes/${encodeURIComponent(code)}/toggle`,
+        {
+          method: 'POST',
+          body: JSON.stringify(updates),
+        },
+        adminToken,
+      ),
   );
 }
 
@@ -206,12 +317,17 @@ export async function deleteAccessCodeAdmin(
   adminToken: string,
   code: string,
 ): Promise<{ deleted: boolean; code: string }> {
-  return apiRequest<{ deleted: boolean; code: string }>(
-    `/api/admin/codes/${encodeURIComponent(code)}`,
-    {
-      method: 'DELETE',
-    },
+  return withCloudAdmin(
     adminToken,
+    () => cloudAdminDeleteAccessCode(code),
+    () =>
+      apiRequest<{ deleted: boolean; code: string }>(
+        `/api/admin/codes/${encodeURIComponent(code)}`,
+        {
+          method: 'DELETE',
+        },
+        adminToken,
+      ),
   );
 }
 
@@ -224,47 +340,59 @@ export async function uploadSubscribersChunkedAdmin(
     onProgress?: (uploaded: number, total: number) => void;
   },
 ): Promise<{ totalSubscribers: number }> {
-  const chunkSize = 400;
-  let uploaded = 0;
-  let totalSubscribers = 0;
+  return withCloudAdmin(
+    adminToken,
+    () => cloudAdminUploadSubscribersChunked(params),
+    async () => {
+      const chunkSize = 400;
+      let uploaded = 0;
+      let totalSubscribers = 0;
 
-  for (let i = 0; i < params.subscribers.length; i += chunkSize) {
-    const chunk = params.subscribers.slice(i, i + chunkSize);
-    const res = await apiRequest<{
-      importedCount: number;
-      totalSubscribers: number;
-    }>(
-      `/api/admin/stations/${encodeURIComponent(params.stationId)}/subscribers/upload-chunk`,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          subscribers: chunk,
-          replaceAll: Boolean(params.replaceAll && i === 0),
-        }),
-      },
-      adminToken,
-    );
-    uploaded += chunk.length;
-    totalSubscribers = res.totalSubscribers;
-    params.onProgress?.(uploaded, params.subscribers.length);
-  }
+      for (let i = 0; i < params.subscribers.length; i += chunkSize) {
+        const chunk = params.subscribers.slice(i, i + chunkSize);
+        const res = await apiRequest<{
+          importedCount: number;
+          totalSubscribers: number;
+        }>(
+          `/api/admin/stations/${encodeURIComponent(params.stationId)}/subscribers/upload-chunk`,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              subscribers: chunk,
+              replaceAll: Boolean(params.replaceAll && i === 0),
+            }),
+          },
+          adminToken,
+        );
+        uploaded += chunk.length;
+        totalSubscribers = res.totalSubscribers;
+        params.onProgress?.(uploaded, params.subscribers.length);
+      }
 
-  return { totalSubscribers };
+      return { totalSubscribers };
+    },
+  );
 }
 
 export async function fetchStationSubscribersAdmin(
   adminToken: string,
   stationId: string,
 ): Promise<Subscriber[]> {
-  const res = await apiRequest<{ subscribers: Array<Omit<Subscriber, 'syncStatus'>> }>(
-    `/api/admin/stations/${encodeURIComponent(stationId)}/subscribers`,
-    {},
+  return withCloudAdmin(
     adminToken,
+    () => cloudAdminFetchStationSubscribers(stationId),
+    async () => {
+      const res = await apiRequest<{ subscribers: Array<Omit<Subscriber, 'syncStatus'>> }>(
+        `/api/admin/stations/${encodeURIComponent(stationId)}/subscribers`,
+        {},
+        adminToken,
+      );
+      return (res.subscribers ?? []).map((s) => ({
+        ...s,
+        syncStatus: 'synced' as const,
+      }));
+    },
   );
-  return (res.subscribers ?? []).map((s) => ({
-    ...s,
-    syncStatus: 'synced' as const,
-  }));
 }
 
 export async function createManualSubscriberAdmin(
@@ -281,21 +409,27 @@ export async function createManualSubscriberAdmin(
     sequenceOrder?: number;
   },
 ): Promise<{ subscriber: Subscriber; totalSubscribers: number }> {
-  const res = await apiRequest<{
-    subscriber: Omit<Subscriber, 'syncStatus'>;
-    totalSubscribers: number;
-  }>(
-    `/api/admin/stations/${encodeURIComponent(params.stationId)}/subscribers`,
-    {
-      method: 'POST',
-      body: JSON.stringify(params),
-    },
+  return withCloudAdmin(
     adminToken,
+    () => cloudAdminCreateManualSubscriber(params),
+    async () => {
+      const res = await apiRequest<{
+        subscriber: Omit<Subscriber, 'syncStatus'>;
+        totalSubscribers: number;
+      }>(
+        `/api/admin/stations/${encodeURIComponent(params.stationId)}/subscribers`,
+        {
+          method: 'POST',
+          body: JSON.stringify(params),
+        },
+        adminToken,
+      );
+      return {
+        subscriber: { ...res.subscriber, syncStatus: 'synced' },
+        totalSubscribers: res.totalSubscribers,
+      };
+    },
   );
-  return {
-    subscriber: { ...res.subscriber, syncStatus: 'synced' },
-    totalSubscribers: res.totalSubscribers,
-  };
 }
 
 export async function deleteSubscriberAdmin(
@@ -303,12 +437,17 @@ export async function deleteSubscriberAdmin(
   stationId: string,
   subscriberId: string,
 ): Promise<{ deleted: boolean; totalSubscribers: number }> {
-  return apiRequest<{ deleted: boolean; totalSubscribers: number }>(
-    `/api/admin/stations/${encodeURIComponent(stationId)}/subscribers/${encodeURIComponent(subscriberId)}`,
-    {
-      method: 'DELETE',
-    },
+  return withCloudAdmin(
     adminToken,
+    () => cloudAdminDeleteSubscriber(stationId, subscriberId),
+    () =>
+      apiRequest<{ deleted: boolean; totalSubscribers: number }>(
+        `/api/admin/stations/${encodeURIComponent(stationId)}/subscribers/${encodeURIComponent(subscriberId)}`,
+        {
+          method: 'DELETE',
+        },
+        adminToken,
+      ),
   );
 }
 
@@ -318,12 +457,17 @@ export async function fetchAdminBackup(adminToken: string): Promise<{
   stationData: Record<string, unknown>;
   exportedAt: string;
 }> {
-  return apiRequest<{
-    stations: Record<string, StationConfig>;
-    codes: Record<string, AccessCodeRecord>;
-    stationData: Record<string, unknown>;
-    exportedAt: string;
-  }>('/api/admin/backup', {}, adminToken);
+  return withCloudAdmin(
+    adminToken,
+    () => cloudAdminFetchBackup(),
+    () =>
+      apiRequest<{
+        stations: Record<string, StationConfig>;
+        codes: Record<string, AccessCodeRecord>;
+        stationData: Record<string, unknown>;
+        exportedAt: string;
+      }>('/api/admin/backup', {}, adminToken),
+  );
 }
 
 export async function restoreAdminBackup(
@@ -340,18 +484,23 @@ export async function restoreAdminBackup(
   codeCount: number;
   subscriberCount: number;
 }> {
-  return apiRequest<{
-    ok: boolean;
-    stationCount: number;
-    codeCount: number;
-    subscriberCount: number;
-  }>(
-    '/api/admin/restore',
-    {
-      method: 'POST',
-      body: JSON.stringify({ ...backup, mode }),
-    },
+  return withCloudAdmin(
     adminToken,
+    () => cloudAdminRestoreBackup(backup as AdminStoreBackupPayload, mode),
+    () =>
+      apiRequest<{
+        ok: boolean;
+        stationCount: number;
+        codeCount: number;
+        subscriberCount: number;
+      }>(
+        '/api/admin/restore',
+        {
+          method: 'POST',
+          body: JSON.stringify({ ...backup, mode }),
+        },
+        adminToken,
+      ),
   );
 }
 
@@ -417,23 +566,33 @@ export async function fetchStationDetailsAdmin(
   expenses: DieselExpenseEntry[];
   alerts: ManagerAlert[];
 }> {
-  return apiRequest<{
-    station: StationConfig;
-    readings: MeterReading[];
-    receipts: PaymentReceipt[];
-    expenses: DieselExpenseEntry[];
-    alerts: ManagerAlert[];
-  }>(`/api/admin/stations/${encodeURIComponent(stationId)}/details`, {}, adminToken);
+  return withCloudAdmin(
+    adminToken,
+    () => cloudAdminFetchStationDetails(stationId),
+    () =>
+      apiRequest<{
+        station: StationConfig;
+        readings: MeterReading[];
+        receipts: PaymentReceipt[];
+        expenses: DieselExpenseEntry[];
+        alerts: ManagerAlert[];
+      }>(`/api/admin/stations/${encodeURIComponent(stationId)}/details`, {}, adminToken),
+  );
 }
 
 export async function deleteStationAdmin(
   adminToken: string,
   stationId: string,
 ): Promise<{ deleted: boolean; stationId: string }> {
-  return apiRequest<{ deleted: boolean; stationId: string }>(
-    `/api/admin/stations/${encodeURIComponent(stationId)}`,
-    { method: 'DELETE' },
+  return withCloudAdmin(
     adminToken,
+    () => cloudAdminDeleteStation(stationId),
+    () =>
+      apiRequest<{ deleted: boolean; stationId: string }>(
+        `/api/admin/stations/${encodeURIComponent(stationId)}`,
+        { method: 'DELETE' },
+        adminToken,
+      ),
   );
 }
 
@@ -442,10 +601,15 @@ export async function deleteReadingAdmin(
   stationId: string,
   readingId: string,
 ): Promise<{ deleted: boolean; id: string }> {
-  return apiRequest<{ deleted: boolean; id: string }>(
-    `/api/admin/stations/${encodeURIComponent(stationId)}/readings/${encodeURIComponent(readingId)}`,
-    { method: 'DELETE' },
+  return withCloudAdmin(
     adminToken,
+    () => cloudAdminDeleteRecord(stationId, 'readings', readingId),
+    () =>
+      apiRequest<{ deleted: boolean; id: string }>(
+        `/api/admin/stations/${encodeURIComponent(stationId)}/readings/${encodeURIComponent(readingId)}`,
+        { method: 'DELETE' },
+        adminToken,
+      ),
   );
 }
 
@@ -454,10 +618,15 @@ export async function deleteReceiptAdmin(
   stationId: string,
   receiptId: string,
 ): Promise<{ deleted: boolean; id: string }> {
-  return apiRequest<{ deleted: boolean; id: string }>(
-    `/api/admin/stations/${encodeURIComponent(stationId)}/receipts/${encodeURIComponent(receiptId)}`,
-    { method: 'DELETE' },
+  return withCloudAdmin(
     adminToken,
+    () => cloudAdminDeleteRecord(stationId, 'receipts', receiptId),
+    () =>
+      apiRequest<{ deleted: boolean; id: string }>(
+        `/api/admin/stations/${encodeURIComponent(stationId)}/receipts/${encodeURIComponent(receiptId)}`,
+        { method: 'DELETE' },
+        adminToken,
+      ),
   );
 }
 
@@ -466,10 +635,15 @@ export async function deleteExpenseAdmin(
   stationId: string,
   expenseId: string,
 ): Promise<{ deleted: boolean; id: string }> {
-  return apiRequest<{ deleted: boolean; id: string }>(
-    `/api/admin/stations/${encodeURIComponent(stationId)}/expenses/${encodeURIComponent(expenseId)}`,
-    { method: 'DELETE' },
+  return withCloudAdmin(
     adminToken,
+    () => cloudAdminDeleteRecord(stationId, 'expenses', expenseId),
+    () =>
+      apiRequest<{ deleted: boolean; id: string }>(
+        `/api/admin/stations/${encodeURIComponent(stationId)}/expenses/${encodeURIComponent(expenseId)}`,
+        { method: 'DELETE' },
+        adminToken,
+      ),
   );
 }
 
@@ -707,6 +881,12 @@ export async function loginUnified(
       }
     }
 
+    if (primaryErr instanceof StaticHostingNoBackendError) {
+      throw new Error(
+        'لم يتم العثور على كود موظف أو بيانات مشترك مطابقة. للدخول كأدمن مطور على استضافة Firebase المباشرة اضغط زر «دخول الأدمن المطور (Google)» أسفل النموذج.',
+      );
+    }
+
     throw primaryErr;
   }
 }
@@ -721,40 +901,98 @@ export async function loginWithAccessCode(codeInput: string): Promise<{
     throw new Error('يرجى إدخال كود الدخول الصحيح.');
   }
 
-  const res = await apiRequest<{
-    token: string;
-    access: AccessCodeRecord;
-    state: {
-      station: StationConfig;
-      collectors?: AccessCodeRecord[];
-      subscribers?: Subscriber[];
-      readings?: MeterReading[];
-      receipts?: PaymentReceipt[];
-      alerts?: ManagerAlert[];
-      expenses?: DieselExpenseEntry[];
-      collectorLocations?: CollectorLocationRecord[];
+  try {
+    const res = await apiRequest<{
+      token: string;
+      access: AccessCodeRecord;
+      state: {
+        station: StationConfig;
+        collectors?: AccessCodeRecord[];
+        subscribers?: Subscriber[];
+        readings?: MeterReading[];
+        receipts?: PaymentReceipt[];
+        alerts?: ManagerAlert[];
+        expenses?: DieselExpenseEntry[];
+        collectorLocations?: CollectorLocationRecord[];
+      };
+    }>('/api/auth/code', {
+      method: 'POST',
+      body: JSON.stringify({ code }),
+    });
+
+    const cloudState = mapServerState(res.state);
+    const local = await loadStationLocalState(cloudState.station.stationId);
+    const merged = mergeLocalPendingWithCloud(local, cloudState);
+    await saveStationLocalState(merged);
+
+    return {
+      token: res.token,
+      access: res.access,
+      state: merged,
     };
-  }>('/api/auth/code', {
-    method: 'POST',
-    body: JSON.stringify({ code }),
-  });
-
-  const cloudState = mapServerState(res.state);
-  const local = await loadStationLocalState(cloudState.station.stationId);
-  const merged = mergeLocalPendingWithCloud(local, cloudState);
-  await saveStationLocalState(merged);
-
-  return {
-    token: res.token,
-    access: res.access,
-    state: merged,
-  };
+  } catch (err) {
+    const staffVault = await loadStaffVaultFromFirestore(code);
+    if (staffVault) {
+      if (!staffVault.access.active) {
+        throw new Error('هذا الكود موقوف حالياً من الإدارة.');
+      }
+      if (staffVault.station.licenseStatus !== 'active') {
+        throw new Error('تم إيقاف ترخيص هذه المحطة من قِبل الإدارة.');
+      }
+      const cloudState = mapServerState({
+        station: staffVault.station,
+        collectors: staffVault.collectors,
+        subscribers: staffVault.subscribers,
+        readings: staffVault.readings,
+        receipts: staffVault.receipts,
+        alerts: staffVault.alerts,
+        expenses: staffVault.expenses,
+        collectorLocations: staffVault.collectorLocations,
+      });
+      const local = await loadStationLocalState(cloudState.station.stationId);
+      const merged = mergeLocalPendingWithCloud(local, cloudState);
+      await saveStationLocalState(merged);
+      return {
+        token: `cloud_${code}`,
+        access: staffVault.access,
+        state: merged,
+      };
+    }
+    if (err instanceof StaticHostingNoBackendError) {
+      throw new Error('كود التفعيل غير صحيح أو غير محفوظ بعد في السحابة.');
+    }
+    throw err;
+  }
 }
 
 export async function refreshStationState(
   stationId: string,
   staffToken: string,
 ): Promise<StationLocalState> {
+  if (staffToken.startsWith('cloud_')) {
+    const code = normalizeActivationCode(staffToken.slice('cloud_'.length));
+    const staffVault = code ? await loadStaffVaultFromFirestore(code) : null;
+    if (staffVault) {
+      const cloudState = mapServerState({
+        station: staffVault.station,
+        collectors: staffVault.collectors,
+        subscribers: staffVault.subscribers,
+        readings: staffVault.readings,
+        receipts: staffVault.receipts,
+        alerts: staffVault.alerts,
+        expenses: staffVault.expenses,
+        collectorLocations: staffVault.collectorLocations,
+      });
+      const local = await loadStationLocalState(stationId);
+      const merged = mergeLocalPendingWithCloud(local, cloudState);
+      await saveStationLocalState(merged);
+      return merged;
+    }
+    const local = await loadStationLocalState(stationId);
+    if (local) return local;
+    throw new StaticHostingNoBackendError();
+  }
+
   const res = await apiRequest<{
     station: StationConfig;
     collectors?: AccessCodeRecord[];
