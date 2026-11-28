@@ -706,8 +706,9 @@ export async function loadStaffVaultFromFirestore(
   try {
     const normalized = normalizeCodeForHash(code);
     const accessHash = await computeStaffAccessHash(normalized);
+    const staffRef = doc(db, 'staffVault', accessHash);
     const [vaultSnap, codeDoc] = await Promise.all([
-      getDoc(doc(db, 'staffVault', accessHash)),
+      getDocFromServer(staffRef).catch(() => getDoc(staffRef)),
       loadAccessCodeFromFirestore(normalized, true),
     ]);
 
@@ -896,6 +897,14 @@ export async function loadSubscriberPortalFromFirestore(
   }
 }
 
+function timestampToIso(val: unknown): string {
+  if (val && typeof val === 'object' && 'toDate' in val && typeof (val as { toDate?: unknown }).toDate === 'function') {
+    return (val as Timestamp).toDate().toISOString();
+  }
+  if (typeof val === 'string' && val) return val;
+  return new Date().toISOString();
+}
+
 export async function saveCollectorReadingTextToFirestore(params: {
   stationId: string;
   reading: MeterReading;
@@ -913,23 +922,79 @@ export async function saveCollectorReadingTextToFirestore(params: {
     const collectorUid = sanitizeVaultDocId(
       reading.collectorUid || 'collector',
     );
-    await setDoc(doc(db, 'stations', stationId, 'readings', reading.id), {
+    const aiStatus =
+      reading.aiVerificationStatus === 'matched' ||
+      reading.aiVerificationStatus === 'mismatch' ||
+      reading.aiVerificationStatus === 'pending_offline'
+        ? reading.aiVerificationStatus
+        : 'not_checked';
+
+    const payload: Record<string, unknown> = {
       subscriberId: sanitizeVaultDocId(reading.subscriberId),
-      meterNumber: reading.meterNumber,
-      subscriberName: reading.subscriberName,
-      previousReading: reading.previousReading,
-      currentReading: Math.max(reading.previousReading, reading.currentReading),
-      consumptionKwh: reading.consumptionKwh,
-      kwhPriceYer: reading.kwhPriceYer,
-      currentBillYer: reading.currentBillYer,
-      previousDebtYer: reading.previousDebtYer,
-      totalDueYer: reading.totalDueYer,
+      meterNumber: (reading.meterNumber || '00').slice(0, 40),
+      subscriberName: (reading.subscriberName || 'مشترك').slice(0, 120),
+      previousReading: Math.max(0, Number(reading.previousReading) || 0),
+      currentReading: Math.max(0, Number(reading.currentReading) || 0),
+      consumptionKwh: Math.max(0, Number(reading.consumptionKwh) || 0),
+      kwhPriceYer: Math.max(0, Number(reading.kwhPriceYer) || 0),
+      currentBillYer: Math.max(0, Number(reading.currentBillYer) || 0),
+      previousDebtYer: Math.max(0, Number(reading.previousDebtYer) || 0),
+      totalDueYer: Math.max(0, Number(reading.totalDueYer) || 0),
       photoUrl: '',
       photoSizeKb: 0,
       hasLocalPhoto: Boolean(reading.hasLocalPhoto || reading.photoUrl),
+      aiVerificationStatus: aiStatus,
       collectorUid,
-      collectorName: reading.collectorName,
+      collectorName: (reading.collectorName || 'المحصّل').slice(0, 120),
       recordedAt: recordedAtTs,
+      createdAt: serverTimestamp(),
+    };
+
+    if (typeof reading.aiDetectedReading === 'number' && Number.isFinite(reading.aiDetectedReading)) {
+      payload.aiDetectedReading = reading.aiDetectedReading;
+    }
+    if (typeof reading.aiConfidence === 'number' && Number.isFinite(reading.aiConfidence)) {
+      const conf = reading.aiConfidence > 1 ? reading.aiConfidence / 100 : reading.aiConfidence;
+      payload.aiConfidence = Math.min(1, Math.max(0, conf));
+    }
+    if (reading.aiVerificationReason) {
+      payload.aiVerificationReason = reading.aiVerificationReason.slice(0, 300);
+    }
+
+    await setDoc(doc(db, 'stations', stationId, 'readings', sanitizeVaultDocId(reading.id)), payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function saveCollectorReceiptTextToFirestore(params: {
+  stationId: string;
+  receipt: PaymentReceipt;
+}): Promise<boolean> {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return false;
+  }
+  if (!(Number(params.receipt.amountPaidYer) > 0)) return false;
+
+  try {
+    const { receipt, stationId } = params;
+    const paidDate = new Date(receipt.paidAt);
+    const paidAtTs = Timestamp.fromDate(
+      Number.isNaN(paidDate.getTime()) ? new Date() : paidDate,
+    );
+    const collectorUid = sanitizeVaultDocId(receipt.collectorUid || 'collector');
+
+    await setDoc(doc(db, 'stations', stationId, 'receipts', sanitizeVaultDocId(receipt.id)), {
+      subscriberId: sanitizeVaultDocId(receipt.subscriberId),
+      meterNumber: (receipt.meterNumber || '00').slice(0, 40),
+      subscriberName: (receipt.subscriberName || 'مشترك').slice(0, 120),
+      readingId: sanitizeVaultDocId(receipt.readingId || `cash_${Date.now()}`),
+      amountPaidYer: Math.max(1, Number(receipt.amountPaidYer)),
+      remainingBalanceYer: Math.max(0, Number(receipt.remainingBalanceYer) || 0),
+      collectorUid,
+      collectorName: (receipt.collectorName || 'المحصّل').slice(0, 120),
+      paidAt: paidAtTs,
       createdAt: serverTimestamp(),
     });
     return true;
@@ -937,3 +1002,267 @@ export async function saveCollectorReadingTextToFirestore(params: {
     return false;
   }
 }
+
+export async function saveCollectorAlertTextToFirestore(params: {
+  stationId: string;
+  alert: ManagerAlert;
+}): Promise<boolean> {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return false;
+  }
+  if (params.alert.alertType === 'manual_edit') {
+    return true;
+  }
+
+  try {
+    const { alert, stationId } = params;
+    const msg =
+      alert.alertType === 'lower_reading'
+        ? `قراءة أقل من السابقة (${alert.editedReading} مقابل ${alert.previousReading})`
+        : alert.alertType === 'high_consumption'
+          ? `استهلاك مرتفع (${alert.consumptionKwh ?? 0} ك.و.س مقابل متوسط ${alert.avg3MonthsKwh ?? 0})`
+          : alert.aiVerificationReason || 'عدم تطابق قراءة العداد مع الصورة';
+
+    const payload: Record<string, unknown> = {
+      stationId: sanitizeVaultDocId(stationId),
+      subscriberId: sanitizeVaultDocId(alert.subscriberId),
+      meterNumber: (alert.meterNumber || '00').slice(0, 40),
+      subscriberName: (alert.subscriberName || 'مشترك').slice(0, 120),
+      collectorName: (alert.collectorName || 'المحصّل').slice(0, 120),
+      alertType:
+        alert.alertType === 'photo_mismatch' ||
+        alert.alertType === 'lower_reading' ||
+        alert.alertType === 'high_consumption'
+          ? alert.alertType
+          : 'lower_reading',
+      editedReading: Number(alert.editedReading) || 0,
+      hasLocalPhoto: true,
+      message: msg.slice(0, 500),
+      severity: alert.severity === 'critical' ? 'critical' : 'warning',
+      resolved: alert.status !== 'pending',
+      createdAt: serverTimestamp(),
+    };
+
+    if (alert.collectorCode) {
+      payload.collectorCode = sanitizeVaultDocId(alert.collectorCode).slice(0, 60);
+    }
+    if (typeof alert.aiDetectedReading === 'number' && Number.isFinite(alert.aiDetectedReading)) {
+      payload.aiDetectedReading = alert.aiDetectedReading;
+    }
+    if (typeof alert.aiConfidence === 'number' && Number.isFinite(alert.aiConfidence)) {
+      const conf = alert.aiConfidence > 1 ? alert.aiConfidence / 100 : alert.aiConfidence;
+      payload.aiConfidence = Math.min(1, Math.max(0, conf));
+    }
+    if (alert.aiVerificationReason) {
+      payload.aiVerificationReason = alert.aiVerificationReason.slice(0, 300);
+    }
+
+    await setDoc(doc(db, 'stations', stationId, 'alerts', sanitizeVaultDocId(alert.id)), payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function resolveManagerAlertInFirestore(params: {
+  stationId: string;
+  alertId: string;
+  managerCode?: string;
+}): Promise<boolean> {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return false;
+  }
+  try {
+    const updatePayload: Record<string, unknown> = {
+      resolved: true,
+    };
+    if (params.managerCode) {
+      updatePayload.resolvedByCode = normalizeCodeForHash(params.managerCode);
+    }
+    await setDoc(
+      doc(db, 'stations', params.stationId, 'alerts', sanitizeVaultDocId(params.alertId)),
+      updatePayload,
+      { merge: true },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function saveCollectorLocationToFirestore(params: {
+  stationId: string;
+  collectorCode: string;
+  collectorName: string;
+  lat: number;
+  lng: number;
+  accuracy?: number;
+}): Promise<boolean> {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return false;
+  }
+  const code = normalizeCodeForHash(params.collectorCode);
+  if (!code) return false;
+  try {
+    const payload: Record<string, unknown> = {
+      collectorCode: code,
+      collectorName: (params.collectorName || 'المحصّل').slice(0, 120),
+      lat: params.lat,
+      lng: params.lng,
+      updatedAt: serverTimestamp(),
+    };
+    if (typeof params.accuracy === 'number' && Number.isFinite(params.accuracy) && params.accuracy >= 0) {
+      payload.accuracyMeters = Math.round(params.accuracy);
+    }
+    await setDoc(doc(db, 'stations', params.stationId, 'collectorLocations', code), payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function loadStationCloudActivityFromFirestore(stationId: string): Promise<{
+  readings: MeterReading[];
+  receipts: PaymentReceipt[];
+  alerts: ManagerAlert[];
+  collectorLocations: CollectorLocationRecord[];
+}> {
+  const safeId = sanitizeVaultDocId(stationId);
+  const fetchCol = async (subName: string) => {
+    const colRef = collection(db, 'stations', safeId, subName);
+    try {
+      return await getDocsFromServer(colRef).catch((err) => {
+        if (isOfflineFirestoreError(err)) return getDocs(colRef);
+        throw err;
+      });
+    } catch {
+      return null;
+    }
+  };
+
+  const [rdSnap, rcSnap, alSnap, locSnap] = await Promise.all([
+    fetchCol('readings'),
+    fetchCol('receipts'),
+    fetchCol('alerts'),
+    fetchCol('collectorLocations'),
+  ]);
+
+  const readings: MeterReading[] = [];
+  rdSnap?.forEach((d) => {
+    const x = d.data() as Record<string, unknown>;
+    readings.push({
+      id: d.id,
+      subscriberId: String(x.subscriberId ?? ''),
+      meterNumber: String(x.meterNumber ?? ''),
+      subscriberName: String(x.subscriberName ?? ''),
+      previousReading: Number(x.previousReading ?? 0),
+      currentReading: Number(x.currentReading ?? 0),
+      consumptionKwh: Number(x.consumptionKwh ?? 0),
+      kwhPriceYer: Number(x.kwhPriceYer ?? 0),
+      currentBillYer: Number(x.currentBillYer ?? 0),
+      previousDebtYer: Number(x.previousDebtYer ?? 0),
+      totalDueYer: Number(x.totalDueYer ?? 0),
+      photoUrl: '',
+      photoSizeKb: 0,
+      hasLocalPhoto: Boolean(x.hasLocalPhoto),
+      ...(x.aiVerificationStatus === 'matched' ||
+      x.aiVerificationStatus === 'mismatch' ||
+      x.aiVerificationStatus === 'pending_offline'
+        ? { aiVerificationStatus: x.aiVerificationStatus }
+        : {}),
+      ...(typeof x.aiDetectedReading === 'number'
+        ? { aiDetectedReading: x.aiDetectedReading }
+        : {}),
+      ...(typeof x.aiConfidence === 'number'
+        ? { aiConfidence: x.aiConfidence }
+        : {}),
+      ...(typeof x.aiVerificationReason === 'string'
+        ? { aiVerificationReason: x.aiVerificationReason }
+        : {}),
+      collectorUid: String(x.collectorUid ?? ''),
+      collectorName: String(x.collectorName ?? 'المحصّل'),
+      recordedAt: timestampToIso(x.recordedAt ?? x.createdAt),
+      syncStatus: 'synced',
+    });
+  });
+
+  const receipts: PaymentReceipt[] = [];
+  rcSnap?.forEach((d) => {
+    const x = d.data() as Record<string, unknown>;
+    receipts.push({
+      id: d.id,
+      subscriberId: String(x.subscriberId ?? ''),
+      meterNumber: String(x.meterNumber ?? ''),
+      subscriberName: String(x.subscriberName ?? ''),
+      readingId: String(x.readingId ?? ''),
+      amountPaidYer: Number(x.amountPaidYer ?? 0),
+      remainingBalanceYer: Number(x.remainingBalanceYer ?? 0),
+      collectorUid: String(x.collectorUid ?? ''),
+      collectorName: String(x.collectorName ?? 'المحصّل'),
+      paidAt: timestampToIso(x.paidAt ?? x.createdAt),
+      syncStatus: 'synced',
+    });
+  });
+
+  const alerts: ManagerAlert[] = [];
+  alSnap?.forEach((d) => {
+    const x = d.data() as Record<string, unknown>;
+    alerts.push({
+      id: d.id,
+      stationId: String(x.stationId ?? safeId),
+      alertType:
+        x.alertType === 'photo_mismatch' ||
+        x.alertType === 'high_consumption' ||
+        x.alertType === 'lower_reading'
+          ? x.alertType
+          : 'lower_reading',
+      severity: x.severity === 'critical' ? 'critical' : 'warning',
+      status: x.resolved === true ? 'approved' : 'pending',
+      readingId: String(x.readingId ?? d.id),
+      subscriberId: String(x.subscriberId ?? ''),
+      subscriberName: String(x.subscriberName ?? ''),
+      meterNumber: String(x.meterNumber ?? ''),
+      collectorName: String(x.collectorName ?? 'المحصّل'),
+      ...(typeof x.collectorCode === 'string'
+        ? { collectorCode: x.collectorCode }
+        : {}),
+      editedReading: Number(x.editedReading ?? 0),
+      previousReading: Number(x.previousReading ?? 0),
+      ...(typeof x.aiDetectedReading === 'number'
+        ? { aiDetectedReading: x.aiDetectedReading }
+        : {}),
+      ...(typeof x.aiConfidence === 'number'
+        ? { aiConfidence: x.aiConfidence }
+        : {}),
+      ...(typeof x.aiVerificationReason === 'string'
+        ? { aiVerificationReason: x.aiVerificationReason }
+        : {}),
+      photoUrl: '',
+      createdAt: timestampToIso(x.createdAt),
+      syncStatus: 'synced',
+    });
+  });
+
+  const collectorLocations: CollectorLocationRecord[] = [];
+  locSnap?.forEach((d) => {
+    const x = d.data() as Record<string, unknown>;
+    collectorLocations.push({
+      collectorCode: String(x.collectorCode ?? d.id),
+      collectorName: String(x.collectorName ?? 'المحصّل'),
+      lat: Number(x.lat ?? 0),
+      lng: Number(x.lng ?? 0),
+      ...(typeof x.accuracyMeters === 'number'
+        ? { accuracy: x.accuracyMeters }
+        : {}),
+      updatedAt: timestampToIso(x.updatedAt),
+    });
+  });
+
+  readings.sort((a, b) => b.recordedAt.localeCompare(a.recordedAt));
+  receipts.sort((a, b) => b.paidAt.localeCompare(a.paidAt));
+  alerts.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  collectorLocations.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+
+  return { readings, receipts, alerts, collectorLocations };
+}
+

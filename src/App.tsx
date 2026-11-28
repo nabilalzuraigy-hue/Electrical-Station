@@ -67,24 +67,25 @@ function StationWorkspace() {
 
     autoSyncLockRef.current = true;
     try {
-      const serverSnapshot = await fetchCloudAutoBackup({
-        adminToken,
-      });
+      const [serverSnapshot, cloudSnap] = await Promise.all([
+        fetchCloudAutoBackup({ adminToken }),
+        loadAdminStoreFromFirestore(true).catch(() => null),
+      ]);
 
-      if (!serverSnapshot.hasData) {
-        const cloudSnap = await loadAdminStoreFromFirestore(true);
-        if (
-          cloudSnap &&
-          (cloudSnap.stationCount > 0 || cloudSnap.codeCount > 0)
-        ) {
-          await restoreCloudAutoBackup({
-            adminToken,
-            backup: cloudSnap.backup,
-            mode: 'merge',
-          });
-        }
-      } else {
-        await saveAdminStoreToFirestore(serverSnapshot);
+      if (cloudSnap && (cloudSnap.stationCount > 0 || cloudSnap.codeCount > 0)) {
+        await restoreCloudAutoBackup({
+          adminToken,
+          backup: cloudSnap.backup,
+          mode: 'merge',
+        });
+      }
+
+      const mergedServer = serverSnapshot.hasData
+        ? await fetchCloudAutoBackup({ adminToken })
+        : serverSnapshot;
+
+      if (mergedServer.hasData) {
+        await saveAdminStoreToFirestore(mergedServer);
       }
     } catch {
       // Non-blocking automatic sync
@@ -141,33 +142,43 @@ function StationWorkspace() {
     void saveStationLocalState(next);
   };
 
-  const handleSyncNow = async () => {
-    if (!staffToken || !stationState || !accessRecord) return;
-    setIsSyncing(true);
-    setSyncNotice(null);
-    setSyncProgress(null);
-    try {
-      const { updatedState, syncedCount } = await syncStationPendingBatches({
-        state: stationState,
-        staffToken,
-        role: accessRecord.role,
-        onProgress: (p) => setSyncProgress(p),
-      });
-      setStationState(updatedState);
-      setSyncNotice(
-        `تمت المزامنة الآمنة لنسخة ${updatedState.station.stationName} (${syncedCount} سجل).`,
-      );
-      void runSilentGlobalCloudSync();
-      setTimeout(() => setSyncNotice(null), 4000);
-    } catch (err) {
-      setSyncNotice(
-        err instanceof Error ? err.message : 'تعذر إتمام المزامنة السحابية',
-      );
-    } finally {
-      setIsSyncing(false);
+  const handleSyncNow = useCallback(
+    async (options?: { silent?: boolean }) => {
+      if (!staffToken || !stationState || !accessRecord) return;
+      const silent = options?.silent ?? true;
+      setIsSyncing(true);
+      if (!silent) {
+        setSyncNotice(null);
+      }
       setSyncProgress(null);
-    }
-  };
+      try {
+        const { updatedState, syncedCount } = await syncStationPendingBatches({
+          state: stationState,
+          staffToken,
+          role: accessRecord.role,
+          onProgress: (p) => setSyncProgress(p),
+        });
+        setStationState(updatedState);
+        if (!silent && syncedCount > 0) {
+          setSyncNotice(
+            `تمت المزامنة الآمنة لنسخة ${updatedState.station.stationName} (${syncedCount} سجل).`,
+          );
+          setTimeout(() => setSyncNotice(null), 4000);
+        }
+        void runSilentGlobalCloudSync();
+      } catch (err) {
+        if (!silent) {
+          setSyncNotice(
+            err instanceof Error ? err.message : 'تعذر إتمام المزامنة السحابية',
+          );
+        }
+      } finally {
+        setIsSyncing(false);
+        setSyncProgress(null);
+      }
+    },
+    [staffToken, stationState, accessRecord, runSilentGlobalCloudSync],
+  );
 
   const handleUnifiedAuth = (result: UnifiedLoginResult) => {
     if (result.kind === 'admin') {

@@ -27,6 +27,7 @@ import {
 import {
   computeSubscriber3MonthAvgKwh,
   dispatchReadingToCloudBackground,
+  dispatchReceiptToCloudBackground,
   exportCollectorReadingsExcel,
   parseSubscribersExcelFile,
   refreshStationState,
@@ -71,7 +72,7 @@ interface CollectorAppProps {
   state: StationLocalState;
   staffToken: string;
   onUpdateState: (next: StationLocalState) => void;
-  onSyncNow: () => Promise<void>;
+  onSyncNow: (options?: { silent?: boolean }) => Promise<void>;
   isSyncing: boolean;
   syncProgress: import('../types/station').SyncProgress | null;
   activeCollector?: CollectorProfile;
@@ -428,24 +429,29 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     return r + rc + s + al;
   }, [state]);
 
-  // Auto-sync offline pending readings as soon as internet connectivity returns
+  // Auto-sync offline pending readings/receipts silently in batches as soon as internet connectivity returns
   useEffect(() => {
-    if (
-      isOnline &&
-      pendingCount > 0 &&
-      !isSyncing &&
-      !isManagerPreview &&
-      staffToken &&
-      !autoReconnectSyncTriggeredRef.current
-    ) {
+    if (!isOnline || pendingCount === 0 || isManagerPreview || !staffToken) {
+      if (pendingCount === 0) {
+        autoReconnectSyncTriggeredRef.current = false;
+      }
+      return;
+    }
+
+    if (!isSyncing && !autoReconnectSyncTriggeredRef.current) {
       autoReconnectSyncTriggeredRef.current = true;
-      void onSyncNow().catch(() => {
+      void onSyncNow({ silent: true }).catch(() => {
         autoReconnectSyncTriggeredRef.current = false;
       });
     }
-    if (pendingCount === 0) {
-      autoReconnectSyncTriggeredRef.current = false;
-    }
+
+    const retryTimer = window.setInterval(() => {
+      if (!isSyncing) {
+        void onSyncNow({ silent: true }).catch(() => {});
+      }
+    }, 20000);
+
+    return () => window.clearInterval(retryTimer);
   }, [isOnline, pendingCount, isSyncing, isManagerPreview, staffToken, onSyncNow]);
 
   const currentLocalPhotoEntry = useMemo(() => {
@@ -954,10 +960,35 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
         : s,
     );
 
+    const updatedSubRecord = updatedSubscribers.find(
+      (s) => s.id === selectedSubscriber.id,
+    );
+
     onUpdateState({
       ...state,
       subscribers: updatedSubscribers,
       receipts: [newReceipt, ...state.receipts],
+    });
+
+    void dispatchReceiptToCloudBackground({
+      stationId: state.station.stationId,
+      staffToken,
+      receipt: newReceipt,
+      subscriber: updatedSubRecord,
+    }).then((didSync) => {
+      if (!didSync) return;
+      const latest = stateRef.current;
+      onUpdateStateRef.current({
+        ...latest,
+        subscribers: latest.subscribers.map((s) =>
+          s.id === selectedSubscriber.id
+            ? { ...s, syncStatus: 'synced' as const }
+            : s,
+        ),
+        receipts: latest.receipts.map((rc) =>
+          rc.id === newReceipt.id ? { ...rc, syncStatus: 'synced' as const } : rc,
+        ),
+      });
     });
 
     setCashPaidInput('');
@@ -1542,7 +1573,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
             <button
               type="button"
               disabled={!isOnline || isSyncing || pendingCount === 0}
-              onClick={() => void onSyncNow()}
+              onClick={() => void onSyncNow({ silent: true })}
               className="min-h-[44px] px-4 py-2 text-xs font-medium rounded-lg bg-teal-700 hover:bg-teal-800 disabled:bg-slate-200 disabled:text-slate-500 text-white transition-colors inline-flex items-center gap-2 whitespace-nowrap cursor-pointer"
             >
               {pendingCount === 0 ? (

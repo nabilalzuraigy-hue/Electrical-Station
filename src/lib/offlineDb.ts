@@ -3,9 +3,14 @@ import { idbGet, idbSet } from './indexedDbCache';
 import {
   loadAccessCodeFromFirestore,
   loadStaffVaultFromFirestore,
+  loadStationCloudActivityFromFirestore,
   loadSubscriberPortalFromFirestore,
+  resolveManagerAlertInFirestore,
   saveAccessCodeToFirestore,
+  saveCollectorAlertTextToFirestore,
+  saveCollectorLocationToFirestore,
   saveCollectorReadingTextToFirestore,
+  saveCollectorReceiptTextToFirestore,
   type AdminStoreBackupPayload,
 } from './firestoreBackup';
 import {
@@ -802,6 +807,147 @@ function mapServerState(raw: {
   };
 }
 
+function mergeCloudActivityIntoState(
+  state: StationLocalState,
+  activity: {
+    readings: MeterReading[];
+    receipts: PaymentReceipt[];
+    alerts: ManagerAlert[];
+    collectorLocations: CollectorLocationRecord[];
+  },
+): StationLocalState {
+  const rdMap = new Map<string, MeterReading>();
+  activity.readings.forEach((r) => rdMap.set(r.id, { ...r, syncStatus: 'synced' }));
+  state.readings.forEach((r) => {
+    const existing = rdMap.get(r.id);
+    if (!existing) {
+      rdMap.set(r.id, r);
+    } else {
+      rdMap.set(r.id, {
+        ...existing,
+        ...r,
+        photoUrl: r.photoUrl || existing.photoUrl || '',
+        hasLocalPhoto: Boolean(r.photoUrl || r.hasLocalPhoto || existing.hasLocalPhoto),
+        syncStatus: r.syncStatus === 'pending' ? 'pending' : 'synced',
+      });
+    }
+  });
+  const readings = Array.from(rdMap.values()).sort((a, b) =>
+    String(b.recordedAt ?? '').localeCompare(String(a.recordedAt ?? '')),
+  );
+
+  const rcMap = new Map<string, PaymentReceipt>();
+  activity.receipts.forEach((rc) => rcMap.set(rc.id, { ...rc, syncStatus: 'synced' }));
+  state.receipts.forEach((rc) => {
+    const existing = rcMap.get(rc.id);
+    if (!existing || rc.syncStatus === 'pending') {
+      rcMap.set(rc.id, rc);
+    }
+  });
+  const receipts = Array.from(rcMap.values()).sort((a, b) =>
+    String(b.paidAt ?? '').localeCompare(String(a.paidAt ?? '')),
+  );
+
+  const alMap = new Map<string, ManagerAlert>();
+  activity.alerts.forEach((al) => alMap.set(al.id, { ...al, syncStatus: 'synced' }));
+  (state.alerts ?? []).forEach((al) => {
+    const existing = alMap.get(al.id);
+    if (!existing || al.syncStatus === 'pending') {
+      alMap.set(al.id, al);
+    } else if (existing.status === 'pending' && al.status !== 'pending') {
+      alMap.set(al.id, al);
+    }
+  });
+  const alerts = Array.from(alMap.values()).sort((a, b) =>
+    String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')),
+  );
+
+  const locMap = new Map<string, CollectorLocationRecord>();
+  (state.collectorLocations ?? []).forEach((l) => locMap.set(l.collectorCode, l));
+  activity.collectorLocations.forEach((l) => {
+    const cur = locMap.get(l.collectorCode);
+    if (!cur || String(l.updatedAt).localeCompare(String(cur.updatedAt)) >= 0) {
+      locMap.set(l.collectorCode, l);
+    }
+  });
+  const collectorLocations = Array.from(locMap.values()).sort((a, b) =>
+    String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')),
+  );
+
+  // Reconcile subscriber balances & readings from newer synced cloud readings/receipts
+  const latestReadingBySubId = new Map<string, MeterReading>();
+  const latestReadingByMeter = new Map<string, MeterReading>();
+  for (const r of readings) {
+    if (r.approvalStatus === 'rejected' || r.approvalStatus === 'pending_manager') continue;
+    if (r.subscriberId && !latestReadingBySubId.has(r.subscriberId)) {
+      latestReadingBySubId.set(r.subscriberId, r);
+    }
+    if (r.meterNumber && !latestReadingByMeter.has(r.meterNumber)) {
+      latestReadingByMeter.set(r.meterNumber, r);
+    }
+  }
+
+  const latestReceiptBySubId = new Map<string, PaymentReceipt>();
+  const latestReceiptByMeter = new Map<string, PaymentReceipt>();
+  for (const rc of receipts) {
+    if (rc.subscriberId && !latestReceiptBySubId.has(rc.subscriberId)) {
+      latestReceiptBySubId.set(rc.subscriberId, rc);
+    }
+    if (rc.meterNumber && !latestReceiptByMeter.has(rc.meterNumber)) {
+      latestReceiptByMeter.set(rc.meterNumber, rc);
+    }
+  }
+
+  const subscribers = state.subscribers.map((sub) => {
+    if (sub.syncStatus === 'pending') return sub;
+    const latestRd =
+      latestReadingBySubId.get(sub.id) ?? latestReadingByMeter.get(sub.meterNumber);
+    const latestRc =
+      latestReceiptBySubId.get(sub.id) ?? latestReceiptByMeter.get(sub.meterNumber);
+
+    const subTs = String(sub.updatedAt ?? '');
+    const rdTs = latestRd ? String(latestRd.recordedAt ?? '') : '';
+    const rcTs = latestRc ? String(latestRc.paidAt ?? '') : '';
+
+    let nextPrev = sub.previousReading;
+    let nextCurr = sub.currentReading;
+    let nextDebt = sub.previousDebtYer;
+    let nextUpdatedAt = subTs;
+
+    if (latestRd && rdTs > subTs) {
+      nextPrev = latestRd.currentReading;
+      nextCurr = latestRd.currentReading;
+      nextDebt = latestRd.totalDueYer;
+      nextUpdatedAt = rdTs;
+    }
+
+    if (latestRc && rcTs >= nextUpdatedAt && rcTs > subTs) {
+      nextDebt = latestRc.remainingBalanceYer;
+      nextUpdatedAt = rcTs;
+    }
+
+    if (nextUpdatedAt !== subTs) {
+      return {
+        ...sub,
+        previousReading: nextPrev,
+        currentReading: nextCurr,
+        previousDebtYer: nextDebt,
+        updatedAt: nextUpdatedAt,
+      };
+    }
+    return sub;
+  });
+
+  return {
+    ...state,
+    subscribers,
+    readings,
+    receipts,
+    alerts,
+    collectorLocations,
+  };
+}
+
 function mergeLocalPendingWithCloud(
   local: StationLocalState | null,
   cloud: StationLocalState,
@@ -809,10 +955,18 @@ function mergeLocalPendingWithCloud(
   if (!local || local.station.stationId !== cloud.station.stationId) {
     return cloud;
   }
-  const pendingSubs = local.subscribers.filter((s) => s.syncStatus === 'pending');
   const subMap = new Map<string, Subscriber>();
-  cloud.subscribers.forEach((s) => subMap.set(s.id, s));
-  pendingSubs.forEach((s) => subMap.set(s.id, s));
+  // Guard: never wipe cached subscribers if cloud returned an empty list unexpectedly
+  if (cloud.subscribers.length === 0 && local.subscribers.length > 0) {
+    local.subscribers.forEach((s) => subMap.set(s.id, s));
+  } else {
+    cloud.subscribers.forEach((s) => subMap.set(s.id, s));
+    local.subscribers.forEach((s) => {
+      if (s.syncStatus === 'pending' || (s.importedLocally && !subMap.has(s.id))) {
+        subMap.set(s.id, s);
+      }
+    });
+  }
 
   // Preserve meter photos stored locally in the collector's phone IndexedDB memory
   const localPhotoByReadingId = new Map<string, string>();
@@ -953,7 +1107,7 @@ export async function loginUnified(
         if (staffVault.station.licenseStatus !== 'active') {
           throw new Error('تم إيقاف ترخيص هذه المحطة من قِبل الإدارة.');
         }
-        const cloudState = mapServerState({
+        let cloudState = mapServerState({
           station: staffVault.station,
           collectors: staffVault.collectors,
           subscribers: staffVault.subscribers,
@@ -963,6 +1117,12 @@ export async function loginUnified(
           expenses: staffVault.expenses,
           collectorLocations: staffVault.collectorLocations,
         });
+        const activity = await loadStationCloudActivityFromFirestore(
+          cloudState.station.stationId,
+        ).catch(() => null);
+        if (activity) {
+          cloudState = mergeCloudActivityIntoState(cloudState, activity);
+        }
         const local = await loadStationLocalState(cloudState.station.stationId);
         const merged = mergeLocalPendingWithCloud(local, cloudState);
         await saveStationLocalState(merged);
@@ -1044,7 +1204,15 @@ export async function loginWithAccessCode(codeInput: string): Promise<{
       throw new Error('تم إلغاء تفعيل هذا الكود من الإدارة.');
     }
 
-    const cloudState = mapServerState(res.state);
+    let cloudState = mapServerState(res.state);
+    if (typeof navigator === 'undefined' || navigator.onLine !== false) {
+      const activity = await loadStationCloudActivityFromFirestore(
+        cloudState.station.stationId,
+      ).catch(() => null);
+      if (activity) {
+        cloudState = mergeCloudActivityIntoState(cloudState, activity);
+      }
+    }
     const local = await loadStationLocalState(cloudState.station.stationId);
     const merged = mergeLocalPendingWithCloud(local, cloudState);
     await saveStationLocalState(merged);
@@ -1064,7 +1232,7 @@ export async function loginWithAccessCode(codeInput: string): Promise<{
       if (staffVault.station.licenseStatus !== 'active') {
         throw new Error('تم إيقاف ترخيص هذه المحطة من قِبل الإدارة.');
       }
-      const cloudState = mapServerState({
+      let cloudState = mapServerState({
         station: staffVault.station,
         collectors: staffVault.collectors,
         subscribers: staffVault.subscribers,
@@ -1074,6 +1242,12 @@ export async function loginWithAccessCode(codeInput: string): Promise<{
         expenses: staffVault.expenses,
         collectorLocations: staffVault.collectorLocations,
       });
+      const activity = await loadStationCloudActivityFromFirestore(
+        cloudState.station.stationId,
+      ).catch(() => null);
+      if (activity) {
+        cloudState = mergeCloudActivityIntoState(cloudState, activity);
+      }
       const local = await loadStationLocalState(cloudState.station.stationId);
       const merged = mergeLocalPendingWithCloud(local, cloudState);
       await saveStationLocalState(merged);
@@ -1148,11 +1322,17 @@ export async function refreshStationState(
   stationId: string,
   staffToken: string,
 ): Promise<StationLocalState> {
+  const local = await loadStationLocalState(stationId);
+
   if (staffToken.startsWith('cloud_')) {
     const code = normalizeActivationCode(staffToken.slice('cloud_'.length));
-    const staffVault = code ? await loadStaffVaultFromFirestore(code) : null;
+    const [staffVault, activity] = await Promise.all([
+      code ? loadStaffVaultFromFirestore(code) : Promise.resolve(null),
+      loadStationCloudActivityFromFirestore(stationId).catch(() => null),
+    ]);
+
     if (staffVault) {
-      const cloudState = mapServerState({
+      let cloudState = mapServerState({
         station: staffVault.station,
         collectors: staffVault.collectors,
         subscribers: staffVault.subscribers,
@@ -1162,54 +1342,91 @@ export async function refreshStationState(
         expenses: staffVault.expenses,
         collectorLocations: staffVault.collectorLocations,
       });
-      const local = await loadStationLocalState(stationId);
-      const merged = mergeLocalPendingWithCloud(local, cloudState);
+      if (activity) {
+        cloudState = mergeCloudActivityIntoState(cloudState, activity);
+      }
+      const freshestLocal = (await loadStationLocalState(stationId)) ?? local;
+      const merged = mergeLocalPendingWithCloud(freshestLocal, cloudState);
       await saveStationLocalState(merged);
       return merged;
     }
-    const local = await loadStationLocalState(stationId);
-    if (local) return local;
+
+    const freshestLocal = (await loadStationLocalState(stationId)) ?? local;
+    if (freshestLocal) {
+      const mergedLocal = activity
+        ? mergeCloudActivityIntoState(freshestLocal, activity)
+        : freshestLocal;
+      await saveStationLocalState(mergedLocal);
+      return mergedLocal;
+    }
     throw new StaticHostingNoBackendError();
   }
 
-  const res = await apiRequest<{
-    station: StationConfig;
-    collectors?: AccessCodeRecord[];
-    subscribers?: Subscriber[];
-    readings?: MeterReading[];
-    receipts?: PaymentReceipt[];
-    alerts?: ManagerAlert[];
-    expenses?: DieselExpenseEntry[];
-    collectorLocations?: CollectorLocationRecord[];
-  }>(`/api/stations/${encodeURIComponent(stationId)}/state`, {}, staffToken);
+  try {
+    const [res, activity] = await Promise.all([
+      apiRequest<{
+        station: StationConfig;
+        collectors?: AccessCodeRecord[];
+        subscribers?: Subscriber[];
+        readings?: MeterReading[];
+        receipts?: PaymentReceipt[];
+        alerts?: ManagerAlert[];
+        expenses?: DieselExpenseEntry[];
+        collectorLocations?: CollectorLocationRecord[];
+      }>(`/api/stations/${encodeURIComponent(stationId)}/state`, {}, staffToken),
+      loadStationCloudActivityFromFirestore(stationId).catch(() => null),
+    ]);
 
-  const cloudState = mapServerState(res);
-  const local = await loadStationLocalState(stationId);
-  const merged = mergeLocalPendingWithCloud(local, cloudState);
-  await saveStationLocalState(merged);
-  return merged;
+    let cloudState = mapServerState(res);
+    if (activity) {
+      cloudState = mergeCloudActivityIntoState(cloudState, activity);
+    }
+    const freshestLocal = (await loadStationLocalState(stationId)) ?? local;
+    const merged = mergeLocalPendingWithCloud(freshestLocal, cloudState);
+    await saveStationLocalState(merged);
+    return merged;
+  } catch (err) {
+    const freshestLocal = (await loadStationLocalState(stationId)) ?? local;
+    if (err instanceof StaticHostingNoBackendError && freshestLocal) {
+      const activity = await loadStationCloudActivityFromFirestore(stationId).catch(
+        () => null,
+      );
+      const mergedLocal = activity
+        ? mergeCloudActivityIntoState(freshestLocal, activity)
+        : freshestLocal;
+      await saveStationLocalState(mergedLocal);
+      return mergedLocal;
+    }
+    throw err;
+  }
 }
 
 export async function saveStationTariffInCloud(
   staffToken: string,
   station: StationConfig,
 ): Promise<void> {
-  await apiRequest(
-    `/api/stations/${encodeURIComponent(station.stationId)}/config`,
-    {
-      method: 'PATCH',
-      body: JSON.stringify({
-        stationName: station.stationName,
-        kwhPriceYer: station.kwhPriceYer,
-        minimumFeeYer: station.minimumFeeYer,
-        mainGeneratorKwh: station.mainGeneratorKwh,
-        ...(station.zoneGeneratorKwh
-          ? { zoneGeneratorKwh: station.zoneGeneratorKwh }
-          : {}),
-      }),
-    },
-    staffToken,
-  );
+  if (!staffToken || staffToken.startsWith('cloud_')) return;
+  try {
+    await apiRequest(
+      `/api/stations/${encodeURIComponent(station.stationId)}/config`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({
+          stationName: station.stationName,
+          kwhPriceYer: station.kwhPriceYer,
+          minimumFeeYer: station.minimumFeeYer,
+          mainGeneratorKwh: station.mainGeneratorKwh,
+          ...(station.zoneGeneratorKwh
+            ? { zoneGeneratorKwh: station.zoneGeneratorKwh }
+            : {}),
+        }),
+      },
+      staffToken,
+    );
+  } catch (err) {
+    if (err instanceof StaticHostingNoBackendError) return;
+    throw err;
+  }
 }
 
 export async function addDieselExpenseInCloud(params: {
@@ -1254,24 +1471,77 @@ export async function sendCollectorLocationInCloud(params: {
   lastMeterNumber?: string;
   zoneStreet?: string;
 }): Promise<CollectorLocationRecord> {
-  const res = await apiRequest<{ location: CollectorLocationRecord }>(
-    `/api/stations/${encodeURIComponent(params.stationId)}/collector-location`,
-    {
-      method: 'POST',
-      body: JSON.stringify({
+  const fallbackLoc: CollectorLocationRecord = {
+    collectorCode: params.collectorCode || 'collector',
+    collectorName: params.collectorName,
+    lat: params.lat,
+    lng: params.lng,
+    ...(typeof params.accuracy === 'number' ? { accuracy: params.accuracy } : {}),
+    ...(params.lastSubscriberName ? { lastSubscriberName: params.lastSubscriberName } : {}),
+    ...(params.lastMeterNumber ? { lastMeterNumber: params.lastMeterNumber } : {}),
+    ...(params.zoneStreet ? { zoneStreet: params.zoneStreet } : {}),
+    updatedAt: new Date().toISOString(),
+  };
+
+  if (params.staffToken.startsWith('cloud_')) {
+    if (params.collectorCode) {
+      await saveCollectorLocationToFirestore({
+        stationId: params.stationId,
         collectorCode: params.collectorCode,
         collectorName: params.collectorName,
         lat: params.lat,
         lng: params.lng,
         accuracy: params.accuracy,
-        lastSubscriberName: params.lastSubscriberName,
-        lastMeterNumber: params.lastMeterNumber,
-        zoneStreet: params.zoneStreet,
-      }),
-    },
-    params.staffToken,
-  );
-  return res.location;
+      });
+    }
+    return fallbackLoc;
+  }
+
+  try {
+    const res = await apiRequest<{ location: CollectorLocationRecord }>(
+      `/api/stations/${encodeURIComponent(params.stationId)}/collector-location`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          collectorCode: params.collectorCode,
+          collectorName: params.collectorName,
+          lat: params.lat,
+          lng: params.lng,
+          accuracy: params.accuracy,
+          lastSubscriberName: params.lastSubscriberName,
+          lastMeterNumber: params.lastMeterNumber,
+          zoneStreet: params.zoneStreet,
+        }),
+      },
+      params.staffToken,
+    );
+    if (params.collectorCode) {
+      void saveCollectorLocationToFirestore({
+        stationId: params.stationId,
+        collectorCode: params.collectorCode,
+        collectorName: params.collectorName,
+        lat: params.lat,
+        lng: params.lng,
+        accuracy: params.accuracy,
+      });
+    }
+    return res.location;
+  } catch (err) {
+    if (err instanceof StaticHostingNoBackendError) {
+      if (params.collectorCode) {
+        await saveCollectorLocationToFirestore({
+          stationId: params.stationId,
+          collectorCode: params.collectorCode,
+          collectorName: params.collectorName,
+          lat: params.lat,
+          lng: params.lng,
+          accuracy: params.accuracy,
+        });
+      }
+      return fallbackLoc;
+    }
+    throw err;
+  }
 }
 
 export async function updateCollectorInCloud(params: {
@@ -1370,17 +1640,47 @@ export async function sendInstantManagerAlert(params: {
         hasLocalPhoto: Boolean(params.reading.photoUrl || params.reading.hasLocalPhoto),
       }
     : undefined;
-  return apiRequest<{ alert: ManagerAlert }>(
-    `/api/stations/${encodeURIComponent(params.stationId)}/alerts`,
-    {
-      method: 'POST',
-      body: JSON.stringify({
+
+  if (params.staffToken.startsWith('cloud_')) {
+    const ok = await saveCollectorAlertTextToFirestore({
+      stationId: params.stationId,
+      alert: textOnlyAlert,
+    });
+    if (!ok) {
+      throw new StaticHostingNoBackendError();
+    }
+    return { alert: { ...textOnlyAlert, syncStatus: 'synced' } };
+  }
+
+  try {
+    const res = await apiRequest<{ alert: ManagerAlert }>(
+      `/api/stations/${encodeURIComponent(params.stationId)}/alerts`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          alert: textOnlyAlert,
+          ...(textOnlyReading ? { reading: textOnlyReading } : {}),
+        }),
+      },
+      params.staffToken,
+    );
+    void saveCollectorAlertTextToFirestore({
+      stationId: params.stationId,
+      alert: textOnlyAlert,
+    });
+    return res;
+  } catch (err) {
+    if (err instanceof StaticHostingNoBackendError) {
+      const ok = await saveCollectorAlertTextToFirestore({
+        stationId: params.stationId,
         alert: textOnlyAlert,
-        ...(textOnlyReading ? { reading: textOnlyReading } : {}),
-      }),
-    },
-    params.staffToken,
-  );
+      });
+      if (ok) {
+        return { alert: { ...textOnlyAlert, syncStatus: 'synced' } };
+      }
+    }
+    throw err;
+  }
 }
 
 export async function resolveManagerAlert(params: {
@@ -1394,21 +1694,100 @@ export async function resolveManagerAlert(params: {
   reading: MeterReading | null;
   subscriber: Subscriber | null;
 }> {
-  return apiRequest<{
-    alert: ManagerAlert;
-    reading: MeterReading | null;
-    subscriber: Subscriber | null;
-  }>(
-    `/api/stations/${encodeURIComponent(params.stationId)}/alerts/${encodeURIComponent(params.alertId)}/resolve`,
-    {
-      method: 'POST',
-      body: JSON.stringify({
-        decision: params.decision,
-        ...(params.managerNote ? { managerNote: params.managerNote } : {}),
-      }),
-    },
-    params.staffToken,
-  );
+  const resolveLocallyAndFirestore = async () => {
+    const managerCode = params.staffToken.startsWith('cloud_')
+      ? normalizeActivationCode(params.staffToken.slice('cloud_'.length))
+      : undefined;
+    await resolveManagerAlertInFirestore({
+      stationId: params.stationId,
+      alertId: params.alertId,
+      managerCode,
+    });
+    const local = await loadStationLocalState(params.stationId);
+    const now = new Date().toISOString();
+    const existingAlert = (local?.alerts ?? []).find((a) => a.id === params.alertId);
+    const updatedAlert: ManagerAlert = existingAlert
+      ? {
+          ...existingAlert,
+          status: params.decision,
+          resolvedAt: now,
+          ...(params.managerNote ? { managerNote: params.managerNote } : {}),
+          syncStatus: 'synced',
+        }
+      : {
+          id: params.alertId,
+          stationId: params.stationId,
+          alertType: 'lower_reading',
+          severity: 'warning',
+          status: params.decision,
+          readingId: '',
+          subscriberId: '',
+          subscriberName: '',
+          meterNumber: '',
+          collectorName: '',
+          editedReading: 0,
+          previousReading: 0,
+          photoUrl: '',
+          createdAt: now,
+          resolvedAt: now,
+          syncStatus: 'synced',
+        };
+    const existingReading = local?.readings.find((r) => r.id === updatedAlert.readingId);
+    const updatedReading: MeterReading | null = existingReading
+      ? {
+          ...existingReading,
+          approvalStatus: params.decision === 'approved' ? 'approved' : 'rejected',
+        }
+      : null;
+    const existingSub = local?.subscribers.find((s) => s.id === updatedAlert.subscriberId);
+    const updatedSubscriber: Subscriber | null =
+      existingSub && updatedReading && params.decision === 'approved'
+        ? {
+            ...existingSub,
+            previousReading: updatedReading.currentReading,
+            currentReading: updatedReading.currentReading,
+            previousDebtYer: updatedReading.totalDueYer,
+            updatedAt: now,
+          }
+        : null;
+    return {
+      alert: updatedAlert,
+      reading: updatedReading,
+      subscriber: updatedSubscriber,
+    };
+  };
+
+  if (params.staffToken.startsWith('cloud_')) {
+    return resolveLocallyAndFirestore();
+  }
+
+  try {
+    const res = await apiRequest<{
+      alert: ManagerAlert;
+      reading: MeterReading | null;
+      subscriber: Subscriber | null;
+    }>(
+      `/api/stations/${encodeURIComponent(params.stationId)}/alerts/${encodeURIComponent(params.alertId)}/resolve`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          decision: params.decision,
+          ...(params.managerNote ? { managerNote: params.managerNote } : {}),
+        }),
+      },
+      params.staffToken,
+    );
+    void resolveManagerAlertInFirestore({
+      stationId: params.stationId,
+      alertId: params.alertId,
+    });
+    return res;
+  } catch (err) {
+    if (err instanceof StaticHostingNoBackendError) {
+      return resolveLocallyAndFirestore();
+    }
+    throw err;
+  }
 }
 
 // ============================================================
@@ -1427,8 +1806,10 @@ export async function syncStationPendingBatches(params: {
   let working = { ...params.state };
   const stationId = working.station.stationId;
 
-  if (params.role === 'manager') {
-    await saveStationTariffInCloud(params.staffToken, working.station);
+  if (params.role === 'manager' && !params.staffToken.startsWith('cloud_')) {
+    await saveStationTariffInCloud(params.staffToken, working.station).catch((err) => {
+      if (!(err instanceof StaticHostingNoBackendError)) throw err;
+    });
   }
 
   const pendingSubs = working.subscribers.filter((s) => s.syncStatus === 'pending');
@@ -1502,18 +1883,30 @@ export async function syncStationPendingBatches(params: {
 
   for (const batch of subBatches) {
     currentBatch++;
-    await apiRequest(
-      `/api/stations/${encodeURIComponent(stationId)}/sync-batch`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ subscribers: batch, readings: [], receipts: [] }),
-      },
-      params.staffToken,
-    );
-    const ids = new Set(batch.map((b) => b.id));
-    await commitLocalProgress(ids, new Set(), new Set(), new Set());
+    let subSynced = false;
+    if (!params.staffToken.startsWith('cloud_')) {
+      try {
+        await apiRequest(
+          `/api/stations/${encodeURIComponent(stationId)}/sync-batch`,
+          {
+            method: 'POST',
+            body: JSON.stringify({ subscribers: batch, readings: [], receipts: [] }),
+          },
+          params.staffToken,
+        );
+        subSynced = true;
+      } catch (err) {
+        if (!(err instanceof StaticHostingNoBackendError)) {
+          throw err;
+        }
+      }
+    }
+    const ids = subSynced ? new Set(batch.map((b) => b.id)) : new Set<string>();
+    if (subSynced) {
+      await commitLocalProgress(ids, new Set(), new Set(), new Set());
+      syncedCount += batch.length;
+    }
     completed += batch.length;
-    syncedCount += batch.length;
     params.onProgress?.({ completed, total: totalItems, currentBatch, totalBatches });
   }
 
@@ -1525,7 +1918,8 @@ export async function syncStationPendingBatches(params: {
       if (
         working.station.aiPhotoVerificationEnabled &&
         r.aiVerificationStatus === 'pending_offline' &&
-        r.photoUrl
+        r.photoUrl &&
+        !params.staffToken.startsWith('cloud_')
       ) {
         try {
           const aiRes = await verifyMeterPhotoWithGemini({
@@ -1607,7 +2001,6 @@ export async function syncStationPendingBatches(params: {
       );
       batchSynced = firestoreResults.some(Boolean);
     } else {
-      // Best-effort Firestore mirror when authenticated
       void Promise.all(
         payloadReadings.map((rd) =>
           saveCollectorReadingTextToFirestore({ stationId, reading: rd }),
@@ -1620,8 +2013,11 @@ export async function syncStationPendingBatches(params: {
       ...working,
       readings: working.readings.map((r) => verifiedById.get(r.id) ?? r),
     };
-    const ids = batchSynced ? new Set(batch.map((b) => b.id)) : new Set<string>();
-    await commitLocalProgress(new Set(), ids, new Set(), new Set());
+    const syncedRdIds = batchSynced ? new Set(batch.map((b) => b.id)) : new Set<string>();
+    const syncedSubIds = batchSynced
+      ? new Set(batch.map((b) => b.subscriberId))
+      : new Set<string>();
+    await commitLocalProgress(syncedSubIds, syncedRdIds, new Set(), new Set());
     completed += batch.length;
     if (batchSynced) {
       syncedCount += batch.length;
@@ -1631,6 +2027,7 @@ export async function syncStationPendingBatches(params: {
 
   for (const batch of receiptBatches) {
     currentBatch++;
+    let batchSynced = false;
     if (!params.staffToken.startsWith('cloud_')) {
       try {
         await apiRequest(
@@ -1641,14 +2038,34 @@ export async function syncStationPendingBatches(params: {
           },
           params.staffToken,
         );
-        const ids = new Set(batch.map((b) => b.id));
-        await commitLocalProgress(new Set(), new Set(), ids, new Set());
-        syncedCount += batch.length;
+        batchSynced = true;
       } catch (err) {
         if (!(err instanceof StaticHostingNoBackendError)) {
           throw err;
         }
       }
+    }
+
+    if (!batchSynced) {
+      const firestoreResults = await Promise.all(
+        batch.map((rc) =>
+          saveCollectorReceiptTextToFirestore({ stationId, receipt: rc }),
+        ),
+      );
+      batchSynced = firestoreResults.some(Boolean);
+    } else {
+      void Promise.all(
+        batch.map((rc) =>
+          saveCollectorReceiptTextToFirestore({ stationId, receipt: rc }),
+        ),
+      );
+    }
+
+    if (batchSynced) {
+      const syncedRcIds = new Set(batch.map((b) => b.id));
+      const syncedSubIds = new Set(batch.map((b) => b.subscriberId));
+      await commitLocalProgress(syncedSubIds, new Set(), syncedRcIds, new Set());
+      syncedCount += batch.length;
     }
     completed += batch.length;
     params.onProgress?.({ completed, total: totalItems, currentBatch, totalBatches });
@@ -1659,6 +2076,8 @@ export async function syncStationPendingBatches(params: {
     const textOnlyAlerts = batch
       .filter((al) => al.alertType !== 'manual_edit')
       .map((al) => ({ ...al, photoUrl: '' }));
+    let batchSynced = false;
+
     if (textOnlyAlerts.length > 0 && !params.staffToken.startsWith('cloud_')) {
       try {
         await apiRequest(
@@ -1674,14 +2093,33 @@ export async function syncStationPendingBatches(params: {
           },
           params.staffToken,
         );
-        const ids = new Set(batch.map((b) => b.id));
-        await commitLocalProgress(new Set(), new Set(), new Set(), ids);
-        syncedCount += batch.length;
+        batchSynced = true;
       } catch (err) {
         if (!(err instanceof StaticHostingNoBackendError)) {
           throw err;
         }
       }
+    }
+
+    if (textOnlyAlerts.length > 0 && !batchSynced) {
+      const firestoreResults = await Promise.all(
+        textOnlyAlerts.map((al) =>
+          saveCollectorAlertTextToFirestore({ stationId, alert: al }),
+        ),
+      );
+      batchSynced = firestoreResults.some(Boolean);
+    } else if (textOnlyAlerts.length > 0) {
+      void Promise.all(
+        textOnlyAlerts.map((al) =>
+          saveCollectorAlertTextToFirestore({ stationId, alert: al }),
+        ),
+      );
+    }
+
+    if (batchSynced || textOnlyAlerts.length === 0) {
+      const ids = new Set(batch.map((b) => b.id));
+      await commitLocalProgress(new Set(), new Set(), new Set(), ids);
+      syncedCount += batch.length;
     }
     completed += batch.length;
     params.onProgress?.({ completed, total: totalItems, currentBatch, totalBatches });
@@ -1735,9 +2173,65 @@ export async function dispatchReadingToCloudBackground(params: {
     }
   }
 
-  const firestoreOk = await saveCollectorReadingTextToFirestore({
+  const [readingOk, receiptOk] = await Promise.all([
+    saveCollectorReadingTextToFirestore({
+      stationId: params.stationId,
+      reading: textOnlyReading,
+    }),
+    params.receipt
+      ? saveCollectorReceiptTextToFirestore({
+          stationId: params.stationId,
+          receipt: params.receipt,
+        })
+      : Promise.resolve(true),
+    ...(params.alerts ?? []).map((al) =>
+      saveCollectorAlertTextToFirestore({
+        stationId: params.stationId,
+        alert: al,
+      }),
+    ),
+  ]);
+
+  return synced || (readingOk && receiptOk);
+}
+
+/**
+ * Sends a cash-only receipt in the background immediately when online.
+ */
+export async function dispatchReceiptToCloudBackground(params: {
+  stationId: string;
+  staffToken: string;
+  receipt: PaymentReceipt;
+  subscriber?: Subscriber;
+}): Promise<boolean> {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return false;
+  }
+
+  let synced = false;
+  if (params.staffToken && !params.staffToken.startsWith('cloud_')) {
+    try {
+      await apiRequest(
+        `/api/stations/${encodeURIComponent(params.stationId)}/sync-batch`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            subscribers: params.subscriber ? [params.subscriber] : [],
+            readings: [],
+            receipts: [params.receipt],
+          }),
+        },
+        params.staffToken,
+      );
+      synced = true;
+    } catch {
+      // fallback to Firestore
+    }
+  }
+
+  const firestoreOk = await saveCollectorReceiptTextToFirestore({
     stationId: params.stationId,
-    reading: textOnlyReading,
+    receipt: params.receipt,
   });
 
   return synced || firestoreOk;

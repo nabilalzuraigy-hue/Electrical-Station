@@ -55,7 +55,7 @@ interface ManagerDashboardProps {
   state: StationLocalState;
   staffToken: string;
   onUpdateState: (next: StationLocalState) => void;
-  onSyncNow: () => Promise<void>;
+  onSyncNow: (options?: { silent?: boolean }) => Promise<void>;
   isSyncing: boolean;
   syncProgress: SyncProgress | null;
 }
@@ -269,13 +269,15 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
       });
   }, [state.subscribers, searchQuery, zoneFilter]);
 
-  // Auto-poll server every 15s for real-time instant manager notifications & text sync
+  // Auto-poll server & Firestore every 15s (and on reconnect) for seamless silent sync
   useEffect(() => {
-    if (!staffToken || (typeof navigator !== 'undefined' && !navigator.onLine))
-      return;
-    const timer = window.setInterval(async () => {
+    if (!staffToken) return;
+    const syncAndPull = async () => {
       if (typeof navigator !== 'undefined' && !navigator.onLine) return;
       try {
+        if (metrics.pendingSyncCount > 0 && !isSyncing) {
+          await onSyncNow({ silent: true });
+        }
         const updated = await refreshStationState(
           state.station.stationId,
           staffToken,
@@ -284,9 +286,26 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
       } catch {
         // silent background poll
       }
+    };
+    const timer = window.setInterval(() => {
+      void syncAndPull();
     }, 15000);
-    return () => window.clearInterval(timer);
-  }, [state.station.stationId, staffToken, onUpdateState]);
+    const onOnline = () => {
+      void syncAndPull();
+    };
+    window.addEventListener('online', onOnline);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('online', onOnline);
+    };
+  }, [
+    state.station.stationId,
+    staffToken,
+    onUpdateState,
+    onSyncNow,
+    metrics.pendingSyncCount,
+    isSyncing,
+  ]);
 
   const sortedAlerts = useMemo(() => {
     const all = [...(state.alerts ?? [])].sort((a, b) =>
