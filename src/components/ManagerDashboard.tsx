@@ -4,6 +4,7 @@ import {
   BarChart3,
   BellRing,
   Check,
+  Clock,
   Download,
   Flame,
   HardDrive,
@@ -27,6 +28,12 @@ import {
   updateCollectorInCloud,
   type StationLocalState,
 } from '../lib/offlineDb';
+import {
+  appendAlertsHistory,
+  loadAlertsHistory,
+  loadAlertsHistorySync,
+  type AlertHistoryEntry,
+} from '../lib/alertsHistory';
 import { CollectorTrackingMap } from './CollectorTrackingMap';
 import { DieselProfitLossSection } from './DieselProfitLossSection';
 import { formatCompactYer, formatKwh, formatYer } from '../lib/formatters';
@@ -43,6 +50,11 @@ const LOWER_REASON_AR: Record<LowerReadingReason, string> = {
   meter_reset: 'تم تصفير العداد',
   previous_error: 'خطأ في القراءة السابقة',
 };
+
+export type ReadingEvaluationState =
+  | 'no_reading'
+  | 'zero_consumption'
+  | 'normal';
 
 type ManagerTab =
   | 'overview_loss'
@@ -97,6 +109,10 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
     url: string;
   } | null>(null);
 
+  const [alertsHistory, setAlertsHistory] = useState<AlertHistoryEntry[]>(() =>
+    loadAlertsHistorySync(state.station.stationId),
+  );
+
   const [stationName, setStationName] = useState(state.station.stationName);
   const [kwhPrice, setKwhPrice] = useState(String(state.station.kwhPriceYer));
   const [minFee, setMinFee] = useState(String(state.station.minimumFeeYer));
@@ -106,13 +122,27 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
 
   const metrics = useMemo(() => {
     const activeSubscribers = state.subscribers.length;
-    const totalKwhSold = state.readings.reduce(
+    const validReadings = state.readings.filter(
+      (r) => r.approvalStatus !== 'rejected',
+    );
+    const totalKwhSold = validReadings.reduce(
       (sum, r) => sum + r.consumptionKwh,
       0,
     );
+    const stationReadingState: ReadingEvaluationState =
+      validReadings.length === 0
+        ? 'no_reading'
+        : totalKwhSold <= 0
+          ? 'zero_consumption'
+          : 'normal';
+
     const mainGen = state.station.mainGeneratorKwh;
-    const powerLossKwh = Math.max(0, mainGen - totalKwhSold);
-    const lossPercent = mainGen > 0 ? (powerLossKwh / mainGen) * 100 : 0;
+    const canComputeLoss = stationReadingState === 'normal' && mainGen > 0;
+    const powerLossKwh = canComputeLoss ? Math.max(0, mainGen - totalKwhSold) : 0;
+    const lossPercent: number | null = canComputeLoss
+      ? (powerLossKwh / mainGen) * 100
+      : null;
+
     const totalCollectedCash = state.receipts.reduce(
       (sum, rc) => sum + rc.amountPaidYer,
       0,
@@ -128,6 +158,8 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
 
     return {
       activeSubscribers,
+      validReadingsCount: validReadings.length,
+      stationReadingState,
       totalKwhSold,
       mainGen,
       powerLossKwh,
@@ -155,10 +187,12 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
     });
 
     const soldByZone = new Map<string, number>();
+    const readingCountByZone = new Map<string, number>();
     state.readings.forEach((rd) => {
       if (rd.approvalStatus === 'rejected') return;
       const z = subToZone.get(rd.subscriberId) || 'عام';
       soldByZone.set(z, (soldByZone.get(z) ?? 0) + rd.consumptionKwh);
+      readingCountByZone.set(z, (readingCountByZone.get(z) ?? 0) + 1);
     });
 
     const customShares = state.station.zoneGeneratorKwh ?? {};
@@ -187,8 +221,16 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
 
     const rows = allZoneNames.map((zoneName) => {
       const subscribersCount = subsByZone.get(zoneName) ?? 0;
+      const zoneReadingsCount = readingCountByZone.get(zoneName) ?? 0;
       const soldKwh =
         Math.round((soldByZone.get(zoneName) ?? 0) * 100) / 100;
+
+      const readingState: ReadingEvaluationState =
+        zoneReadingsCount === 0
+          ? 'no_reading'
+          : soldKwh <= 0
+            ? 'zero_consumption'
+            : 'normal';
 
       const draftStr = zoneShareDrafts[zoneName];
       const hasDraft = draftStr !== undefined && draftStr.trim() !== '';
@@ -206,21 +248,32 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
             ) / 100
           : 0;
 
-      const lossKwh = Math.max(
-        0,
-        Math.round((generatorShareKwh - soldKwh) * 100) / 100,
-      );
-      const lossPercent =
-        generatorShareKwh > 0
-          ? Math.round((lossKwh / generatorShareKwh) * 100 * 10) / 10
-          : 0;
+      // Only compute loss in 'normal' state when generator share > 0
+      const canComputeLoss = readingState === 'normal' && generatorShareKwh > 0;
+      const lossKwh = canComputeLoss
+        ? Math.max(
+            0,
+            Math.round((generatorShareKwh - soldKwh) * 100) / 100,
+          )
+        : 0;
+      const lossPercent: number | null = canComputeLoss
+        ? Math.round((lossKwh / generatorShareKwh) * 100 * 10) / 10
+        : null;
 
-      const severity: 'ok' | 'warn' | 'critical' =
-        lossPercent > 20 ? 'critical' : lossPercent >= 10 ? 'warn' : 'ok';
+      const severity: 'waiting' | 'ok' | 'warn' | 'critical' =
+        lossPercent === null
+          ? 'waiting'
+          : lossPercent > 20
+            ? 'critical'
+            : lossPercent >= 10
+              ? 'warn'
+              : 'ok';
 
       return {
         zoneName,
         subscribersCount,
+        zoneReadingsCount,
+        readingState,
         soldKwh,
         generatorShareKwh,
         isCustomShare,
@@ -231,10 +284,10 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
     });
 
     return rows.sort((a, b) => {
-      const aCrit = a.lossPercent > 20 ? 1 : 0;
-      const bCrit = b.lossPercent > 20 ? 1 : 0;
+      const aCrit = a.severity === 'critical' ? 1 : 0;
+      const bCrit = b.severity === 'critical' ? 1 : 0;
       if (aCrit !== bCrit) return bCrit - aCrit;
-      return b.lossPercent - a.lossPercent;
+      return (b.lossPercent ?? -1) - (a.lossPercent ?? -1);
     });
   }, [
     state.subscribers,
@@ -250,7 +303,13 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
   }, [zoneLossRows, lossZoneFilter]);
 
   const criticalLossZonesCount = useMemo(
-    () => zoneLossRows.filter((r) => r.lossPercent > 20).length,
+    () =>
+      zoneLossRows.filter(
+        (r) =>
+          r.readingState === 'normal' &&
+          r.lossPercent !== null &&
+          r.lossPercent > 20,
+      ).length,
     [zoneLossRows],
   );
 
@@ -340,10 +399,89 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
     return map;
   }, [state.readings]);
 
-  const handleResolveAlert = async (
-    alert: ManagerAlert,
-    decision: 'approved' | 'rejected',
-  ) => {
+  // Load and continuously persist alerts_history (never cleared on refresh or when values reset to 0)
+  useEffect(() => {
+    let active = true;
+    void loadAlertsHistory(state.station.stationId).then((loaded) => {
+      if (active) setAlertsHistory(loaded);
+    });
+    return () => {
+      active = false;
+    };
+  }, [state.station.stationId]);
+
+  useEffect(() => {
+    const subZoneMap = new Map<string, string>();
+    state.subscribers.forEach((s) =>
+      subZoneMap.set(s.id, s.zoneStreet?.trim() || 'عام'),
+    );
+
+    const todayKey = new Date().toISOString().slice(0, 10);
+    const nowIso = new Date().toISOString();
+    const toPersist: AlertHistoryEntry[] = [];
+
+    for (const row of zoneLossRows) {
+      if (
+        row.readingState === 'normal' &&
+        row.lossPercent !== null &&
+        (row.severity === 'critical' || row.severity === 'warn')
+      ) {
+        const roundedPct = row.lossPercent.toFixed(1);
+        toPersist.push({
+          id: `loss_${state.station.stationId}_${row.zoneName}_${todayKey}_${roundedPct}`,
+          stationId: state.station.stationId,
+          sourceType: 'zone_loss',
+          severity: row.severity === 'critical' ? 'critical' : 'warning',
+          zoneName: row.zoneName,
+          valueSummary: `فاقد ${roundedPct}% (${formatKwh(row.lossKwh)} من ${formatKwh(row.generatorShareKwh)})`,
+          message:
+            row.severity === 'critical'
+              ? `ارتفاع نسبة الفاقد إلى ${roundedPct}% في حارة ${row.zoneName}`
+              : `تنبيه فاقد ${roundedPct}% في حارة ${row.zoneName}`,
+          createdAt: nowIso,
+          statusLabel: row.severity === 'critical' ? 'فاقد مرتفع' : 'انتبه',
+        });
+      }
+    }
+
+    for (const al of state.alerts ?? []) {
+      const zoneName = subZoneMap.get(al.subscriberId) || 'غير محدد';
+      toPersist.push({
+        id: `field_${state.station.stationId}_${al.id}`,
+        stationId: state.station.stationId,
+        sourceType: 'field_alert',
+        severity: al.severity === 'critical' ? 'critical' : 'warning',
+        zoneName,
+        valueSummary:
+          al.alertType === 'high_consumption'
+            ? `استهلاك ${al.consumptionKwh ?? 0} ك.و.س`
+            : `قراءة ${al.editedReading} (السابقة ${al.previousReading})`,
+        message: `${al.subscriberName} · عداد ${al.meterNumber}`,
+        createdAt: al.createdAt || nowIso,
+        statusLabel:
+          al.status === 'pending'
+            ? 'بانتظار الاطلاع'
+            : al.status === 'approved'
+              ? 'تم الاطلاع'
+              : 'مرفوض',
+      });
+    }
+
+    if (toPersist.length > 0) {
+      let active = true;
+      void appendAlertsHistory(state.station.stationId, toPersist).then(
+        (updated) => {
+          if (active) setAlertsHistory(updated);
+        },
+      );
+      return () => {
+        active = false;
+      };
+    }
+  }, [state.station.stationId, state.subscribers, state.alerts, zoneLossRows]);
+
+  // Manager can only acknowledge alerts (cannot edit or alter subscriber readings)
+  const handleAcknowledgeAlert = async (alert: ManagerAlert) => {
     setAlertError(null);
     setResolvingId(alert.id);
     try {
@@ -351,27 +489,13 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
         staffToken,
         stationId: state.station.stationId,
         alertId: alert.id,
-        decision,
+        decision: 'approved',
       });
       const nextState: StationLocalState = {
         ...state,
         alerts: (state.alerts ?? []).map((a) =>
           a.id === alert.id ? { ...res.alert, syncStatus: 'synced' } : a,
         ),
-        readings: res.reading
-          ? state.readings.map((r) =>
-              r.id === res.reading!.id
-                ? { ...res.reading!, syncStatus: 'synced' }
-                : r,
-            )
-          : state.readings,
-        subscribers: res.subscriber
-          ? state.subscribers.map((s) =>
-              s.id === res.subscriber!.id
-                ? { ...res.subscriber!, syncStatus: 'synced' }
-                : s,
-            )
-          : state.subscribers,
       };
       await saveStationLocalState(nextState);
       onUpdateState(nextState);
@@ -379,7 +503,7 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
       setAlertError(
         err instanceof Error
           ? err.message
-          : 'تعذر معالجة القرار في الخادم؛ تأكد من توفر الاتصال.',
+          : 'تعذر تسجيل الاطلاع على التنبيه؛ تأكد من توفر الاتصال.',
       );
     } finally {
       setResolvingId(null);
@@ -616,64 +740,76 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
         </div>
       )}
 
-      {/* 4-Column KPI Strip */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between gap-2">
-          <span className="text-xs font-medium text-slate-500">
-            إجمالي المشتركين المسجلين
-          </span>
-          <div className="flex items-baseline justify-between">
-            <span className="text-2xl font-bold text-slate-900 font-mono-nums">
-              {metrics.activeSubscribers}
+      {/* Single Luxury Glassmorphic KPI Card (Side-by-Side on All Phone & Desktop Widths) */}
+      <section
+        aria-label="ملخص مؤشرات الأداء"
+        className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-[#062738]/95 via-[#083545]/95 to-[#0F766E]/90 backdrop-blur-xl border border-white/20 shadow-[0_16px_40px_-12px_rgba(6,39,56,0.45)] p-3 sm:p-4 text-white"
+      >
+        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_right,rgba(255,255,255,0.14),transparent_55%)]" />
+        <div className="relative grid grid-cols-2 lg:grid-cols-4 gap-2 sm:gap-3">
+          <div className="rounded-2xl bg-white/10 backdrop-blur-md border border-white/15 px-3 py-2.5 sm:px-4 sm:py-3 flex flex-col justify-between gap-1 min-w-0">
+            <span className="text-[11px] sm:text-xs font-medium text-emerald-100/85 truncate">
+              إجمالي المشتركين
             </span>
-            <span className="text-xs text-slate-500">مشترك</span>
-          </div>
-        </div>
-
-        <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between gap-2">
-          <span className="text-xs font-medium text-slate-500">
-            المباع مقابل المولد (كشف الفاقد)
-          </span>
-          <div>
-            <div className="text-2xl font-bold text-slate-900 font-mono-nums">
-              {formatKwh(metrics.totalKwhSold)}
-            </div>
-            <div
-              className={`text-xs mt-1 font-medium ${
-                metrics.lossPercent > 20
-                  ? 'text-rose-700'
-                  : metrics.lossPercent >= 10
-                    ? 'text-amber-700'
-                    : 'text-teal-700'
-              }`}
-            >
-              المولد: {formatKwh(metrics.mainGen)} · الإجمالي{' '}
-              {metrics.lossPercent.toFixed(1)}%
-              {criticalLossZonesCount > 0
-                ? ` · ${criticalLossZonesCount} حارة فوق 20%!`
-                : ` · ${zoneLossRows.length} حارة`}
+            <div className="flex items-baseline justify-between gap-1">
+              <span className="text-lg sm:text-2xl font-extrabold text-white font-mono-nums truncate">
+                {metrics.activeSubscribers}
+              </span>
+              <span className="text-[10px] sm:text-xs text-emerald-100/75 shrink-0">
+                مشترك
+              </span>
             </div>
           </div>
-        </div>
 
-        <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between gap-2">
-          <span className="text-xs font-medium text-slate-500">
-            إجمالي النقد المحصّل
-          </span>
-          <div className="text-2xl font-bold text-teal-700 font-mono-nums">
-            {formatCompactYer(metrics.totalCollectedCash)}
+          <div className="rounded-2xl bg-white/10 backdrop-blur-md border border-white/15 px-3 py-2.5 sm:px-4 sm:py-3 flex flex-col justify-between gap-1 min-w-0">
+            <span className="text-[11px] sm:text-xs font-medium text-emerald-100/85 truncate">
+              المباع مقابل المولد
+            </span>
+            <div className="min-w-0">
+              <div className="text-lg sm:text-2xl font-extrabold text-white font-mono-nums truncate">
+                {formatKwh(metrics.totalKwhSold)}
+              </div>
+              <div
+                className={`text-[10px] sm:text-xs mt-0.5 font-semibold truncate ${
+                  metrics.lossPercent === null
+                    ? 'text-amber-200'
+                    : metrics.lossPercent > 20
+                      ? 'text-rose-200'
+                      : metrics.lossPercent >= 10
+                        ? 'text-amber-200'
+                        : 'text-emerald-200'
+                }`}
+              >
+                {metrics.lossPercent === null
+                  ? 'بانتظار قراءات المحصل'
+                  : `المولد: ${formatKwh(metrics.mainGen)} · ${metrics.lossPercent.toFixed(1)}%${
+                      criticalLossZonesCount > 0
+                        ? ` (${criticalLossZonesCount} حارة فوق 20%)`
+                        : ''
+                    }`}
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-2xl bg-white/10 backdrop-blur-md border border-white/15 px-3 py-2.5 sm:px-4 sm:py-3 flex flex-col justify-between gap-1 min-w-0">
+            <span className="text-[11px] sm:text-xs font-medium text-emerald-100/85 truncate">
+              إجمالي النقد المحصّل
+            </span>
+            <div className="text-lg sm:text-2xl font-extrabold text-emerald-300 font-mono-nums truncate">
+              {formatCompactYer(metrics.totalCollectedCash)}
+            </div>
+          </div>
+
+          <div className="rounded-2xl bg-white/10 backdrop-blur-md border border-white/15 px-3 py-2.5 sm:px-4 sm:py-3 flex flex-col justify-between gap-1 min-w-0">
+            <span className="text-[11px] sm:text-xs font-medium text-emerald-100/85 truncate">
+              المتأخرات غير المسددة
+            </span>
+            <div className="text-lg sm:text-2xl font-extrabold text-rose-200 font-mono-nums truncate">
+              {formatCompactYer(metrics.totalUnpaidDebts)}
+            </div>
           </div>
         </div>
-
-        <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between gap-2">
-          <span className="text-xs font-medium text-slate-500">
-            المتأخرات غير المسددة
-          </span>
-          <div className="text-2xl font-bold text-rose-700 font-mono-nums">
-            {formatCompactYer(metrics.totalUnpaidDebts)}
-          </div>
-        </div>
-      </div>
+      </section>
 
       {/* Centered Workspace Tabs Grid (No Horizontal Scroll) */}
       <nav
@@ -839,6 +975,16 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
               </div>
             </div>
 
+            {(metrics.mainGen > 0 || Number(mainGenKwh) > 0) &&
+              metrics.stationReadingState !== 'normal' && (
+                <div className="flex items-start gap-2.5 text-xs sm:text-sm font-bold text-amber-900 bg-amber-50 border border-amber-300 rounded-xl px-4 py-3">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <span>
+                    تجربة غير مكتملة: أدخل قراءات المشتركين أولاً لحساب الفاقد بشكل صحيح
+                  </span>
+                </div>
+              )}
+
             {zoneShareSavedNotice && (
               <div className="text-xs font-bold text-teal-800 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2">
                 {zoneShareSavedNotice}
@@ -867,17 +1013,21 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
                           ? 'bg-amber-50/50'
                           : 'hover:bg-slate-50/70';
                     const badgeClass =
-                      row.severity === 'critical'
-                        ? 'bg-rose-100 text-rose-900 border-rose-300'
-                        : row.severity === 'warn'
-                          ? 'bg-amber-100 text-amber-900 border-amber-300'
-                          : 'bg-emerald-100 text-emerald-900 border-emerald-300';
+                      row.severity === 'waiting'
+                        ? 'bg-slate-100 text-slate-700 border-slate-300'
+                        : row.severity === 'critical'
+                          ? 'bg-rose-100 text-rose-900 border-rose-300'
+                          : row.severity === 'warn'
+                            ? 'bg-amber-100 text-amber-900 border-amber-300'
+                            : 'bg-emerald-100 text-emerald-900 border-emerald-300';
                     const statusLabel =
-                      row.severity === 'critical'
-                        ? 'يوجد سرقة محتملة - راجع الحارة'
-                        : row.severity === 'warn'
-                          ? 'انتبه'
-                          : 'سليم';
+                      row.readingState !== 'normal' || row.lossPercent === null
+                        ? 'بانتظار قراءات المحصل'
+                        : row.severity === 'critical'
+                          ? 'يوجد سرقة محتملة - راجع الحارة'
+                          : row.severity === 'warn'
+                            ? 'انتبه'
+                            : 'سليم';
 
                     return (
                       <tr key={row.zoneName} className={rowHighlight}>
@@ -912,18 +1062,26 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
                           </div>
                         </td>
                         <td className="py-3 px-3 font-mono-nums font-bold text-slate-900">
-                          {formatKwh(row.lossKwh)}
+                          {row.readingState === 'normal' &&
+                          row.lossPercent !== null
+                            ? formatKwh(row.lossKwh)
+                            : '—'}
                         </td>
                         <td
                           className={`py-3 px-3 font-mono-nums font-extrabold ${
-                            row.severity === 'critical'
-                              ? 'text-rose-800'
-                              : row.severity === 'warn'
-                                ? 'text-amber-800'
-                                : 'text-emerald-800'
+                            row.severity === 'waiting'
+                              ? 'text-slate-500'
+                              : row.severity === 'critical'
+                                ? 'text-rose-800'
+                                : row.severity === 'warn'
+                                  ? 'text-amber-800'
+                                  : 'text-emerald-800'
                           }`}
                         >
-                          {row.lossPercent.toFixed(1)}%
+                          {row.readingState === 'normal' &&
+                          row.lossPercent !== null
+                            ? `${row.lossPercent.toFixed(1)}%`
+                            : '—'}
                         </td>
                         <td className="py-3 px-3">
                           <span
@@ -1308,8 +1466,8 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
                               }`}
                             >
                               {al.status === 'approved'
-                                ? `تم قبول واعتماد القراءة بواسطة ${al.resolvedBy || 'المدير'}`
-                                : `تم رفض القراءة بواسطة ${al.resolvedBy || 'المدير'}`}
+                                ? `تم الاطلاع والمراجعة بواسطة ${al.resolvedBy || 'المدير'}`
+                                : `تم التسجيل (${al.resolvedBy || 'المدير'})`}
                             </div>
                           )}
                         </div>
@@ -1320,25 +1478,12 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
                           <button
                             type="button"
                             disabled={resolvingId === al.id}
-                            onClick={() => void handleResolveAlert(al, 'approved')}
+                            onClick={() => void handleAcknowledgeAlert(al)}
                             className="min-h-[40px] px-4 py-2 text-xs font-bold bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 text-white rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
                           >
                             <Check className="w-4 h-4" />
-                            {isYellow ? 'إقرار المراجعة' : 'اعتماد القراءة'}
+                            تم الاطلاع
                           </button>
-                          {!isYellow && (
-                            <button
-                              type="button"
-                              disabled={resolvingId === al.id}
-                              onClick={() =>
-                                void handleResolveAlert(al, 'rejected')
-                              }
-                              className="min-h-[40px] px-4 py-2 text-xs font-bold bg-white border border-rose-300 text-rose-800 hover:bg-rose-100 disabled:opacity-50 rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
-                            >
-                              <X className="w-4 h-4" />
-                              رفض القراءة
-                            </button>
-                          )}
                         </div>
                       )}
                     </div>
@@ -1346,6 +1491,60 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
                 })}
               </div>
             )}
+
+            {/* Persistent Alerts History (Never cleared on refresh or zeroed values) */}
+            <div className="pt-5 border-t border-slate-200 space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="text-sm sm:text-base font-bold text-slate-900 flex items-center gap-2">
+                  <Clock className="w-4 h-4 text-teal-700" />
+                  سجل التنبيهات الدائم ({alertsHistory.length})
+                </h3>
+                <span className="text-[11px] text-slate-500">
+                  محفوظ تلقائياً بوقته وحارته وقيمته حتى عند تحديث الصفحة
+                </span>
+              </div>
+
+              {alertsHistory.length === 0 ? (
+                <div className="py-6 text-center text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-xl">
+                  لا توجد تنبيهات مسجلة في السجل الدائم بعد.
+                </div>
+              ) : (
+                <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden bg-white">
+                  {alertsHistory.map((item) => (
+                    <div
+                      key={item.id}
+                      className="px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs"
+                    >
+                      <div className="space-y-1 min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span
+                            className={`px-2 py-0.5 rounded font-bold border ${
+                              item.severity === 'critical'
+                                ? 'bg-rose-50 text-rose-800 border-rose-200'
+                                : 'bg-amber-50 text-amber-800 border-amber-200'
+                            }`}
+                          >
+                            {item.statusLabel ||
+                              (item.severity === 'critical' ? 'حرج' : 'تنبيه')}
+                          </span>
+                          <span className="font-bold text-slate-900">
+                            الحارة: {item.zoneName}
+                          </span>
+                          <span className="text-slate-400">·</span>
+                          <span className="font-mono-nums font-bold text-teal-800">
+                            {item.valueSummary}
+                          </span>
+                        </div>
+                        <div className="text-slate-600">{item.message}</div>
+                      </div>
+                      <div className="text-[11px] text-slate-500 font-mono-nums shrink-0">
+                        {new Date(item.createdAt).toLocaleString('ar-YE')}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </section>
 
           {/* Adjacent Side Column: Admin-Locked AI Verification Status & Storage Policy */}
@@ -1516,7 +1715,7 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
                 سجل المشتركين والعدادات ({filteredSubscribers.length})
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                مرتّب حسب تسلسل خط السير الميداني · محفوظ كنصوص وأرقام للاستعادة اللحظية
+                مرتّب حسب تسلسل خط السير الميداني · تُرفع القراءات من تطبيق المحصّل الميداني فقط (عرض النتائج للمدير فقط)
               </p>
             </div>
             <div className="flex flex-col sm:flex-row sm:items-center gap-3 w-full md:w-auto">

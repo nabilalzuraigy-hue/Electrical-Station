@@ -993,7 +993,9 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     overridePhotoUrl?: string;
     overridePhotoKb?: number;
   }) => {
-    if (!selectedSubscriber || activeFinalReading === null) return;
+    if (isManagerPreview || !selectedSubscriber || activeFinalReading === null) {
+      return;
+    }
 
     const now = new Date().toISOString();
     const readingId = sanitizeFirestoreId(`rd_${Date.now()}`);
