@@ -391,9 +391,15 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
 
   const latestReadingBySubscriber = useMemo(() => {
     const map = new Map<string, (typeof state.readings)[number]>();
-    for (const r of state.readings) {
-      if (!map.has(r.subscriberId)) {
+    const sorted = [...state.readings].sort((a, b) =>
+      String(b.recordedAt ?? '').localeCompare(String(a.recordedAt ?? '')),
+    );
+    for (const r of sorted) {
+      if (r.subscriberId && !map.has(r.subscriberId)) {
         map.set(r.subscriberId, r);
+      }
+      if (r.meterNumber && !map.has(`meter:${r.meterNumber}`)) {
+        map.set(`meter:${r.meterNumber}`, r);
       }
     }
     return map;
@@ -1760,7 +1766,21 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {filteredSubscribers.slice(0, 200).map((sub) => {
-                  const latestRd = latestReadingBySubscriber.get(sub.id);
+                  const latestRd =
+                    latestReadingBySubscriber.get(sub.id) ??
+                    latestReadingBySubscriber.get(`meter:${sub.meterNumber}`);
+                  const useLatestApproved =
+                    latestRd &&
+                    latestRd.approvalStatus !== 'rejected' &&
+                    latestRd.approvalStatus !== 'pending_manager' &&
+                    (!sub.updatedAt ||
+                      String(latestRd.recordedAt ?? '') >= String(sub.updatedAt));
+                  const displayPrev = useLatestApproved
+                    ? latestRd.previousReading
+                    : sub.previousReading;
+                  const displayCurr = useLatestApproved
+                    ? latestRd.currentReading
+                    : sub.currentReading;
                   return (
                     <tr
                       key={sub.id}
@@ -1784,10 +1804,10 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
                         {sub.zoneStreet}
                       </td>
                       <td className="py-3 px-4 font-mono-nums text-slate-700">
-                        {sub.previousReading}
+                        {displayPrev}
                       </td>
                       <td className="py-3 px-4 font-mono-nums text-slate-900 font-medium">
-                        <div>{sub.currentReading}</div>
+                        <div>{displayCurr}</div>
                         {latestRd?.isClosedHouseZero && (
                           <div className="text-[11px] font-sans text-sky-800 font-medium">
                             استهلاك صفر - بيت مغلق

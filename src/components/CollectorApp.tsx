@@ -28,6 +28,7 @@ import {
   dispatchReadingToCloudBackground,
   dispatchReceiptToCloudBackground,
   exportCollectorReadingsExcel,
+  getSubscriberPreviousBaseline,
   parseSubscribersExcelFile,
   refreshStationState,
   sanitizeFirestoreId,
@@ -589,10 +590,14 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       setLocalPhotos(updatedPhotos);
       setCurrentPhotoEntryId(photoId);
 
+      const currentBaseline = getSubscriberPreviousBaseline(
+        selectedSubscriber,
+        state.readings,
+      );
       await runAutoMeterExtraction(
         compressed.dataUrl,
         compressed.sizeKb,
-        selectedSubscriber.previousReading,
+        currentBaseline,
       );
     } catch {
       setPhotoStatus('تعذرت القراءة الدقيقة، اكتب القراءة يدوياً');
@@ -848,7 +853,9 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     }
   };
 
-  const prevReading = selectedSubscriber?.previousReading ?? 0;
+  const prevReading = selectedSubscriber
+    ? getSubscriberPreviousBaseline(selectedSubscriber, state.readings)
+    : 0;
   const ocrOriginalReading = ocrResult?.accepted ? ocrResult.reading : null;
   const parsedFinalInput = Number(finalReadingInput);
 
@@ -1255,7 +1262,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       }
       return {
         ...s,
-        previousReading: activeFinalReading,
+        previousReading: prevReading,
         currentReading: activeFinalReading,
         previousDebtYer: remainingBalanceYer,
         syncStatus: 'pending' as const,
@@ -1317,6 +1324,14 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       });
     });
 
+    setFinalReadingInput('');
+    setOcrResult(null);
+    setProofPhotoUrl('');
+    setProofSizeKb(0);
+    setCurrentPhotoEntryId(null);
+    setPhotoStatus(null);
+    setShowEnhancedPreview(false);
+    setValidationError(null);
     setCashPaidInput('');
 
     if (aiMismatchTriggered) {
@@ -1657,6 +1672,10 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
           <div className="divide-y divide-slate-100 max-h-[600px] overflow-y-auto">
             {routeSubscribers.map((sub) => {
               const active = selectedSubscriber?.id === sub.id;
+              const subBaseline = getSubscriberPreviousBaseline(
+                sub,
+                state.readings,
+              );
               return (
                 <button
                   key={sub.id}
@@ -1685,7 +1704,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                         <span className="font-mono-nums">{sub.meterNumber}</span>{' '}
                         · {sub.zoneStreet} · السابقة{' '}
                         <span className="font-mono-nums">
-                          {sub.previousReading}
+                          {subBaseline}
                         </span>
                       </div>
                     </div>
@@ -1741,7 +1760,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                     </span>{' '}
                     · {selectedSubscriber.zoneStreet} · القراءة السابقة{' '}
                     <span className="font-mono-nums font-semibold">
-                      {selectedSubscriber.previousReading}
+                      {prevReading}
                     </span>
                     {avg3MonthsKwh > 0 && (
                       <>

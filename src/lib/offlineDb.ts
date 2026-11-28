@@ -915,7 +915,7 @@ function mergeCloudActivityIntoState(
     let nextUpdatedAt = subTs;
 
     if (latestRd && rdTs > subTs) {
-      nextPrev = latestRd.currentReading;
+      nextPrev = latestRd.previousReading;
       nextCurr = latestRd.currentReading;
       nextDebt = latestRd.totalDueYer;
       nextUpdatedAt = rdTs;
@@ -1584,6 +1584,33 @@ export function computeSubscriber3MonthAvgKwh(
   return subscriber.last3MonthsAvgKwh ?? 0;
 }
 
+export function getSubscriberPreviousBaseline(
+  subscriber: Subscriber,
+  readings: MeterReading[],
+): number {
+  const latestApproved = readings
+    .filter(
+      (r) =>
+        (r.subscriberId === subscriber.id ||
+          (Boolean(subscriber.meterNumber) &&
+            r.meterNumber === subscriber.meterNumber)) &&
+        r.approvalStatus !== 'rejected' &&
+        r.approvalStatus !== 'pending_manager',
+    )
+    .sort((a, b) =>
+      String(b.recordedAt ?? '').localeCompare(String(a.recordedAt ?? '')),
+    )[0];
+
+  if (
+    latestApproved &&
+    (!subscriber.updatedAt ||
+      String(latestApproved.recordedAt ?? '') >= String(subscriber.updatedAt))
+  ) {
+    return latestApproved.currentReading;
+  }
+  return subscriber.currentReading ?? subscriber.previousReading ?? 0;
+}
+
 export interface GeminiPhotoVerificationResult {
   enabled: boolean;
   matched: boolean;
@@ -1740,11 +1767,23 @@ export async function resolveManagerAlert(params: {
         }
       : null;
     const existingSub = local?.subscribers.find((s) => s.id === updatedAlert.subscriberId);
+    const candidatePrev =
+      updatedReading && updatedAlert.lowerReadingReason === 'meter_replaced'
+        ? (updatedAlert.openingReading ?? updatedReading.currentReading)
+        : updatedReading?.previousReading ?? 0;
+    const nextPrevOnApprove =
+      updatedReading && candidatePrev <= updatedReading.currentReading
+        ? candidatePrev
+        : updatedReading?.currentReading ?? 0;
     const updatedSubscriber: Subscriber | null =
       existingSub && updatedReading && params.decision === 'approved'
         ? {
             ...existingSub,
-            previousReading: updatedReading.currentReading,
+            ...(updatedAlert.lowerReadingReason === 'meter_replaced' &&
+            updatedAlert.newMeterNumber
+              ? { meterNumber: updatedAlert.newMeterNumber }
+              : {}),
+            previousReading: nextPrevOnApprove,
             currentReading: updatedReading.currentReading,
             previousDebtYer: updatedReading.totalDueYer,
             updatedAt: now,

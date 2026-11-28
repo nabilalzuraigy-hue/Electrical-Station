@@ -2819,11 +2819,13 @@ Inspect the attached electric meter photo carefully:
       if (sub && alert.alertType !== 'high_consumption' && decision === 'approved') {
         if (alert.lowerReadingReason === 'meter_replaced' && alert.newMeterNumber) {
           sub.meterNumber = alert.newMeterNumber;
-          const nextVal = alert.openingReading ?? alert.editedReading;
-          sub.previousReading = nextVal;
-          sub.currentReading = nextVal;
+          const openVal = alert.openingReading ?? alert.editedReading;
+          sub.previousReading = openVal <= alert.editedReading ? openVal : alert.editedReading;
+          sub.currentReading = alert.editedReading;
         } else {
-          sub.previousReading = alert.editedReading;
+          const prevCandidate = reading?.previousReading ?? alert.editedReading;
+          sub.previousReading =
+            prevCandidate <= alert.editedReading ? prevCandidate : alert.editedReading;
           sub.currentReading = alert.editedReading;
         }
         if (reading) {
@@ -2885,13 +2887,21 @@ Inspect the attached electric meter photo carefully:
       const subId = normalizeId(sub?.id);
       const existing = bucket.subscribers[subId];
       if (existing) {
-        existing.previousReading = Math.max(0, Number(sub?.previousReading) || existing.previousReading);
-        existing.currentReading = Math.max(
-          existing.previousReading,
-          Number(sub?.currentReading) || existing.currentReading,
-        );
+        const incomingPrev =
+          typeof sub?.previousReading === 'number' && Number.isFinite(sub.previousReading)
+            ? Math.max(0, sub.previousReading)
+            : existing.previousReading;
+        const incomingCurr =
+          typeof sub?.currentReading === 'number' && Number.isFinite(sub.currentReading)
+            ? Math.max(0, sub.currentReading)
+            : existing.currentReading;
+        existing.previousReading = incomingPrev;
+        existing.currentReading = Math.max(existing.previousReading, incomingCurr);
         existing.previousDebtYer = Math.max(0, Number(sub?.previousDebtYer) || 0);
-        existing.updatedAt = new Date().toISOString();
+        existing.updatedAt =
+          typeof sub?.updatedAt === 'string' && sub.updatedAt
+            ? sub.updatedAt
+            : new Date().toISOString();
         syncedCount++;
       }
     }
@@ -2987,6 +2997,18 @@ Inspect the attached electric meter photo carefully:
           collectorName: String(rd?.collectorName ?? session.name),
           recordedAt: String(rd?.recordedAt ?? new Date().toISOString()),
         };
+
+        const rdRecordedAt = String(rd?.recordedAt ?? '');
+        if (
+          approvalStatus === 'approved' &&
+          (!sub.updatedAt || rdRecordedAt >= sub.updatedAt)
+        ) {
+          sub.previousReading = prev;
+          sub.currentReading = cur;
+          if (rdRecordedAt) {
+            sub.updatedAt = rdRecordedAt;
+          }
+        }
 
         if (
           typeof rd?.gpsLat === 'number' &&
