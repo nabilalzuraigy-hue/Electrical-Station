@@ -222,13 +222,13 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
       if (refreshed.updatedAtIso) {
         setCloudLastSyncAt(refreshed.updatedAtIso);
       }
-      const msg = `تم تحديث وجلب البيانات من Firestore بنجاح (${refreshed.stations.length} محطة · ${refreshed.codes.length} كود · ${refreshed.subscriberCount} مشترك).`;
+      const msg = `تم تحديث وجلب البيانات من السحابة بنجاح (${refreshed.stations.length} محطة · ${refreshed.codes.length} كود · ${refreshed.subscriberCount} مشترك).`;
       setCloudStatus(msg);
       setFeedback(msg);
     } catch (err) {
       const msg = formatFirestoreUserMessage(
         err,
-        'تعذر جلب البيانات من Firestore.',
+        'تعذر جلب البيانات من السحابة.',
       );
       setCloudStatus(msg);
       setFeedback(msg);
@@ -510,8 +510,8 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
       );
       setFeedback(
         updated.station.aiPhotoVerificationEnabled
-          ? `تم تفعيل وتشفير ميزة «مطابقة صورة العداد مع رقم القراءة المحصل» عبر Gemini Vision-AI لمحطة «${st.stationName}».`
-          : `تم تعطيل ميزة مطابقة الصور بالذكاء الاصطناعي لمحطة «${st.stationName}».`,
+          ? `تم تفعيل وتشفير ميزة «مطابقة صورة العداد مع رقم القراءة المحصل» لمحطة «${st.stationName}».`
+          : `تم تعطيل ميزة مطابقة الصور لمحطة «${st.stationName}».`,
       );
       await loadAdminData();
       void syncBackupToFirestoreSilently();
@@ -519,7 +519,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
       setFeedback(
         err instanceof Error
           ? err.message
-          : 'تعذر تحديث إعداد مطابقة صورة العداد عبر Gemini Vision-AI.',
+          : 'تعذر تحديث إعداد مطابقة صورة العداد.',
       );
     } finally {
       setTogglingAiStationId(null);
@@ -804,7 +804,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
               دخول الأدمن المطور (Google)
             </h1>
             <p className="text-xs text-slate-600 leading-relaxed">
-              سجّل الدخول بحساب Google المعتمد للمطور ({ADMIN_GOOGLE_EMAIL}) لجلب المحطات والأكواد والمشتركين من Firestore بأمان.
+              سجّل الدخول بحساب Google المعتمد للمطور ({ADMIN_GOOGLE_EMAIL}) لجلب المحطات والأكواد والمشتركين من السحابة بأمان.
             </p>
           </div>
 
@@ -916,10 +916,10 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
           <div>
             <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
               <Database className="w-5 h-5 text-teal-700" />
-              المزامنة السحابية التلقائية الدائمة (Firebase Firestore)
+              المزامنة السحابية التلقائية الدائمة
             </h2>
             <p className="text-xs text-slate-600 mt-1 leading-relaxed">
-              مشروع Firebase المرتبط:{' '}
+              المشروع السحابي المرتبط:{' '}
               <span dir="ltr" className="font-mono-nums font-bold text-teal-800">
                 {FIREBASE_PROJECT_ID} / {FIREBASE_DATABASE_ID}
               </span>{' '}
@@ -930,7 +930,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs font-bold text-teal-900 bg-teal-50 border border-teal-200 px-3 py-1.5 rounded-lg inline-flex items-center gap-1.5">
               <Cloud className="w-4 h-4 text-teal-700" />
-              <span className="text-[11px] font-bold text-emerald-700">مزامنة Firestore نشطة</span>
+              <span className="text-[11px] font-bold text-emerald-700">المزامنة السحابية نشطة</span>
             </span>
             <button
               type="button"
@@ -1509,7 +1509,7 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                 <th className="py-3 px-4 font-medium">التعرفة</th>
                 <th className="py-3 px-4 font-medium">الحالة</th>
                 <th className="py-3 px-4 font-medium">
-                  مطابقة صورة العداد مع رقم القراءة (Gemini Vision-AI)
+                  مطابقة صورة العداد مع رقم القراءة
                 </th>
                 <th className="py-3 px-4 font-medium">إجراء (المطور فقط)</th>
               </tr>
@@ -1553,8 +1553,8 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
                         {togglingAiStationId === st.stationId
                           ? 'جاري التشفير...'
                           : st.aiPhotoVerificationEnabled
-                            ? 'مفعّل ومشفّر (AI Vision)'
-                            : 'معطّل (تفعيل AI Vision)'}
+                            ? 'مفعّل ومشفّر'
+                            : 'معطّل (تفعيل المطابقة)'}
                       </button>
                       {st.aiPhotoVerificationEnabled &&
                         typeof st.aiPhotoVerificationSealed === 'string' &&

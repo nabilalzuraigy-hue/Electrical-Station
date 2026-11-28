@@ -599,7 +599,7 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
           <div className="flex items-center gap-2.5 text-rose-900">
             <ShieldAlert className="w-5 h-5 text-rose-600 shrink-0" />
             <div className="text-xs sm:text-sm font-bold">
-              تنبيه أحمر فوري: رصد محرك Gemini Vision-AI{' '}
+              تنبيه أحمر فوري: تم رصد{' '}
               <span className="font-mono-nums underline">
                 {pendingPhotoMismatchCount}
               </span>{' '}
@@ -675,98 +675,126 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
         </div>
       </div>
 
-      {/* Horizontal Adjacent Workspace Tabs (No Long Vertical Scrolling) */}
+      {/* Centered Workspace Tabs Grid (No Horizontal Scroll) */}
       <nav
         aria-label="تبويبات لوحة مدير المحطة"
-        className="flex items-center gap-1.5 overflow-x-auto bg-white border border-slate-200 rounded-xl p-1.5"
+        className="grid grid-cols-2 md:grid-cols-6 gap-3 sm:gap-4 max-w-4xl mx-auto justify-center"
       >
         <button
           type="button"
           onClick={() => setActiveTab('overview_loss')}
-          className={`inline-flex items-center gap-2 px-4 py-2.5 text-xs sm:text-sm font-bold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+          className={`col-span-1 md:col-span-2 w-full min-h-[64px] flex flex-col items-center justify-center gap-1.5 text-center px-3 py-2.5 text-xs sm:text-sm font-bold rounded-2xl border transition-colors cursor-pointer ${
             activeTab === 'overview_loss'
-              ? 'bg-teal-700 text-white'
-              : 'text-slate-700 hover:bg-slate-100'
+              ? 'bg-[#0F766E] border-[#0F766E] text-white shadow-sm'
+              : 'bg-white border-gray-200 text-black hover:bg-slate-50'
           }`}
         >
-          <BarChart3 className="w-4 h-4" />
-          الفاقد والتعرفة
-          {criticalLossZonesCount > 0 && (
-            <span
-              className={`px-1.5 py-0.5 text-[11px] font-mono-nums rounded ${
-                activeTab === 'overview_loss'
-                  ? 'bg-rose-500 text-white'
-                  : 'bg-rose-100 text-rose-800'
-              }`}
-            >
-              {criticalLossZonesCount}
-            </span>
-          )}
+          <BarChart3
+            className={`w-5 h-5 shrink-0 ${
+              activeTab === 'overview_loss' ? 'text-white' : 'text-[#0F766E]'
+            }`}
+          />
+          <span className="inline-flex items-center justify-center gap-1.5 flex-wrap leading-snug">
+            <span>الفاقد والتعرفة</span>
+            {criticalLossZonesCount > 0 && (
+              <span
+                className={`px-1.5 py-0.5 text-[11px] font-mono-nums rounded ${
+                  activeTab === 'overview_loss'
+                    ? 'bg-rose-500 text-white'
+                    : 'bg-rose-100 text-rose-800'
+                }`}
+              >
+                {criticalLossZonesCount}
+              </span>
+            )}
+          </span>
         </button>
 
         <button
           type="button"
           onClick={() => setActiveTab('alerts')}
-          className={`inline-flex items-center gap-2 px-4 py-2.5 text-xs sm:text-sm font-bold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+          className={`col-span-1 md:col-span-2 w-full min-h-[64px] flex flex-col items-center justify-center gap-1.5 text-center px-3 py-2.5 text-xs sm:text-sm font-bold rounded-2xl border transition-colors cursor-pointer ${
             activeTab === 'alerts'
-              ? 'bg-teal-700 text-white'
-              : 'text-slate-700 hover:bg-slate-100'
+              ? 'bg-[#0F766E] border-[#0F766E] text-white shadow-sm'
+              : 'bg-white border-gray-200 text-black hover:bg-slate-50'
           }`}
         >
-          <ShieldAlert className="w-4 h-4" />
-          التنبيهات الفورية و AI
-          {pendingAlertsCount > 0 && (
-            <span
-              className={`px-1.5 py-0.5 text-[11px] font-mono-nums rounded ${
-                pendingPhotoMismatchCount > 0
-                  ? 'bg-rose-600 text-white'
-                  : activeTab === 'alerts'
-                    ? 'bg-white/20 text-white'
-                    : 'bg-amber-100 text-amber-900'
-              }`}
-            >
-              {pendingAlertsCount}
-            </span>
-          )}
+          <ShieldAlert
+            className={`w-5 h-5 shrink-0 ${
+              activeTab === 'alerts' ? 'text-white' : 'text-[#0F766E]'
+            }`}
+          />
+          <span className="inline-flex items-center justify-center gap-1.5 flex-wrap leading-snug">
+            <span>التنبيهات الفورية</span>
+            {pendingAlertsCount > 0 && (
+              <span
+                className={`px-1.5 py-0.5 text-[11px] font-mono-nums rounded ${
+                  pendingPhotoMismatchCount > 0
+                    ? 'bg-rose-600 text-white'
+                    : activeTab === 'alerts'
+                      ? 'bg-white/20 text-white'
+                      : 'bg-amber-100 text-amber-900'
+                }`}
+              >
+                {pendingAlertsCount}
+              </span>
+            )}
+          </span>
         </button>
 
         <button
           type="button"
           onClick={() => setActiveTab('collectors_map')}
-          className={`inline-flex items-center gap-2 px-4 py-2.5 text-xs sm:text-sm font-bold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+          className={`col-span-1 md:col-span-2 w-full min-h-[64px] flex flex-col items-center justify-center gap-1.5 text-center px-3 py-2.5 text-xs sm:text-sm font-bold rounded-2xl border transition-colors cursor-pointer ${
             activeTab === 'collectors_map'
-              ? 'bg-teal-700 text-white'
-              : 'text-slate-700 hover:bg-slate-100'
+              ? 'bg-[#0F766E] border-[#0F766E] text-white shadow-sm'
+              : 'bg-white border-gray-200 text-black hover:bg-slate-50'
           }`}
         >
-          <MapPin className="w-4 h-4" />
-          المحصّلون والتتبع المباشر ({state.collectors.length})
+          <MapPin
+            className={`w-5 h-5 shrink-0 ${
+              activeTab === 'collectors_map' ? 'text-white' : 'text-[#0F766E]'
+            }`}
+          />
+          <span className="leading-snug">
+            المحصلون والتتبع المباشر ({state.collectors.length})
+          </span>
         </button>
 
         <button
           type="button"
           onClick={() => setActiveTab('finance')}
-          className={`inline-flex items-center gap-2 px-4 py-2.5 text-xs sm:text-sm font-bold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+          className={`col-span-1 md:col-span-2 md:col-start-2 w-full min-h-[64px] flex flex-col items-center justify-center gap-1.5 text-center px-3 py-2.5 text-xs sm:text-sm font-bold rounded-2xl border transition-colors cursor-pointer ${
             activeTab === 'finance'
-              ? 'bg-teal-700 text-white'
-              : 'text-slate-700 hover:bg-slate-100'
+              ? 'bg-[#0F766E] border-[#0F766E] text-white shadow-sm'
+              : 'bg-white border-gray-200 text-black hover:bg-slate-50'
           }`}
         >
-          <Flame className="w-4 h-4" />
-          الديزل والأرباح
+          <Flame
+            className={`w-5 h-5 shrink-0 ${
+              activeTab === 'finance' ? 'text-white' : 'text-[#0F766E]'
+            }`}
+          />
+          <span className="leading-snug">الديزل والأرباح</span>
         </button>
 
         <button
           type="button"
           onClick={() => setActiveTab('subscribers')}
-          className={`inline-flex items-center gap-2 px-4 py-2.5 text-xs sm:text-sm font-bold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+          className={`col-span-2 md:col-span-2 md:col-start-4 w-full min-h-[64px] flex flex-col items-center justify-center gap-1.5 text-center px-3 py-2.5 text-xs sm:text-sm font-bold rounded-2xl border transition-colors cursor-pointer ${
             activeTab === 'subscribers'
-              ? 'bg-teal-700 text-white'
-              : 'text-slate-700 hover:bg-slate-100'
+              ? 'bg-[#0F766E] border-[#0F766E] text-white shadow-sm'
+              : 'bg-white border-gray-200 text-black hover:bg-slate-50'
           }`}
         >
-          <Users className="w-4 h-4" />
-          سجل المشتركين ({state.subscribers.length})
+          <Users
+            className={`w-5 h-5 shrink-0 ${
+              activeTab === 'subscribers' ? 'text-white' : 'text-[#0F766E]'
+            }`}
+          />
+          <span className="leading-snug">
+            سجل المشتركين ({state.subscribers.length})
+          </span>
         </button>
       </nav>
 
@@ -940,7 +968,7 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
                   </div>
                   <div className="text-[11px] text-slate-600 flex items-center gap-1">
                     <Sparkles className="w-3.5 h-3.5 text-teal-700 shrink-0" />
-                    <span>Gemini Vision-AI Verification · حقل مشفر للأدمن فقط</span>
+                    <span>التحقق الآلي من الصورة · حقل مشفر للأدمن فقط</span>
                   </div>
                 </div>
                 <span
@@ -956,7 +984,7 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
 
               <p className="text-xs text-slate-700 leading-relaxed">
                 {aiEnabled
-                  ? 'يتم التحقق بالذكاء الاصطناعي من مطابقة صورة العداد مع الرقم المدخل لمنع أي خطأ يدوي أو تلاعب، مع إطلاق تنبيه أحمر فوري هنا وعند المحصّل فور أي اختلاف.'
+                  ? 'يتم التحقق آلياً من مطابقة صورة العداد مع الرقم المدخل لمنع أي خطأ يدوي أو تلاعب، مع إطلاق تنبيه أحمر فوري هنا وعند المحصّل فور أي اختلاف.'
                   : 'هذا الحقل مشفر ولا يملك مدير المحطة أو المحصّل صلاحية تعديله؛ يُفعّل حصراً من لوحة الأدمن المطور.'}
               </p>
 
@@ -1048,10 +1076,10 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
               <div>
                 <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
                   <ShieldAlert className="w-5 h-5 text-rose-700" />
-                  التنبيهات الفورية ومطابقة الصور بالذكاء الاصطناعي ({sortedAlerts.length})
+                  التنبيهات الفورية ومطابقة الصور ({sortedAlerts.length})
                 </h2>
                 <p className="text-xs text-slate-600 mt-1">
-                  مرتبة حسب الوقت — يتم إطلاق تنبيه أحمر فوري عند عدم مطابقة صورة العداد مع رقم القراءة (Gemini Vision-AI) أو عند تسجيل قراءة أقل من السابقة (تم إلغاء تنبيه التعديل اليدوي المجرد)
+                  مرتبة حسب الوقت — يتم إطلاق تنبيه أحمر فوري عند عدم مطابقة صورة العداد مع رقم القراءة أو عند تسجيل قراءة أقل من السابقة
                 </p>
               </div>
 
@@ -1147,7 +1175,7 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
                             {isAiMismatch ? (
                               <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-rose-700 text-white font-extrabold">
                                 <Sparkles className="w-3.5 h-3.5" />
-                                تنبيه أحمر فوري: عدم مطابقة صورة العداد مع رقم القراءة (Gemini Vision-AI)
+                                تنبيه أحمر فوري: عدم مطابقة صورة العداد مع رقم القراءة
                               </span>
                             ) : isYellow ? (
                               <span className="inline-flex items-center gap-1 font-bold text-amber-900">
@@ -1184,7 +1212,7 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
                             <div className="space-y-1">
                               <div className="text-xs text-rose-950 font-mono-nums flex flex-wrap gap-3">
                                 <span>
-                                  قراءة الصورة (AI):{' '}
+                                  قراءة الصورة:{' '}
                                   <strong className="text-rose-800">
                                     {al.aiDetectedReading !== undefined &&
                                     al.aiDetectedReading !== null
@@ -1213,7 +1241,7 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
                               </div>
                               {al.aiVerificationReason && (
                                 <p className="text-xs text-rose-900 font-medium">
-                                  تقرير الذكاء الاصطناعي: {al.aiVerificationReason}
+                                  تفاصيل المطابقة: {al.aiVerificationReason}
                                 </p>
                               )}
                             </div>
@@ -1342,7 +1370,7 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
               >
                 <Sparkles className="w-3.5 h-3.5" />
                 {aiEnabled
-                  ? 'مفعّل ومشفّر عبر Gemini Vision-AI'
+                  ? 'مفعّل ومشفّر للمطابقة التلقائية'
                   : 'معطّل (يُفعّل من الأدمن فقط)'}
               </div>
               <p className="text-xs text-slate-600 leading-relaxed">
@@ -1356,7 +1384,7 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
                 سياسة حفظ الصور والاستعادة
               </div>
               <p className="text-xs text-slate-600 leading-relaxed">
-                صور العدادات محفوظة في ذاكرة هاتف المحصّل محلياً ولا تُرفع إلى Firestore. تُحفظ النصوص والأرقام والمتأخرات وسندات القبض في السحابة للاستعادة اللحظية.
+                صور العدادات محفوظة في ذاكرة هاتف المحصّل محلياً ولا تُرفع إلى السحابة تلقائياً. تُحفظ النصوص والأرقام والمتأخرات وسندات القبض في السحابة للاستعادة اللحظية.
               </p>
             </div>
           </aside>

@@ -1051,7 +1051,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
             aiServerAlert = { ...aiRes.alert, syncStatus: 'synced' };
           }
           setAiRedAlertNotice(
-            `تنبيه أحمر فوري (Gemini Vision-AI): ${aiRes.discrepancyReason || `صورة العداد (${aiRes.detectedReading ?? 'غير مقروءة'}) لا تطابق القراءة المدخلة (${activeFinalReading})`}`,
+            `تنبيه أحمر فوري: ${aiRes.discrepancyReason || `صورة العداد (${aiRes.detectedReading ?? 'غير مقروءة'}) لا تطابق القراءة المدخلة (${activeFinalReading})`}`,
           );
         }
       } catch {
@@ -1572,7 +1572,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
           <div className="text-xs font-bold text-slate-900 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 flex flex-wrap items-center justify-between gap-2">
             <span className="inline-flex items-center gap-1.5">
               <Lock className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
-              مطابقة صورة العداد مع رقم القراءة مفعّلة ومشفّرة (Gemini Vision-AI) — أي اختلاف يطلق تنبيهاً أحمر فورياً للمدير.
+              مطابقة صورة العداد مع رقم القراءة مفعّلة ومشفّرة — أي اختلاف يطلق تنبيهاً أحمر فورياً للمدير.
             </span>
             <span className="text-[11px] font-medium text-emerald-800">
               الصور محفوظة بهاتفك محلياً فقط (النصوص في السحابة)

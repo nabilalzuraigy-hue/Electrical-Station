@@ -641,7 +641,7 @@ export const ActivationGate: React.FC<ActivationGateProps> = ({
                 دخول المطور بحساب Google
               </h2>
               <p className="text-xs text-slate-600 leading-relaxed">
-                مخصص للأدمن المطور فقط للوصول إلى قاعدة بيانات Firestore وإدارة الأكواد والمحطات.
+                مخصص للأدمن المطور فقط للوصول إلى قاعدة البيانات السحابية وإدارة الأكواد والمحطات.
               </p>
             </div>
 
