@@ -12,7 +12,6 @@ import {
   MapPin,
   MessageCircle,
   MessageSquare,
-  RefreshCw,
   RotateCcw,
   ScanLine,
   Search,
@@ -177,8 +176,6 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   const [savedInvoiceText, setSavedInvoiceText] = useState<string | null>(null);
   const [copiedInvoice, setCopiedInvoice] = useState(false);
   const [localExcelNotice, setLocalExcelNotice] = useState<string | null>(null);
-  const [refreshingState, setRefreshingState] = useState(false);
-  const [refreshNotice, setRefreshNotice] = useState<string | null>(null);
   const [gpsEnabled, setGpsEnabled] = useState(false);
   const [gpsPosition, setGpsPosition] = useState<{
     lat: number;
@@ -231,7 +228,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     };
   }, [state.station.stationId]);
 
-  // Auto-refresh subscribers and collector assignment from server on mount & every 15s
+  // Auto-refresh subscribers, readings, and collector assignment silently on mount, focus, reconnect & every 15s
   useEffect(() => {
     if (!isOnline || isManagerPreview || !staffToken || !state.station.stationId) {
       return;
@@ -251,40 +248,21 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       }
     };
     void pullLatest();
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void pullLatest();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
     const timer = window.setInterval(() => {
       void pullLatest();
     }, 15000);
     return () => {
       cancelled = true;
+      document.removeEventListener('visibilitychange', handleVisibility);
       window.clearInterval(timer);
     };
   }, [isOnline, isManagerPreview, staffToken, state.station.stationId]);
-
-  const handleRefreshSubscribers = async () => {
-    if (!staffToken || isManagerPreview) return;
-    if (!isOnline) {
-      setRefreshNotice('لا يوجد اتصال بالإنترنت لتحديث الكشف حالياً.');
-      return;
-    }
-    setRefreshingState(true);
-    setRefreshNotice(null);
-    try {
-      const latest = await refreshStationState(
-        state.station.stationId,
-        staffToken,
-      );
-      onUpdateState(latest);
-      setRefreshNotice(
-        `تم تحديث الكشف (${latest.subscribers.length} مشترك في نطاق المحطة).`,
-      );
-    } catch (err) {
-      setRefreshNotice(
-        err instanceof Error ? err.message : 'تعذر تحديث الكشف من الخادم.',
-      );
-    } finally {
-      setRefreshingState(false);
-    }
-  };
 
 
   const resolvedCollectorName =
@@ -1529,34 +1507,20 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
 
           <div className="flex flex-wrap items-center justify-end gap-2">
             {!isManagerPreview && (
-              <>
-                <button
-                  type="button"
-                  onClick={() => setGpsEnabled((prev) => !prev)}
-                  className={`min-h-[44px] px-3.5 py-2 text-xs font-bold rounded-lg border transition-colors inline-flex items-center gap-2 whitespace-nowrap cursor-pointer ${
-                    gpsEnabled
-                      ? 'bg-emerald-50 border-emerald-300 text-emerald-900 hover:bg-emerald-100'
-                      : 'bg-white border-slate-300 text-slate-800 hover:bg-slate-50'
-                  }`}
-                >
-                  <MapPin
-                    className={`w-4 h-4 ${gpsEnabled ? 'text-emerald-700' : 'text-slate-600'}`}
-                  />
-                  {gpsEnabled ? 'إيقاف مشاركة GPS' : 'تفعيل تتبع GPS'}
-                </button>
-
-                <button
-                  type="button"
-                  disabled={!isOnline || refreshingState}
-                  onClick={() => void handleRefreshSubscribers()}
-                  className="min-h-[44px] px-3.5 py-2 text-xs font-bold rounded-lg bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-50 text-slate-800 transition-colors inline-flex items-center gap-2 whitespace-nowrap cursor-pointer"
-                >
-                  <RefreshCw
-                    className={`w-4 h-4 text-teal-700 ${refreshingState ? 'animate-spin' : ''}`}
-                  />
-                  {refreshingState ? 'جاري الاستعادة...' : 'استعادة / تحديث فوري'}
-                </button>
-              </>
+              <button
+                type="button"
+                onClick={() => setGpsEnabled((prev) => !prev)}
+                className={`min-h-[44px] px-3.5 py-2 text-xs font-bold rounded-lg border transition-colors inline-flex items-center gap-2 whitespace-nowrap cursor-pointer ${
+                  gpsEnabled
+                    ? 'bg-emerald-50 border-emerald-300 text-emerald-900 hover:bg-emerald-100'
+                    : 'bg-white border-slate-300 text-slate-800 hover:bg-slate-50'
+                }`}
+              >
+                <MapPin
+                  className={`w-4 h-4 ${gpsEnabled ? 'text-emerald-700' : 'text-slate-600'}`}
+                />
+                {gpsEnabled ? 'إيقاف مشاركة GPS' : 'تفعيل تتبع GPS'}
+              </button>
             )}
 
             <button
@@ -1613,11 +1577,6 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
             <span className="text-[11px] font-medium text-emerald-800">
               الصور محفوظة بهاتفك محلياً فقط (النصوص في السحابة)
             </span>
-          </div>
-        )}
-        {refreshNotice && (
-          <div className="text-xs font-medium text-teal-800 bg-teal-50 border border-teal-200 rounded-lg px-3 py-2">
-            {refreshNotice}
           </div>
         )}
         {gpsStatusText && (
@@ -1757,21 +1716,8 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                 <p className="text-xs text-slate-500">
                   {assignedZones.length > 0
                     ? `النطاق المخصص: ${assignedZones.join('، ')}`
-                    : 'تأكد من إضافة مشتركين للمحطة أو تحديث الكشف من الخادم.'}
+                    : 'يتم جلب وتحديث كشف المشتركين تلقائياً فور توفر الاتصال.'}
                 </p>
-                {!isManagerPreview && isOnline && (
-                  <button
-                    type="button"
-                    disabled={refreshingState}
-                    onClick={() => void handleRefreshSubscribers()}
-                    className="min-h-[40px] px-4 py-2 text-xs font-bold rounded-lg bg-teal-700 hover:bg-teal-800 disabled:opacity-60 text-white inline-flex items-center gap-2 cursor-pointer"
-                  >
-                    <RefreshCw
-                      className={`w-3.5 h-3.5 ${refreshingState ? 'animate-spin' : ''}`}
-                    />
-                    تحديث الكشف من الخادم
-                  </button>
-                )}
               </div>
             )}
           </div>

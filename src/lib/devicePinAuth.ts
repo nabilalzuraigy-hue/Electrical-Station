@@ -213,10 +213,10 @@ export async function clearDevicePinForReset(): Promise<DeviceCodeBinding | null
 }
 
 export async function clearDeviceBinding(): Promise<void> {
-  await idbDel(DEVICE_BINDING_IDB_KEY);
   try {
     localStorage.removeItem(DEVICE_BINDING_LS_KEY);
   } catch {
     // Ignore
   }
+  await idbDel(DEVICE_BINDING_IDB_KEY);
 }

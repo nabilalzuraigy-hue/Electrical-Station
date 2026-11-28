@@ -19,6 +19,7 @@ import {
 import { isCloudAdminToken } from './lib/cloudAdminStore';
 import {
   clearDeveloperSession,
+  clearDeviceBinding,
   saveDeveloperSession,
 } from './lib/devicePinAuth';
 import {
@@ -197,10 +198,13 @@ function StationWorkspace() {
     setActiveTab('subscriber');
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
     if (adminToken) {
-      void clearDeveloperSession();
+      await clearDeveloperSession();
       void signOutUser().catch(() => {});
+    }
+    if (staffToken || accessRecord) {
+      await clearDeviceBinding();
     }
     setAdminToken(null);
     setStaffToken(null);
@@ -309,7 +313,7 @@ function StationWorkspace() {
                 <PWAInstallPrompt variant="header" />
                 <button
                   type="button"
-                  onClick={handleLogout}
+                  onClick={() => void handleLogout()}
                   className="px-3 sm:px-4 py-2 text-xs font-bold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   <LogOut className="w-3.5 h-3.5" />
@@ -389,7 +393,7 @@ function StationWorkspace() {
               setAdminToken(tok);
               setActiveTab('admin');
             }}
-            onLogoutAdmin={handleLogout}
+            onLogoutAdmin={() => void handleLogout()}
           />
         ) : (
           <ActivationGate onAuthenticated={handleUnifiedAuth} />
