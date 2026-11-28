@@ -22,7 +22,6 @@ import {
   UserPlus,
 } from 'lucide-react';
 import {
-  claimAdminPasscode,
   createManualSubscriberAdmin,
   deleteAccessCodeAdmin,
   deleteExpenseAdmin,
@@ -36,9 +35,9 @@ import {
   fetchStationDetailsAdmin,
   fetchStationSubscribersAdmin,
   generateAccessCodeAdmin,
-  getAdminStatus,
-  loginAdminPasscode,
+  loginAdminWithGoogle,
   parseSubscribersExcelFile,
+  refreshOverviewFromFirestoreAdmin,
   resetCodePinAdmin,
   restoreAdminBackup,
   toggleAccessCodeAdmin,
@@ -47,11 +46,17 @@ import {
   uploadSubscribersChunkedAdmin,
 } from '../lib/offlineDb';
 import {
+  ADMIN_GOOGLE_EMAIL,
+  auth,
   FIREBASE_DATABASE_ID,
   FIREBASE_PROJECT_ID,
+  formatAuthError,
   formatFirestoreUserMessage,
+  isAuthorizedAdminUser,
+  signInWithGooglePopup,
 } from '../lib/firebase';
 import {
+  clearCloudVaultLocalCache,
   isCloudAdminToken,
 } from '../lib/cloudAdminStore';
 import { saveDeveloperSession } from '../lib/devicePinAuth';
@@ -84,9 +89,6 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const jsonBackupInputRef = useRef<HTMLInputElement>(null);
 
-  const [checkingStatus, setCheckingStatus] = useState(true);
-  const [configured, setConfigured] = useState(true);
-  const [passcodeInput, setPasscodeInput] = useState('');
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
 
@@ -156,31 +158,8 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
   const [loadingDetails, setLoadingDetails] = useState(false);
   const [deletingRecordKey, setDeletingRecordKey] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (adminToken) {
-      setCheckingStatus(false);
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await getAdminStatus();
-        if (!cancelled) {
-          setConfigured(res.configured);
-        }
-      } catch {
-        if (!cancelled) setConfigured(true);
-      } finally {
-        if (!cancelled) setCheckingStatus(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [adminToken]);
-
   const syncBackupToFirestoreSilently = useCallback(async () => {
-    if (!adminToken) return;
+    if (!adminToken || !isAuthorizedAdminUser(auth.currentUser)) return;
     if (isCloudAdminToken(adminToken)) {
       setCloudLastSyncAt(new Date().toISOString());
       setCloudStatus(
@@ -216,10 +195,46 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
       }
     } catch (err) {
       setFeedback(
-        err instanceof Error ? err.message : 'تعذر تحميل بيانات الإدارة.',
+        formatFirestoreUserMessage(err, 'تعذر تحميل بيانات الإدارة.'),
       );
     } finally {
       setLoading(false);
+    }
+  }, [adminToken]);
+
+  const handleRefreshFromFirestore = useCallback(async () => {
+    if (!adminToken) return;
+    setLoading(true);
+    setCloudBusy(true);
+    setFeedback(null);
+    setCloudStatus(null);
+    try {
+      const refreshed = await refreshOverviewFromFirestoreAdmin(adminToken);
+      setStations(refreshed.stations);
+      setCodes(refreshed.codes);
+      const firstId = refreshed.stations[0]?.stationId ?? '';
+      if (firstId) {
+        setTargetStationId((prev) => prev || firstId);
+        setExcelStationId((prev) => prev || firstId);
+        setManualSubStationId((prev) => prev || firstId);
+        setInspectStationId((prev) => prev || firstId);
+      }
+      if (refreshed.updatedAtIso) {
+        setCloudLastSyncAt(refreshed.updatedAtIso);
+      }
+      const msg = `تم تحديث وجلب البيانات من Firestore بنجاح (${refreshed.stations.length} محطة · ${refreshed.codes.length} كود · ${refreshed.subscriberCount} مشترك).`;
+      setCloudStatus(msg);
+      setFeedback(msg);
+    } catch (err) {
+      const msg = formatFirestoreUserMessage(
+        err,
+        'تعذر جلب البيانات من Firestore.',
+      );
+      setCloudStatus(msg);
+      setFeedback(msg);
+    } finally {
+      setLoading(false);
+      setCloudBusy(false);
     }
   }, [adminToken]);
 
@@ -268,10 +283,15 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
   );
 
   useEffect(() => {
-    if (adminToken) {
-      void loadAdminData();
+    if (adminToken && isAuthorizedAdminUser(auth.currentUser)) {
+      if (!autoRestoredRef.current) {
+        autoRestoredRef.current = true;
+        void handleRefreshFromFirestore();
+      } else {
+        void loadAdminData();
+      }
     }
-  }, [adminToken, loadAdminData]);
+  }, [adminToken, handleRefreshFromFirestore, loadAdminData]);
 
   useEffect(() => {
     if (adminToken && manualSubStationId) {
@@ -285,56 +305,17 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     }
   }, [adminToken, inspectStationId, loadStationDetails]);
 
-  // Auto-restore from Firestore Vault once on mount if server store is empty
-  useEffect(() => {
-    if (
-      !adminToken ||
-      isCloudAdminToken(adminToken) ||
-      loading ||
-      autoRestoredRef.current ||
-      stations.length > 0 ||
-      codes.length > 0
-    ) {
-      return;
-    }
-    autoRestoredRef.current = true;
-    (async () => {
-      try {
-        const snap = await loadAdminStoreFromFirestore();
-        if (snap && (snap.stationCount > 0 || snap.codeCount > 0)) {
-          const restored = await restoreAdminBackup(
-            adminToken,
-            snap.backup,
-            'merge',
-          );
-          setCloudLastSyncAt(snap.updatedAtIso);
-          setCloudStatus(
-            `تمت الاستعادة التلقائية من سحابة Firebase (${restored.stationCount} محطة · ${restored.codeCount} كود · ${restored.subscriberCount} مشترك).`,
-          );
-          await loadAdminData();
-        }
-      } catch {
-        // non-blocking auto-restore check
-      }
-    })();
-  }, [adminToken, loading, stations.length, codes.length, loadAdminData]);
-
-  const handlePasscodeSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!passcodeInput.trim()) return;
+  const handleGoogleAdminLogin = async () => {
     setAuthSubmitting(true);
     setAuthError(null);
     try {
-      const res = configured
-        ? await loginAdminPasscode(passcodeInput.trim())
-        : await claimAdminPasscode(passcodeInput.trim());
+      const user = await signInWithGooglePopup();
+      const idToken = await user.getIdToken();
+      const res = await loginAdminWithGoogle(idToken);
       await saveDeveloperSession({ token: res.token, name: res.name });
-      setPasscodeInput('');
       onAdminAuthenticated(res.token);
     } catch (err) {
-      setAuthError(
-        err instanceof Error ? err.message : 'تعذر التحقق من كلمة مرور الأدمن.',
-      );
+      setAuthError(formatAuthError(err));
     } finally {
       setAuthSubmitting(false);
     }
@@ -739,7 +720,8 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     setCloudBusy(true);
     setCloudStatus(null);
     try {
-      const snap = await loadAdminStoreFromFirestore();
+      await clearCloudVaultLocalCache();
+      const snap = await loadAdminStoreFromFirestore(true);
       if (!snap) {
         setCloudStatus('لا توجد نسخة احتياطية محفوظة في سحابة Firebase حتى الآن.');
         return;
@@ -812,51 +794,37 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
     }
   };
 
-  if (!adminToken) {
+  if (!adminToken || !isAuthorizedAdminUser(auth.currentUser)) {
     return (
       <div className="max-w-md mx-auto py-10">
         <div className="bg-white border border-slate-200 rounded-xl p-6 sm:p-8 space-y-5">
           <div className="space-y-1.5">
             <h1 className="text-xl font-bold text-slate-900 flex items-center gap-2">
               <Lock className="w-5 h-5 text-teal-700" />
-              {checkingStatus
-                ? 'جاري التحقق من لوحة المطور...'
-                : 'دخول المطور'}
+              دخول الأدمن المطور (Google)
             </h1>
             <p className="text-xs text-slate-600 leading-relaxed">
-              أدخل كلمة مرور المطور لإدارة المحطات والمشتركين والأكواد.
+              سجّل الدخول بحساب Google المعتمد للمطور ({ADMIN_GOOGLE_EMAIL}) لجلب المحطات والأكواد والمشتركين من Firestore بأمان.
             </p>
           </div>
 
-          <form onSubmit={handlePasscodeSubmit} className="space-y-4">
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">
-                كلمة مرور المطور
-              </label>
-              <input
-                type="password"
-                dir="ltr"
-                value={passcodeInput}
-                onChange={(e) => setPasscodeInput(e.target.value)}
-                placeholder="••••••••"
-                className="w-full min-h-[48px] px-3.5 py-2.5 text-lg font-bold font-mono-nums placeholder:font-medium border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
-              />
-            </div>
+          {authError && (
+            <p className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-3">
+              {authError}
+            </p>
+          )}
 
-            {authError && (
-              <p className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-3">
-                {authError}
-              </p>
-            )}
-
-            <button
-              type="submit"
-              disabled={authSubmitting || checkingStatus}
-              className="w-full min-h-[46px] py-2.5 px-4 bg-teal-700 hover:bg-teal-800 text-white text-sm font-bold rounded-lg transition-colors cursor-pointer"
-            >
-              {authSubmitting ? 'جاري التحقق...' : 'دخول لوحة المطور'}
-            </button>
-          </form>
+          <button
+            type="button"
+            disabled={authSubmitting}
+            onClick={() => void handleGoogleAdminLogin()}
+            className="w-full min-h-[48px] py-2.5 px-4 bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 text-white text-sm font-bold rounded-lg transition-colors cursor-pointer inline-flex items-center justify-center gap-2"
+          >
+            <ShieldCheck className="w-4 h-4" />
+            {authSubmitting
+              ? 'جاري التحقق عبر Google...'
+              : 'دخول بحساب Google للمطور'}
+          </button>
         </div>
       </div>
     );
@@ -872,7 +840,10 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
             لوحة الأدمن المطور · الصلاحية المطلقة
           </h1>
           <p className="text-sm text-slate-600 mt-1">
-            توليد أكواد مديري المحطات والمحصّلين يدوياً، ورفع كشوفات Excel للمشتركين لكل محطة معزولة.
+            توليد أكواد مديري المحطات والمحصّلين يدوياً، ورفع كشوفات Excel للمشتركين لكل محطة معزولة.{' '}
+            <span dir="ltr" className="font-mono-nums text-xs text-teal-700 font-semibold">
+              ({auth.currentUser?.email || ADMIN_GOOGLE_EMAIL})
+            </span>
           </p>
         </div>
 
@@ -887,12 +858,12 @@ export const AdminLicensingPanel: React.FC<AdminLicensingPanelProps> = ({
           </button>
           <button
             type="button"
-            onClick={() => void loadAdminData()}
-            disabled={loading}
-            className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium bg-white border border-slate-300 text-slate-800 rounded-lg hover:bg-slate-50 cursor-pointer"
+            onClick={() => void handleRefreshFromFirestore()}
+            disabled={loading || cloudBusy}
+            className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-bold bg-white border border-teal-300 text-teal-900 rounded-lg hover:bg-teal-50 disabled:opacity-60 cursor-pointer"
           >
-            <RefreshCw className="w-4 h-4" />
-            تحديث
+            <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+            {loading ? 'جاري التحديث...' : 'تحديث'}
           </button>
           <button
             type="button"

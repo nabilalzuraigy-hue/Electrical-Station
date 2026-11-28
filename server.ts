@@ -1019,6 +1019,29 @@ async function startServer() {
     res.json({ token, name: 'الأدمن المطور' });
   });
 
+  app.post('/api/admin/firebase-google', async (req, res) => {
+    const idToken = String(
+      req.body?.idToken ?? req.headers['x-firebase-id-token'] ?? '',
+    ).trim();
+    if (!idToken) {
+      res.status(400).json({ error: 'رمز تحقق Google غير مرفق.' });
+      return;
+    }
+    const verified = await verifyFirebaseAdminToken(idToken);
+    if (!verified) {
+      res.status(403).json({
+        error: `الدخول مقتصر على حساب المطور المعتمد (${ADMIN_GOOGLE_EMAIL}).`,
+      });
+      return;
+    }
+    const token = signSessionToken({
+      role: 'admin',
+      name: 'نبيل الزريقي',
+      exp: Date.now() + 30 * 24 * 60 * 60 * 1000,
+    });
+    res.json({ token, name: 'نبيل الزريقي', email: verified.email });
+  });
+
   // ============================================================
   // Developer Admin Protected Endpoints
   // ============================================================

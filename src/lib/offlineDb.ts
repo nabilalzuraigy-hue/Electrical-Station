@@ -12,6 +12,7 @@ import {
   verifyDeveloperPasscodeStatic,
 } from './devicePinAuth';
 import {
+  clearCloudVaultLocalCache,
   CLOUD_ADMIN_TOKEN,
   canUseCloudAdminFallback,
   cloudAdminCreateManualSubscriber,
@@ -33,6 +34,7 @@ import {
   cloudAdminUploadSubscribersChunked,
   isCloudAdminToken,
 } from './cloudAdminStore';
+import { loadAdminStoreFromFirestore } from './firestoreBackup';
 export { CLOUD_ADMIN_TOKEN, isCloudAdminToken };
 import type {
   AccessCodeRecord,
@@ -193,19 +195,79 @@ export async function loginAdminPasscode(
   }
 }
 
+export async function loginAdminWithGoogle(
+  idToken: string,
+): Promise<{ token: string; name: string }> {
+  try {
+    return await apiRequest<{ token: string; name: string }>(
+      '/api/admin/firebase-google',
+      {
+        method: 'POST',
+        body: JSON.stringify({ idToken }),
+      },
+    );
+  } catch (err) {
+    if (err instanceof StaticHostingNoBackendError) {
+      return { token: CLOUD_ADMIN_TOKEN, name: 'نبيل الزريقي' };
+    }
+    throw err;
+  }
+}
+
 export async function fetchAdminOverview(adminToken: string): Promise<{
   stations: StationConfig[];
   codes: AccessCodeRecord[];
 }> {
   return withCloudAdmin(
     adminToken,
-    () => cloudAdminOverview(),
+    () => cloudAdminOverview(false),
     () =>
       apiRequest<{
         stations: StationConfig[];
         codes: AccessCodeRecord[];
       }>('/api/admin/overview', {}, adminToken),
   );
+}
+
+export async function refreshOverviewFromFirestoreAdmin(
+  adminToken: string,
+): Promise<{
+  stations: StationConfig[];
+  codes: AccessCodeRecord[];
+  subscriberCount: number;
+  updatedAtIso: string | null;
+}> {
+  await clearCloudVaultLocalCache();
+
+  if (isCloudAdminToken(adminToken)) {
+    const overview = await cloudAdminOverview(true);
+    const subscriberCount = overview.stations.reduce(
+      (sum, st) => sum + (st.subscriberCount ?? 0),
+      0,
+    );
+    return {
+      stations: overview.stations,
+      codes: overview.codes,
+      subscriberCount,
+      updatedAtIso: new Date().toISOString(),
+    };
+  }
+
+  const snap = await loadAdminStoreFromFirestore(true);
+  if (snap && (snap.stationCount > 0 || snap.codeCount > 0)) {
+    await restoreAdminBackup(adminToken, snap.backup, 'merge');
+  }
+  const overview = await fetchAdminOverview(adminToken);
+  const subscriberCount = overview.stations.reduce(
+    (sum, st) => sum + (st.subscriberCount ?? 0),
+    0,
+  );
+  return {
+    stations: overview.stations,
+    codes: overview.codes,
+    subscriberCount,
+    updatedAtIso: snap?.updatedAtIso ?? null,
+  };
 }
 
 export async function createStationAdmin(

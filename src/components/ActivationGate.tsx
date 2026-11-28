@@ -12,12 +12,16 @@ import {
 import {
   checkBoundCodeStatus,
   loadStationLocalState,
-  loginAdminPasscode,
+  loginAdminWithGoogle,
   loginWithAccessCode,
   saveStationLocalState,
   type StationLocalState,
   type UnifiedLoginResult,
 } from '../lib/offlineDb';
+import {
+  formatAuthError,
+  signInWithGooglePopup,
+} from '../lib/firebase';
 import {
   clearDevicePinForReset,
   getDeviceBinding,
@@ -63,10 +67,6 @@ export const ActivationGate: React.FC<ActivationGateProps> = ({
   const [pinInput, setPinInput] = useState('');
   const [confirmPinInput, setConfirmPinInput] = useState('');
   const [showPin, setShowPin] = useState(false);
-
-  // 3. Developer passcode input
-  const [devPassword, setDevPassword] = useState('');
-  const [showDevPassword, setShowDevPassword] = useState(false);
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -344,29 +344,22 @@ export const ActivationGate: React.FC<ActivationGateProps> = ({
     }
   };
 
-  const handleDeveloperLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const pass = devPassword.trim();
-    if (!pass) {
-      setError('يرجى إدخال كلمة مرور المطور.');
-      return;
-    }
-
+  const handleDeveloperGoogleLogin = async () => {
     setSubmitting(true);
     setError(null);
+    setInfoNotice(null);
     try {
-      const res = await loginAdminPasscode(pass);
+      const user = await signInWithGooglePopup();
+      const idToken = await user.getIdToken();
+      const res = await loginAdminWithGoogle(idToken);
       await saveDeveloperSession({ token: res.token, name: res.name });
-      setDevPassword('');
       onAuthenticated({
         kind: 'admin',
         token: res.token,
         name: res.name,
       });
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : 'كلمة مرور المطور غير صحيحة.',
-      );
+      setError(formatAuthError(err));
     } finally {
       setSubmitting(false);
     }
@@ -461,7 +454,7 @@ export const ActivationGate: React.FC<ActivationGateProps> = ({
                 }}
                 className="text-xs font-semibold text-slate-500 hover:text-emerald-700 transition-colors cursor-pointer"
               >
-                دخول المطور
+                دخول المطور (Google)
               </button>
             </div>
           </form>
@@ -639,50 +632,17 @@ export const ActivationGate: React.FC<ActivationGateProps> = ({
         )}
 
         {mode === 'developer_login' && (
-          <form onSubmit={handleDeveloperLogin} className="space-y-4">
+          <div className="space-y-4">
             <div className="text-center space-y-1">
               <div className="w-11 h-11 mx-auto rounded-2xl bg-slate-900 text-emerald-400 inline-flex items-center justify-center">
                 <ShieldCheck className="w-6 h-6" />
               </div>
               <h2 className="text-lg font-extrabold text-slate-900">
-                دخول المطور
+                دخول المطور بحساب Google
               </h2>
-            </div>
-
-            <div>
-              <label
-                htmlFor="developer-password-input"
-                className="block text-xs font-bold text-slate-700 mb-1"
-              >
-                كلمة مرور المطور
-              </label>
-              <div className="relative">
-                <Lock className="w-4 h-4 text-slate-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-                <input
-                  id="developer-password-input"
-                  type={showDevPassword ? 'text' : 'password'}
-                  dir="ltr"
-                  value={devPassword}
-                  onChange={(e) => {
-                    setDevPassword(e.target.value);
-                    if (error) setError(null);
-                  }}
-                  placeholder="••••••••"
-                  autoComplete="current-password"
-                  className="w-full min-h-[52px] pr-10 pl-10 py-2.5 text-base font-bold bg-slate-50 border border-slate-300 rounded-2xl focus:outline-none focus:ring-2 focus:ring-emerald-600 focus:bg-white"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowDevPassword((v) => !v)}
-                  className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 cursor-pointer"
-                >
-                  {showDevPassword ? (
-                    <EyeOff className="w-4 h-4" />
-                  ) : (
-                    <Eye className="w-4 h-4" />
-                  )}
-                </button>
-              </div>
+              <p className="text-xs text-slate-600 leading-relaxed">
+                مخصص للأدمن المطور فقط للوصول إلى قاعدة بيانات Firestore وإدارة الأكواد والمحطات.
+              </p>
             </div>
 
             {error && (
@@ -693,11 +653,13 @@ export const ActivationGate: React.FC<ActivationGateProps> = ({
             )}
 
             <button
-              type="submit"
+              type="button"
               disabled={submitting}
-              className="w-full min-h-[50px] py-3 px-6 bg-slate-900 hover:bg-slate-800 disabled:bg-slate-300 text-white text-sm font-extrabold rounded-2xl shadow-md transition-colors cursor-pointer"
+              onClick={() => void handleDeveloperGoogleLogin()}
+              className="w-full min-h-[52px] py-3 px-6 bg-slate-900 hover:bg-slate-800 disabled:bg-slate-300 text-white text-sm font-extrabold rounded-2xl shadow-md transition-colors cursor-pointer inline-flex items-center justify-center gap-2"
             >
-              {submitting ? 'جاري الدخول...' : 'دخول لوحة المطور'}
+              <ShieldCheck className="w-4 h-4 text-emerald-400" />
+              {submitting ? 'جاري المصادقة عبر Google...' : 'المتابعة بحساب Google للمطور'}
             </button>
 
             <div className="pt-1 text-center">
@@ -705,7 +667,6 @@ export const ActivationGate: React.FC<ActivationGateProps> = ({
                 type="button"
                 onClick={() => {
                   setError(null);
-                  setDevPassword('');
                   setMode('code_entry');
                 }}
                 className="text-xs font-semibold text-slate-500 hover:text-slate-800 cursor-pointer"
@@ -713,7 +674,7 @@ export const ActivationGate: React.FC<ActivationGateProps> = ({
                 العودة إلى كود التفعيل
               </button>
             </div>
-          </form>
+          </div>
         )}
       </div>
     </div>

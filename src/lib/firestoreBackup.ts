@@ -6,14 +6,18 @@ import {
   getDoc,
   getDocFromServer,
   getDocs,
+  getDocsFromServer,
   serverTimestamp,
   setDoc,
 } from 'firebase/firestore';
 import {
+  ADMIN_GOOGLE_EMAIL,
+  auth,
   computeStaffAccessHash,
   computeSubscriberPortalHash,
   db,
   handleFirestoreError,
+  isAuthorizedAdminUser,
   normalizeCodeForHash,
   OperationType,
 } from './firebase';
@@ -59,7 +63,30 @@ export interface StaffVaultPayload {
 
 const MAX_CHUNK_CHARS = 380000;
 const MAX_STAFF_VAULT_JSON_CHARS = 760000;
-const DEVELOPER_ACTOR_LABEL = 'developer_admin';
+
+function isOfflineFirestoreError(err: unknown): boolean {
+  const code =
+    typeof err === 'object' && err !== null && 'code' in err
+      ? String((err as { code?: unknown }).code ?? '')
+      : '';
+  const msg = err instanceof Error ? err.message.toLowerCase() : String(err ?? '').toLowerCase();
+  return (
+    code === 'unavailable' ||
+    msg.includes('unavailable') ||
+    msg.includes('offline') ||
+    msg.includes('could not reach')
+  );
+}
+
+function getAuthenticatedAdminEmail(): string {
+  const user = auth.currentUser;
+  if (!isAuthorizedAdminUser(user)) {
+    throw new Error(
+      `يجب تسجيل الدخول بحساب المطور في Google (${ADMIN_GOOGLE_EMAIL}) أولاً للوصول إلى قاعدة بيانات Firestore.`,
+    );
+  }
+  return user!.email!;
+}
 
 function sanitizeVaultDocId(raw: string): string {
   return raw.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
@@ -184,7 +211,7 @@ function mapDocToAccessCodeRecord(
     role,
     stationId,
     active: raw.active !== false,
-    createdBy: String(raw.createdBy ?? DEVELOPER_ACTOR_LABEL),
+    createdBy: String(raw.createdBy ?? ADMIN_GOOGLE_EMAIL),
     name: String(raw.name ?? (role === 'manager' ? 'مدير المحطة' : 'المحصّل')),
     phone: String(raw.phone ?? ''),
     stationName: String(raw.stationName ?? stationId),
@@ -217,6 +244,7 @@ function mapDocToAccessCodeRecord(
 export async function saveAccessCodeToFirestore(
   codeRec: AccessCodeRecord,
 ): Promise<void> {
+  const adminEmail = getAuthenticatedAdminEmail();
   const code = normalizeCodeForHash(codeRec.code);
   if (!code) return;
   const payload = {
@@ -224,7 +252,7 @@ export async function saveAccessCodeToFirestore(
     role: codeRec.role,
     stationId: codeRec.stationId,
     active: Boolean(codeRec.active),
-    createdBy: codeRec.createdBy || DEVELOPER_ACTOR_LABEL,
+    createdBy: codeRec.createdBy || adminEmail,
     name: (codeRec.name || '').slice(0, 120),
     phone: (codeRec.phone || '').slice(0, 30),
     stationName: (codeRec.stationName || '').slice(0, 120),
@@ -248,7 +276,11 @@ export async function saveAccessCodeToFirestore(
     updatedAt: codeRec.updatedAt || new Date().toISOString(),
   };
 
-  await setDoc(doc(db, 'codes', code), payload);
+  try {
+    await setDoc(doc(db, 'codes', code), payload);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, `codes/${code}`);
+  }
 }
 
 export async function loadAccessCodeFromFirestore(
@@ -272,37 +304,49 @@ export async function loadAccessCodeFromFirestore(
   }
 }
 
-export async function listAccessCodesFromFirestore(): Promise<AccessCodeRecord[]> {
+export async function listAccessCodesFromFirestore(
+  preferServer = true,
+): Promise<AccessCodeRecord[]> {
+  getAuthenticatedAdminEmail();
+  const colRef = collection(db, 'codes');
+  let snap;
   try {
-    const snap = await getDocs(collection(db, 'codes'));
-    const list: AccessCodeRecord[] = [];
-    snap.forEach((d) => {
-      const mapped = mapDocToAccessCodeRecord(
-        d.id,
-        d.data() as Record<string, unknown>,
-      );
-      if (mapped) list.push(mapped);
-    });
-    return list;
-  } catch {
-    return [];
+    snap = preferServer
+      ? await getDocsFromServer(colRef).catch((err) => {
+          if (isOfflineFirestoreError(err)) return getDocs(colRef);
+          throw err;
+        })
+      : await getDocs(colRef);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, 'codes');
   }
+  const list: AccessCodeRecord[] = [];
+  snap.forEach((d) => {
+    const mapped = mapDocToAccessCodeRecord(
+      d.id,
+      d.data() as Record<string, unknown>,
+    );
+    if (mapped) list.push(mapped);
+  });
+  return list;
 }
 
 export async function deleteAccessCodeFromFirestore(
   codeInput: string,
 ): Promise<void> {
+  getAuthenticatedAdminEmail();
   const code = normalizeCodeForHash(codeInput);
   if (!code) return;
   try {
     await deleteDoc(doc(db, 'codes', code));
-  } catch {
-    // Non-blocking if already removed or offline
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, `codes/${code}`);
   }
 }
 
 async function syncStaffAndPortalCachesToFirestore(
   backup: AdminStoreBackupPayload,
+  adminEmail: string,
 ): Promise<void> {
   const stations = backup.stations ?? {};
   const codes = Object.values(backup.codes ?? {});
@@ -335,7 +379,7 @@ async function syncStaffAndPortalCachesToFirestore(
         stationJson: JSON.stringify(station),
         collectorsJson: JSON.stringify(stationCollectors),
         stationDataJson: buildCompactStaffBucketJson(bucket),
-        updatedByEmail: DEVELOPER_ACTOR_LABEL,
+        updatedByEmail: adminEmail,
         updatedAt: serverTimestamp(),
       });
     } catch {
@@ -413,6 +457,7 @@ export async function saveAdminStoreToFirestore(
   updatedAtIso: string;
   skippedEmptyOverwrite?: boolean;
 }> {
+  const adminEmail = getAuthenticatedAdminEmail();
   const stationIds = Object.keys(backup.stations ?? {});
   const stationCount = stationIds.length;
   const codeCount = Object.keys(backup.codes ?? {}).length;
@@ -421,7 +466,9 @@ export async function saveAdminStoreToFirestore(
   // Guard: NEVER wipe a non-empty cloud vault with an empty local/restarted store
   if (stationCount === 0 && codeCount === 0 && !options?.allowEmptyOverwrite) {
     try {
-      const existingSnap = await getDoc(doc(db, 'adminVault', 'meta'));
+      const existingSnap = await getDocFromServer(doc(db, 'adminVault', 'meta')).catch(() =>
+        getDoc(doc(db, 'adminVault', 'meta')),
+      );
       if (existingSnap.exists()) {
         const meta = existingSnap.data() as {
           stationCount?: number;
@@ -473,7 +520,7 @@ export async function saveAdminStoreToFirestore(
           partIndex: i,
           totalParts: parts.length,
           payloadChunk: parts[i],
-          updatedByEmail: DEVELOPER_ACTOR_LABEL,
+          updatedByEmail: adminEmail,
           updatedAt: serverTimestamp(),
         });
       } catch (err) {
@@ -494,7 +541,7 @@ export async function saveAdminStoreToFirestore(
     stationCount,
     codeCount,
     subscriberCount,
-    updatedByEmail: DEVELOPER_ACTOR_LABEL,
+    updatedByEmail: adminEmail,
     clientUpdatedAt: nowIso,
     updatedAt: serverTimestamp(),
   };
@@ -506,7 +553,7 @@ export async function saveAdminStoreToFirestore(
   }
 
   // Sync top-level `codes` collection, `staffVault`, and `subscriberPortals`
-  await syncStaffAndPortalCachesToFirestore(backup);
+  await syncStaffAndPortalCachesToFirestore(backup, adminEmail);
 
   return {
     stationCount,
@@ -516,15 +563,25 @@ export async function saveAdminStoreToFirestore(
   };
 }
 
-export async function loadAdminStoreFromFirestore(): Promise<FirestoreVaultSnapshot | null> {
+export async function loadAdminStoreFromFirestore(
+  preferServer = true,
+): Promise<FirestoreVaultSnapshot | null> {
+  const adminEmail = getAuthenticatedAdminEmail();
+  const metaRef = doc(db, 'adminVault', 'meta');
+
   let metaSnap;
   try {
-    metaSnap = await getDoc(doc(db, 'adminVault', 'meta'));
+    metaSnap = preferServer
+      ? await getDocFromServer(metaRef).catch((err) => {
+          if (isOfflineFirestoreError(err)) return getDoc(metaRef);
+          throw err;
+        })
+      : await getDoc(metaRef);
   } catch (err) {
     handleFirestoreError(err, OperationType.GET, 'adminVault/meta');
   }
 
-  const cloudCodes = await listAccessCodesFromFirestore();
+  const cloudCodes = await listAccessCodesFromFirestore(preferServer);
 
   if (!metaSnap.exists()) {
     if (cloudCodes.length === 0) return null;
@@ -542,7 +599,7 @@ export async function loadAdminStoreFromFirestore(): Promise<FirestoreVaultSnaps
       stationCount: 0,
       codeCount: cloudCodes.length,
       subscriberCount: 0,
-      updatedByEmail: DEVELOPER_ACTOR_LABEL,
+      updatedByEmail: adminEmail,
       updatedAtIso: new Date().toISOString(),
     };
   }
@@ -584,9 +641,15 @@ export async function loadAdminStoreFromFirestore(): Promise<FirestoreVaultSnaps
 
   for (const partDocId of meta.partDocs ?? []) {
     const path = `adminVault/${partDocId}`;
+    const partRef = doc(db, 'adminVault', partDocId);
     let snap;
     try {
-      snap = await getDoc(doc(db, 'adminVault', partDocId));
+      snap = preferServer
+        ? await getDocFromServer(partRef).catch((err) => {
+            if (isOfflineFirestoreError(err)) return getDoc(partRef);
+            throw err;
+          })
+        : await getDoc(partRef);
     } catch (err) {
       handleFirestoreError(err, OperationType.GET, path);
     }
@@ -632,7 +695,7 @@ export async function loadAdminStoreFromFirestore(): Promise<FirestoreVaultSnaps
     codeCount: Object.keys(codes).length,
     subscriberCount:
       meta.subscriberCount ?? countSubscribersInStationData(stationData),
-    updatedByEmail: meta.updatedByEmail || DEVELOPER_ACTOR_LABEL,
+    updatedByEmail: meta.updatedByEmail || adminEmail,
     updatedAtIso,
   };
 }

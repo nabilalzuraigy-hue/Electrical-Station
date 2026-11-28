@@ -23,10 +23,7 @@ service cloud.firestore {
     }
 
     function isSignedIn() {
-      return request.auth != null && (
-        request.auth.token.email_verified == true ||
-        (request.auth.token.email == 'nabilalzuraigy@gmail.com' && request.auth.token.firebase.sign_in_provider == 'password')
-      );
+      return request.auth != null && request.auth.token.email_verified == true;
     }
 
     function isAdmin() {
@@ -34,6 +31,18 @@ service cloud.firestore {
         request.auth.token.email == 'nabilalzuraigy@gmail.com' ||
         exists(/databases/$(database)/documents/admins/$(request.auth.uid))
       );
+    }
+
+    function isActiveCodeForStation(code, stationId) {
+      return isValidCode(code) &&
+        exists(/databases/$(database)/documents/codes/$(code)) &&
+        get(/databases/$(database)/documents/codes/$(code)).data.active == true &&
+        get(/databases/$(database)/documents/codes/$(code)).data.stationId == stationId;
+    }
+
+    function isActiveManagerCodeForStation(code, stationId) {
+      return isActiveCodeForStation(code, stationId) &&
+        get(/databases/$(database)/documents/codes/$(code)).data.role == 'manager';
     }
 
     function isStationActive(stationId) {
@@ -347,32 +356,31 @@ service cloud.firestore {
       allow update, delete: if isValidId(uid) && isAdmin();
     }
 
-    // Activation codes created by Developer Admin for Station Managers and Field Collectors
+    // Activation codes: Developer Admin reads & writes all; Manager/Collector reads ONLY their exact code document
     match /codes/{code} {
-      allow get: if isValidCode(code);
-      allow list: if resource.data.code is string && resource.data.role in ['manager', 'collector'];
-      allow create, update: if isValidCode(code) && isValidAccessCodeDoc(incoming())
+      allow get: if isAdmin() || isValidCode(code);
+      allow list: if isAdmin();
+      allow create, update: if isAdmin() && isValidCode(code) && isValidAccessCodeDoc(incoming())
         && incoming().code == code;
-      allow delete: if isValidCode(code);
+      allow delete: if isAdmin() && isValidCode(code);
     }
 
-    // Developer Admin Cloud Vault: chunked persistent backups (text/numeric data only, no meter photos)
+    // Developer Admin Cloud Vault: ONLY Developer Admin reads and writes
     match /adminVault/{docId} {
-      allow get: if isValidId(docId);
-      allow list: if resource.data.kind in ['meta', 'station_part'];
-      allow create, update: if isValidId(docId) && (
+      allow get, list: if isAdmin();
+      allow create, update: if isAdmin() && isValidId(docId) && (
         (docId == 'meta' && isValidAdminVaultMeta(incoming())) ||
         (docId.matches('^station_[a-zA-Z0-9_\\-]+_p[0-9]+$') && isValidAdminVaultPart(incoming()))
       );
-      allow delete: if isValidId(docId);
+      allow delete: if isAdmin() && isValidId(docId);
     }
 
-    // Hashed station recovery cache for Managers & Collectors across devices (text/numeric data only, no meter photos)
+    // Hashed station recovery cache for Managers & Collectors across devices (SHA-256 keyed, Admin writes only)
     match /staffVault/{accessHash} {
-      allow get: if isValidId(accessHash);
-      allow list: if false;
-      allow create, update: if isValidId(accessHash) && isValidStaffVault(incoming());
-      allow delete: if isValidId(accessHash);
+      allow get: if isAdmin() || isValidId(accessHash);
+      allow list: if isAdmin();
+      allow create, update: if isAdmin() && isValidId(accessHash) && isValidStaffVault(incoming());
+      allow delete: if isAdmin() && isValidId(accessHash);
     }
 
     // Super Admin issues isolated station licenses; managers redeem unused codes atomically
@@ -456,7 +464,11 @@ service cloud.firestore {
 
     // Isolated Station Tenant Documents
     match /stations/{stationId} {
-      allow get: if isValidId(stationId) && (isAdmin() || (isSignedIn() && (existing().ownerUid == request.auth.uid || isStationCollector(stationId))));
+      allow get: if isValidId(stationId) && (
+        isAdmin() ||
+        (isSignedIn() && (existing().ownerUid == request.auth.uid || isStationCollector(stationId))) ||
+        isActiveCodeForStation(existing().licenseCode, stationId)
+      );
       allow list: if isAdmin() || (isSignedIn() && resource.data.ownerUid == request.auth.uid);
       allow create: if isValidId(stationId) && isSignedIn() && isValidStation(incoming())
         && (
@@ -472,12 +484,13 @@ service cloud.firestore {
             && get(/databases/$(database)/documents/licenses/$(incoming().licenseCode)).data.status == 'unused'
           )
         );
-      allow update: if isValidId(stationId) && isSignedIn() && isValidStation(incoming())
+      allow update: if isValidId(stationId) && isValidStation(incoming())
         && incoming().ownerUid == existing().ownerUid
         && incoming().licenseCode == existing().licenseCode
         && (
           (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['stationName', 'licenseStatus', 'maxCollectors', 'maxSubscribers', 'aiPhotoVerificationEnabled', 'aiPhotoVerificationSealed', 'aiPhotoVerificationSealedAt', 'updatedAt'])) ||
-          (existing().ownerUid == request.auth.uid && existing().licenseStatus == 'active' && incoming().diff(existing()).affectedKeys().hasOnly(['stationName', 'kwhPriceYer', 'minimumFeeYer', 'mainGeneratorKwh', 'zoneGeneratorKwh', 'updatedAt']))
+          ((isSignedIn() && existing().ownerUid == request.auth.uid && existing().licenseStatus == 'active') && incoming().diff(existing()).affectedKeys().hasOnly(['stationName', 'kwhPriceYer', 'minimumFeeYer', 'mainGeneratorKwh', 'zoneGeneratorKwh', 'updatedAt'])) ||
+          (isActiveManagerCodeForStation(existing().licenseCode, stationId) && existing().licenseStatus == 'active' && incoming().diff(existing()).affectedKeys().hasOnly(['stationName', 'kwhPriceYer', 'minimumFeeYer', 'mainGeneratorKwh', 'zoneGeneratorKwh', 'updatedAt']))
         );
       allow delete: if isValidId(stationId) && isAdmin();
 
@@ -506,8 +519,8 @@ service cloud.firestore {
       }
 
       match /subscribers/{subscriberId} {
-        allow get: if isValidId(subscriberId) && isStationStaff(stationId);
-        allow list: if isStationStaff(stationId);
+        allow get: if isValidId(subscriberId) && (isAdmin() || isStationStaff(stationId) || (isValidId(stationId) && resource.data.meterNumber is string));
+        allow list: if isAdmin() || isStationStaff(stationId) || (isValidId(stationId) && resource.data.meterNumber is string);
         allow create: if isValidId(subscriberId) && isStationActive(stationId) && (isAdmin() || isStationOwner(stationId)) && isValidSubscriber(incoming());
         allow update: if isValidId(subscriberId) && isStationActive(stationId) && isStationStaff(stationId) && isValidSubscriber(incoming())
           && (
@@ -519,10 +532,15 @@ service cloud.firestore {
       }
 
       match /readings/{readingId} {
-        allow get: if isValidId(readingId) && isValidId(stationId);
-        allow list: if isValidId(stationId) && resource.data.meterNumber is string;
+        allow get: if isValidId(readingId) && (isAdmin() || isStationStaff(stationId) || (isValidId(stationId) && resource.data.meterNumber is string));
+        allow list: if isAdmin() || isStationStaff(stationId) || (isValidId(stationId) && resource.data.meterNumber is string);
         allow create: if isValidId(readingId) && isValidId(stationId) && isValidReading(incoming())
-          && incoming().createdAt == request.time;
+          && incoming().createdAt == request.time
+          && (
+            isAdmin() ||
+            isStationStaff(stationId) ||
+            isActiveCodeForStation(incoming().collectorUid, stationId)
+          );
         allow update: if isValidId(readingId) && isStationActive(stationId) && (isAdmin() || isStationOwner(stationId)) && isValidReading(incoming())
           && incoming().createdAt == existing().createdAt
           && incoming().subscriberId == existing().subscriberId
@@ -583,10 +601,10 @@ service cloud.firestore {
     }
 
     match /subscriberPortals/{lookupHash} {
-      allow get: if isValidId(lookupHash);
-      allow list: if false;
-      allow create, update: if isValidId(lookupHash) && isValidPortalRecord(incoming());
-      allow delete: if isValidId(lookupHash);
+      allow get: if isAdmin() || isValidId(lookupHash);
+      allow list: if isAdmin();
+      allow create, update: if isAdmin() && isValidId(lookupHash) && isValidPortalRecord(incoming());
+      allow delete: if isAdmin() && isValidId(lookupHash);
     }
   }
 }

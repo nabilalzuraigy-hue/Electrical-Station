@@ -9,11 +9,17 @@ import { SubscriberPortal } from './components/SubscriberPortal';
 import { FlutterCodeExplorer } from './components/FlutterCodeExplorer';
 import { PWAInstallPrompt } from './components/PWAInstallPrompt';
 import { OfflineIndicator } from './components/OfflineIndicator';
-import { testFirestoreConnection } from './lib/firebase';
+import {
+  auth,
+  isAuthorizedAdminUser,
+  signOutUser,
+  subscribeToAuth,
+  testFirestoreConnection,
+} from './lib/firebase';
 import { isCloudAdminToken } from './lib/cloudAdminStore';
 import {
   clearDeveloperSession,
-  loadDeveloperSession,
+  saveDeveloperSession,
 } from './lib/devicePinAuth';
 import {
   loadAdminStoreFromFirestore,
@@ -21,6 +27,7 @@ import {
 } from './lib/firestoreBackup';
 import {
   fetchCloudAutoBackup,
+  loginAdminWithGoogle,
   restoreCloudAutoBackup,
   saveStationLocalState,
   syncStationPendingBatches,
@@ -54,7 +61,7 @@ function StationWorkspace() {
 
   const runSilentGlobalCloudSync = useCallback(async () => {
     if (autoSyncLockRef.current) return;
-    if (!adminToken) return;
+    if (!adminToken || !isAuthorizedAdminUser(auth.currentUser)) return;
     if (isCloudAdminToken(adminToken)) return;
     if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
 
@@ -65,7 +72,7 @@ function StationWorkspace() {
       });
 
       if (!serverSnapshot.hasData) {
-        const cloudSnap = await loadAdminStoreFromFirestore();
+        const cloudSnap = await loadAdminStoreFromFirestore(true);
         if (
           cloudSnap &&
           (cloudSnap.stationCount > 0 || cloudSnap.codeCount > 0)
@@ -88,19 +95,31 @@ function StationWorkspace() {
 
   useEffect(() => {
     let active = true;
-    (async () => {
-      try {
-        const savedDev = await loadDeveloperSession();
-        if (active && savedDev?.token) {
-          setAdminToken(savedDev.token);
-          setActiveTab('admin');
+    const unsubscribe = subscribeToAuth((user) => {
+      void (async () => {
+        try {
+          if (isAuthorizedAdminUser(user) && user) {
+            const idToken = await user.getIdToken();
+            const res = await loginAdminWithGoogle(idToken);
+            if (!active) return;
+            await saveDeveloperSession({ token: res.token, name: res.name });
+            setAdminToken(res.token);
+            setActiveTab((prev) => (prev === 'activation' ? 'admin' : prev));
+          } else if (active) {
+            setAdminToken(null);
+            await clearDeveloperSession();
+          }
+        } catch {
+          // Non-blocking on startup
+        } finally {
+          if (active) setAuthInitialized(true);
         }
-      } finally {
-        if (active) setAuthInitialized(true);
-      }
-    })();
+      })();
+    });
+
     return () => {
       active = false;
+      unsubscribe();
     };
   }, []);
 
@@ -170,6 +189,7 @@ function StationWorkspace() {
   const handleLogout = () => {
     if (adminToken) {
       void clearDeveloperSession();
+      void signOutUser().catch(() => {});
     }
     setAdminToken(null);
     setStaffToken(null);

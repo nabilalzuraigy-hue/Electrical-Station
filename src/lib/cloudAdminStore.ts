@@ -1,11 +1,16 @@
 import {
+  ADMIN_GOOGLE_EMAIL,
+  auth,
+  isAuthorizedAdminUser,
+} from './firebase';
+import {
   deleteAccessCodeFromFirestore,
   loadAdminStoreFromFirestore,
   saveAccessCodeToFirestore,
   saveAdminStoreToFirestore,
   type AdminStoreBackupPayload,
 } from './firestoreBackup';
-import { idbGet, idbSet } from './indexedDbCache';
+import { idbDel, idbGet, idbSet } from './indexedDbCache';
 import type {
   AccessCodeRecord,
   CollectorLocationRecord,
@@ -41,7 +46,28 @@ export function isCloudAdminToken(token?: string | null): boolean {
 }
 
 export function canUseCloudAdminFallback(): boolean {
-  return true;
+  return isAuthorizedAdminUser(auth.currentUser);
+}
+
+export async function clearCloudVaultLocalCache(): Promise<void> {
+  await idbDel(CLOUD_VAULT_CACHE_KEY);
+}
+
+function isVaultNonEmpty(vault: CloudAdminVault | null | undefined): boolean {
+  if (!vault) return false;
+  return (
+    Object.keys(vault.stations ?? {}).length > 0 ||
+    Object.keys(vault.codes ?? {}).length > 0
+  );
+}
+
+function isPermissionError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message.toLowerCase() : String(err ?? '').toLowerCase();
+  return (
+    msg.includes('permission-denied') ||
+    msg.includes('insufficient permissions') ||
+    msg.includes('google')
+  );
 }
 
 function emptyBucket(): CloudStationBucket {
@@ -86,35 +112,45 @@ function normalizeVault(payload?: AdminStoreBackupPayload | null): CloudAdminVau
   return { stations, codes, stationData };
 }
 
-async function loadCloudVault(): Promise<CloudAdminVault> {
+async function loadCloudVault(forceServer = false): Promise<CloudAdminVault> {
+  if (!isAuthorizedAdminUser(auth.currentUser)) {
+    throw new Error(
+      `يجب تسجيل الدخول بحساب Google للمطور (${ADMIN_GOOGLE_EMAIL}) أولاً.`,
+    );
+  }
+
+  if (forceServer) {
+    await idbDel(CLOUD_VAULT_CACHE_KEY);
+  }
+
   try {
-    const snap = await loadAdminStoreFromFirestore();
+    const snap = await loadAdminStoreFromFirestore(true);
     if (snap) {
       const vault = normalizeVault(snap.backup);
-      await idbSet(CLOUD_VAULT_CACHE_KEY, vault);
+      if (isVaultNonEmpty(vault)) {
+        await idbSet(CLOUD_VAULT_CACHE_KEY, vault);
+      }
       return vault;
     }
+    return normalizeVault(null);
   } catch (err) {
-    const cached = await idbGet<CloudAdminVault>(CLOUD_VAULT_CACHE_KEY);
-    if (cached) {
-      return normalizeVault(cached);
+    if (!forceServer && !isPermissionError(err)) {
+      const cached = await idbGet<CloudAdminVault>(CLOUD_VAULT_CACHE_KEY);
+      if (isVaultNonEmpty(cached)) {
+        return normalizeVault(cached);
+      }
     }
     throw err;
   }
-  const cached = await idbGet<CloudAdminVault>(CLOUD_VAULT_CACHE_KEY);
-  if (cached) {
-    return normalizeVault(cached);
-  }
-  const empty = normalizeVault(null);
-  await idbSet(CLOUD_VAULT_CACHE_KEY, empty);
-  return empty;
 }
 
 async function saveCloudVault(
   vault: CloudAdminVault,
   options?: { allowEmptyOverwrite?: boolean },
 ): Promise<void> {
-  await idbSet(CLOUD_VAULT_CACHE_KEY, vault);
+  if (isVaultNonEmpty(vault) || options?.allowEmptyOverwrite) {
+    await idbSet(CLOUD_VAULT_CACHE_KEY, vault);
+  }
   await saveAdminStoreToFirestore(vault, options);
 }
 
@@ -163,11 +199,11 @@ function enrichStationCounts(
   };
 }
 
-export async function cloudAdminOverview(): Promise<{
+export async function cloudAdminOverview(forceServer = false): Promise<{
   stations: StationConfig[];
   codes: AccessCodeRecord[];
 }> {
-  const vault = await loadCloudVault();
+  const vault = await loadCloudVault(forceServer);
   const stations = Object.values(vault.stations).map((st) =>
     enrichStationCounts(st, vault.stationData[st.stationId]),
   );

@@ -1,5 +1,16 @@
 import { initializeApp } from 'firebase/app';
 import {
+  GoogleAuthProvider,
+  browserLocalPersistence,
+  getAuth,
+  onAuthStateChanged,
+  setPersistence,
+  signInWithPopup,
+  signOut,
+  type Unsubscribe,
+  type User,
+} from 'firebase/auth';
+import {
   doc,
   getDocFromServer,
   getFirestore,
@@ -20,8 +31,18 @@ export const FIREBASE_CONFIG = {
 
 export const FIREBASE_PROJECT_ID = FIREBASE_CONFIG.projectId;
 export const FIREBASE_DATABASE_ID = '(default)';
+export const ADMIN_GOOGLE_EMAIL = 'nabilalzuraigy@gmail.com';
+export const ADMIN_DISPLAY_NAME = 'نبيل الزريقي';
 
 const app = initializeApp(FIREBASE_CONFIG);
+
+export const auth = getAuth(app);
+void setPersistence(auth, browserLocalPersistence).catch(() => {
+  // Ignore persistence warning in private/restricted browsers
+});
+
+const googleProvider = new GoogleAuthProvider();
+googleProvider.setCustomParameters({ prompt: 'select_account' });
 
 function createFirestoreClient(): Firestore {
   try {
@@ -39,6 +60,69 @@ function createFirestoreClient(): Firestore {
 
 export const db = createFirestoreClient();
 
+export function isAuthorizedAdminUser(user: User | null | undefined): boolean {
+  if (!user || !user.email) return false;
+  return (
+    user.email.trim().toLowerCase() === ADMIN_GOOGLE_EMAIL.toLowerCase() &&
+    user.emailVerified === true
+  );
+}
+
+export async function signInWithGooglePopup(): Promise<User> {
+  const cred = await signInWithPopup(auth, googleProvider);
+  if (!isAuthorizedAdminUser(cred.user)) {
+    const emailFound = cred.user.email || 'غير معروف';
+    await signOut(auth).catch(() => {});
+    throw new Error(
+      `الحساب (${emailFound}) غير مصرح له بالدخول كأدمن مطور. يرجى اختيار الحساب المعتمد ${ADMIN_GOOGLE_EMAIL}.`,
+    );
+  }
+  return cred.user;
+}
+
+export async function signOutUser(): Promise<void> {
+  await signOut(auth);
+}
+
+export function subscribeToAuth(
+  callback: (user: User | null) => void,
+): Unsubscribe {
+  return onAuthStateChanged(auth, callback);
+}
+
+export async function getFirebaseAdminIdToken(
+  forceRefresh = false,
+): Promise<string | null> {
+  const user = auth.currentUser;
+  if (!isAuthorizedAdminUser(user)) return null;
+  try {
+    return await user!.getIdToken(forceRefresh);
+  } catch {
+    return null;
+  }
+}
+
+export function formatAuthError(error: unknown): string {
+  if (error instanceof Error) {
+    const code =
+      'code' in error ? String((error as { code?: unknown }).code ?? '') : '';
+    if (code === 'auth/popup-closed-by-user') {
+      return 'تم إغلاق نافذة تسجيل دخول Google قبل إتمام العملية.';
+    }
+    if (code === 'auth/popup-blocked') {
+      return 'تم حظر نافذة تسجيل الدخول المنبثقة. اسمح بالنوافذ المنبثقة لهذا الموقع وحاول مجدداً.';
+    }
+    if (code === 'auth/network-request-failed') {
+      return 'تعذر الاتصال بخادم المصادقة. تحقق من اتصال الإنترنت.';
+    }
+    if (code === 'auth/unauthorized-domain') {
+      return 'النطاق الحالي غير مضاف في Authorized Domains ضمن إعدادات Firebase Authentication.';
+    }
+    return error.message;
+  }
+  return 'تعذر تسجيل الدخول عبر حساب Google.';
+}
+
 export enum OperationType {
   CREATE = 'create',
   UPDATE = 'update',
@@ -52,6 +136,17 @@ export interface FirestoreErrorInfo {
   error: string;
   operationType: OperationType;
   path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  };
 }
 
 export function handleFirestoreError(
@@ -63,6 +158,18 @@ export function handleFirestoreError(
     error: error instanceof Error ? error.message : String(error),
     operationType,
     path,
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo:
+        auth.currentUser?.providerData?.map((provider) => ({
+          providerId: provider.providerId,
+          email: provider.email,
+        })) || [],
+    },
   };
   console.error('Firestore Error: ', JSON.stringify(errInfo));
   throw new Error(JSON.stringify(errInfo));
@@ -124,7 +231,7 @@ export function formatFirestoreUserMessage(
     lower.includes('permission-denied') ||
     lower.includes('insufficient permissions')
   ) {
-    return 'تعذر تنفيذ العملية بسبب قواعد صلاحيات Firebase Firestore. يرجى نشر ملف firestore.rules المحدّث على المشروع.';
+    return 'تعذر تنفيذ العملية بسبب قواعد صلاحيات Firebase Firestore (Missing or insufficient permissions). تأكد من تسجيل الدخول بحساب المطور في Google وأن قواعد firestore.rules محدثة.';
   }
   if (lower.includes('quota exceeded')) {
     return 'تم تجاوز حصة الاستخدام المجانية اليومية في Firebase Firestore.';
