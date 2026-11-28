@@ -1,6 +1,6 @@
 {
   "name": "محطة الكهرباء التجارية — نظام إدارة وفوترة محطات الكهرباء في اليمن",
   "description": "منصة متكاملة وتطبيق Flutter لإدارة محطات الكهرباء التجارية في اليمن: لوحة المدير واستيراد Excel، تطبيق المحصّل الميداني أوفلاين بالكاميرا وOCR، وبوابة المشترك لإثبات القراءات.",
-  "requestFramePermissions": ["camera"],
+  "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
