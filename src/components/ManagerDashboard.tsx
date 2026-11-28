@@ -405,6 +405,22 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
     return map;
   }, [state.readings]);
 
+  const latestReceiptBySubscriber = useMemo(() => {
+    const map = new Map<string, (typeof state.receipts)[number]>();
+    const sorted = [...state.receipts].sort((a, b) =>
+      String(b.paidAt ?? '').localeCompare(String(a.paidAt ?? '')),
+    );
+    for (const rc of sorted) {
+      if (rc.subscriberId && !map.has(rc.subscriberId)) {
+        map.set(rc.subscriberId, rc);
+      }
+      if (rc.meterNumber && !map.has(`meter:${rc.meterNumber}`)) {
+        map.set(`meter:${rc.meterNumber}`, rc);
+      }
+    }
+    return map;
+  }, [state.receipts]);
+
   // Load and continuously persist alerts_history (never cleared on refresh or when values reset to 0)
   useEffect(() => {
     let active = true;
@@ -1820,7 +1836,18 @@ export const ManagerDashboard: React.FC<ManagerDashboardProps> = ({
                         )}
                       </td>
                       <td className="py-3 px-4 font-mono-nums font-medium text-slate-900">
-                        {formatYer(sub.previousDebtYer)}
+                        <div>{formatYer(sub.previousDebtYer)}</div>
+                        {(() => {
+                          const latestRc =
+                            latestReceiptBySubscriber.get(sub.id) ??
+                            latestReceiptBySubscriber.get(`meter:${sub.meterNumber}`);
+                          if (!latestRc) return null;
+                          return (
+                            <div className="text-[11px] font-sans text-emerald-700 font-medium">
+                              آخر سداد: {formatCompactYer(latestRc.amountPaidYer)}
+                            </div>
+                          );
+                        })()}
                       </td>
                       <td className="py-3 px-4 text-xs">
                         <span

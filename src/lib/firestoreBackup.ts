@@ -983,12 +983,20 @@ export async function saveCollectorReceiptTextToFirestore(params: {
     const paidAtTs = Timestamp.fromDate(
       Number.isNaN(paidDate.getTime()) ? new Date() : paidDate,
     );
-    const collectorUid = sanitizeVaultDocId(receipt.collectorUid || 'collector');
+    const rawCollectorUid = (receipt.collectorUid || 'collector').trim();
+    const normalizedCollectorUid = /^[a-zA-Z0-9-]+$/.test(rawCollectorUid) && rawCollectorUid.includes('-')
+      ? rawCollectorUid.toUpperCase()
+      : rawCollectorUid;
+    const collectorUid = sanitizeVaultDocId(normalizedCollectorUid);
+    const rawMeter = (receipt.meterNumber || '00').trim();
+    const safeMeter = rawMeter.length >= 2 ? rawMeter.slice(0, 40) : rawMeter.padStart(2, '0');
+    const rawSubName = (receipt.subscriberName || 'مشترك').trim();
+    const safeSubName = rawSubName.length >= 2 ? rawSubName.slice(0, 120) : rawSubName.padEnd(2, '.');
 
     await setDoc(doc(db, 'stations', stationId, 'receipts', sanitizeVaultDocId(receipt.id)), {
       subscriberId: sanitizeVaultDocId(receipt.subscriberId),
-      meterNumber: (receipt.meterNumber || '00').slice(0, 40),
-      subscriberName: (receipt.subscriberName || 'مشترك').slice(0, 120),
+      meterNumber: safeMeter,
+      subscriberName: safeSubName,
       readingId: sanitizeVaultDocId(receipt.readingId || `cash_${Date.now()}`),
       amountPaidYer: Math.max(1, Number(receipt.amountPaidYer)),
       remainingBalanceYer: Math.max(0, Number(receipt.remainingBalanceYer) || 0),

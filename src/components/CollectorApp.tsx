@@ -32,6 +32,7 @@ import {
   parseSubscribersExcelFile,
   refreshStationState,
   sanitizeFirestoreId,
+  saveStationLocalState,
   sendCollectorLocationInCloud,
   sendInstantManagerAlert,
   verifyMeterPhotoWithGemini,
@@ -271,7 +272,7 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     collectorAccess?.name ||
     (isManagerPreview ? 'مدير المحطة' : 'المحصّل الميداني');
   const resolvedCollectorCode =
-    activeCollector?.code || activeCollector?.id || collectorAccess?.code || '';
+    collectorAccess?.code || activeCollector?.code || activeCollector?.id || '';
 
   useEffect(() => {
     if (!gpsEnabled || isManagerPreview) {
@@ -896,13 +897,22 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
   const remainingBalanceYer = Math.max(0, totalDueYer - cashPaidYer);
 
   const persistCashReceiptOnly = async () => {
-    if (!selectedSubscriber || !permissions.canCollectCash || cashPaidYer <= 0) {
+    if (
+      isManagerPreview ||
+      !selectedSubscriber ||
+      !permissions.canCollectCash ||
+      cashPaidYer <= 0
+    ) {
       return;
     }
     const now = new Date().toISOString();
     const collectorName = resolvedCollectorName;
     const collectorUid =
-      activeCollector?.id ?? collectorAccess?.code ?? state.station.ownerUid;
+      (collectorAccess?.code || activeCollector?.code || resolvedCollectorCode || '')
+        .trim()
+        .toUpperCase() ||
+      activeCollector?.id ||
+      state.station.ownerUid;
     const nextBalance = Math.max(0, previousDebtYer - cashPaidYer);
 
     const newReceipt: PaymentReceipt = {
@@ -949,32 +959,14 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
       (s) => s.id === selectedSubscriber.id,
     );
 
-    onUpdateState({
+    const nextLocalState: StationLocalState = {
       ...state,
       subscribers: updatedSubscribers,
       receipts: [newReceipt, ...state.receipts],
-    });
+    };
 
-    void dispatchReceiptToCloudBackground({
-      stationId: state.station.stationId,
-      staffToken,
-      receipt: newReceipt,
-      subscriber: updatedSubRecord,
-    }).then((didSync) => {
-      if (!didSync) return;
-      const latest = stateRef.current;
-      onUpdateStateRef.current({
-        ...latest,
-        subscribers: latest.subscribers.map((s) =>
-          s.id === selectedSubscriber.id
-            ? { ...s, syncStatus: 'synced' as const }
-            : s,
-        ),
-        receipts: latest.receipts.map((rc) =>
-          rc.id === newReceipt.id ? { ...rc, syncStatus: 'synced' as const } : rc,
-        ),
-      });
-    });
+    onUpdateState(nextLocalState);
+    await saveStationLocalState(nextLocalState);
 
     setCashPaidInput('');
     setValidationError(null);
@@ -990,6 +982,30 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
           `المتبقي المستحق: ${Math.round(nextBalance)} ريال. ` +
           `محطة ${state.station.stationName}`,
       );
+    }
+
+    const didSync = await dispatchReceiptToCloudBackground({
+      stationId: state.station.stationId,
+      staffToken,
+      receipt: newReceipt,
+      subscriber: updatedSubRecord,
+    }).catch(() => false);
+
+    if (didSync) {
+      const latest = stateRef.current;
+      const syncedState: StationLocalState = {
+        ...latest,
+        subscribers: latest.subscribers.map((s) =>
+          s.id === selectedSubscriber.id
+            ? { ...s, syncStatus: 'synced' as const }
+            : s,
+        ),
+        receipts: latest.receipts.map((rc) =>
+          rc.id === newReceipt.id ? { ...rc, syncStatus: 'synced' as const } : rc,
+        ),
+      };
+      onUpdateStateRef.current(syncedState);
+      await saveStationLocalState(syncedState);
     }
   };
 
@@ -1008,7 +1024,11 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
     const readingId = sanitizeFirestoreId(`rd_${Date.now()}`);
     const collectorName = resolvedCollectorName;
     const collectorUid =
-      activeCollector?.id ?? collectorAccess?.code ?? state.station.ownerUid;
+      (collectorAccess?.code || activeCollector?.code || resolvedCollectorCode || '')
+        .trim()
+        .toUpperCase() ||
+      activeCollector?.id ||
+      state.station.ownerUid;
 
     const isManualWithoutOcr =
       ocrOriginalReading === null && activeFinalReading !== null;
@@ -2075,6 +2095,15 @@ export const CollectorApp: React.FC<CollectorAppProps> = ({
                             placeholder="0 (اختياري)"
                             className="w-full min-h-[48px] px-3.5 py-2.5 text-lg sm:text-xl font-bold font-mono-nums placeholder:font-medium placeholder:text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
                           />
+                          {cashPaidYer > 0 && !proofPhotoUrl && (
+                            <button
+                              type="button"
+                              onClick={() => void persistCashReceiptOnly()}
+                              className="mt-2 w-full min-h-[38px] px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold rounded-lg transition-colors cursor-pointer"
+                            >
+                              {`حفظ سند القبض الآن وخصمه (${formatCompactYer(cashPaidYer)})`}
+                            </button>
+                          )}
                         </div>
                       )}
                     </div>

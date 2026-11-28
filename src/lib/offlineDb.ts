@@ -887,14 +887,19 @@ function mergeCloudActivityIntoState(
     }
   }
 
-  const latestReceiptBySubId = new Map<string, PaymentReceipt>();
-  const latestReceiptByMeter = new Map<string, PaymentReceipt>();
-  for (const rc of receipts) {
-    if (rc.subscriberId && !latestReceiptBySubId.has(rc.subscriberId)) {
-      latestReceiptBySubId.set(rc.subscriberId, rc);
+  const receiptsAscBySubId = new Map<string, PaymentReceipt[]>();
+  const receiptsAscByMeter = new Map<string, PaymentReceipt[]>();
+  for (let i = receipts.length - 1; i >= 0; i--) {
+    const rc = receipts[i];
+    if (rc.subscriberId) {
+      const list = receiptsAscBySubId.get(rc.subscriberId) ?? [];
+      list.push(rc);
+      receiptsAscBySubId.set(rc.subscriberId, list);
     }
-    if (rc.meterNumber && !latestReceiptByMeter.has(rc.meterNumber)) {
-      latestReceiptByMeter.set(rc.meterNumber, rc);
+    if (rc.meterNumber) {
+      const list = receiptsAscByMeter.get(rc.meterNumber) ?? [];
+      list.push(rc);
+      receiptsAscByMeter.set(rc.meterNumber, list);
     }
   }
 
@@ -902,31 +907,51 @@ function mergeCloudActivityIntoState(
     if (sub.syncStatus === 'pending') return sub;
     const latestRd =
       latestReadingBySubId.get(sub.id) ?? latestReadingByMeter.get(sub.meterNumber);
-    const latestRc =
-      latestReceiptBySubId.get(sub.id) ?? latestReceiptByMeter.get(sub.meterNumber);
+    const subReceiptsAsc =
+      receiptsAscBySubId.get(sub.id) ?? receiptsAscByMeter.get(sub.meterNumber) ?? [];
 
     const subTs = String(sub.updatedAt ?? '');
     const rdTs = latestRd ? String(latestRd.recordedAt ?? '') : '';
-    const rcTs = latestRc ? String(latestRc.paidAt ?? '') : '';
 
     let nextPrev = sub.previousReading;
     let nextCurr = sub.currentReading;
     let nextDebt = sub.previousDebtYer;
     let nextUpdatedAt = subTs;
+    let debtChanged = false;
 
     if (latestRd && rdTs > subTs) {
       nextPrev = latestRd.previousReading;
       nextCurr = latestRd.currentReading;
       nextDebt = latestRd.totalDueYer;
       nextUpdatedAt = rdTs;
+      debtChanged = true;
     }
 
-    if (latestRc && rcTs >= nextUpdatedAt && rcTs > subTs) {
-      nextDebt = latestRc.remainingBalanceYer;
-      nextUpdatedAt = rcTs;
+    for (const rc of subReceiptsAsc) {
+      const rcTs = String(rc.paidAt ?? '');
+      // Skip receipts superseded by a newer approved reading (unless paid together with that reading)
+      if (latestRd && rcTs < rdTs && rc.readingId !== latestRd.id) continue;
+
+      const isNewerTs = rcTs > nextUpdatedAt;
+      const isWithLatestReading =
+        Boolean(latestRd) &&
+        rc.readingId === latestRd?.id &&
+        nextDebt > rc.remainingBalanceYer;
+      const matchesPrePaymentBalance =
+        rc.amountPaidYer > 0 &&
+        Math.abs(nextDebt - (rc.remainingBalanceYer + rc.amountPaidYer)) < 1 &&
+        nextDebt > rc.remainingBalanceYer;
+
+      if (isNewerTs || isWithLatestReading || matchesPrePaymentBalance) {
+        nextDebt = rc.remainingBalanceYer;
+        if (rcTs > nextUpdatedAt) {
+          nextUpdatedAt = rcTs;
+        }
+        debtChanged = true;
+      }
     }
 
-    if (nextUpdatedAt !== subTs) {
+    if (nextUpdatedAt !== subTs || debtChanged) {
       return {
         ...sub,
         previousReading: nextPrev,
@@ -2247,6 +2272,14 @@ export async function dispatchReceiptToCloudBackground(params: {
     return false;
   }
 
+  const fallbackCode = params.staffToken.startsWith('cloud_')
+    ? normalizeActivationCode(params.staffToken.slice('cloud_'.length))
+    : '';
+  const safeReceipt: PaymentReceipt =
+    fallbackCode && !/^[A-Z0-9-]+$/.test(params.receipt.collectorUid || '')
+      ? { ...params.receipt, collectorUid: fallbackCode }
+      : params.receipt;
+
   let synced = false;
   if (params.staffToken && !params.staffToken.startsWith('cloud_')) {
     try {
@@ -2257,7 +2290,7 @@ export async function dispatchReceiptToCloudBackground(params: {
           body: JSON.stringify({
             subscribers: params.subscriber ? [params.subscriber] : [],
             readings: [],
-            receipts: [params.receipt],
+            receipts: [safeReceipt],
           }),
         },
         params.staffToken,
@@ -2270,7 +2303,7 @@ export async function dispatchReceiptToCloudBackground(params: {
 
   const firestoreOk = await saveCollectorReceiptTextToFirestore({
     stationId: params.stationId,
-    receipt: params.receipt,
+    receipt: safeReceipt,
   });
 
   return synced || firestoreOk;

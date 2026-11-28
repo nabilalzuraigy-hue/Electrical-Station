@@ -3107,20 +3107,57 @@ Inspect the attached electric meter photo carefully:
       for (const rc of receipts) {
         const rcId = normalizeId(rc?.id);
         const subId = normalizeId(rc?.subscriberId);
-        if (!bucket.subscribers[subId]) continue;
+        const targetSub =
+          bucket.subscribers[subId] ??
+          Object.values(bucket.subscribers).find(
+            (s) => s.meterNumber === String(rc?.meterNumber ?? ''),
+          );
+        if (!targetSub) continue;
+
+        const existingRc = bucket.receipts[rcId];
+        const amountPaidYer = Math.max(1, Number(rc?.amountPaidYer) || 0);
+        const remainingBalanceYer = Math.max(
+          0,
+          Number(rc?.remainingBalanceYer) || 0,
+        );
+        const paidAt = String(rc?.paidAt ?? new Date().toISOString());
+        const readingId = normalizeId(rc?.readingId);
 
         bucket.receipts[rcId] = {
           id: rcId,
-          subscriberId: subId,
-          meterNumber: String(rc?.meterNumber ?? ''),
-          subscriberName: String(rc?.subscriberName ?? ''),
-          readingId: normalizeId(rc?.readingId),
-          amountPaidYer: Math.max(1, Number(rc?.amountPaidYer) || 0),
-          remainingBalanceYer: Math.max(0, Number(rc?.remainingBalanceYer) || 0),
+          subscriberId: targetSub.id,
+          meterNumber: String(rc?.meterNumber ?? targetSub.meterNumber),
+          subscriberName: String(rc?.subscriberName ?? targetSub.subscriberName),
+          readingId,
+          amountPaidYer,
+          remainingBalanceYer,
           collectorCode: session.code || session.role,
           collectorName: String(rc?.collectorName ?? session.name),
-          paidAt: String(rc?.paidAt ?? new Date().toISOString()),
+          paidAt,
         };
+
+        const hasNewerReading = Object.values(bucket.readings).some(
+          (r) =>
+            r.subscriberId === targetSub.id &&
+            r.approvalStatus !== 'rejected' &&
+            r.id !== readingId &&
+            String(r.recordedAt ?? '') > paidAt,
+        );
+        const subTs = String(targetSub.updatedAt ?? '');
+        const matchesPrePay =
+          Math.abs(
+            targetSub.previousDebtYer - (remainingBalanceYer + amountPaidYer),
+          ) < 1 && targetSub.previousDebtYer > remainingBalanceYer;
+
+        if (
+          !hasNewerReading &&
+          (paidAt >= subTs || (!existingRc && matchesPrePay))
+        ) {
+          targetSub.previousDebtYer = remainingBalanceYer;
+          if (paidAt > subTs) {
+            targetSub.updatedAt = paidAt;
+          }
+        }
         syncedCount++;
       }
     }
